@@ -34,13 +34,25 @@ const PUBLIC_NATIVE_SAC = 'CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XO
 
 export function amountToStroops(amount: string | number): bigint {
   const str = String(amount).trim();
-  if (str.includes('.')) {
-    const parts = str.split('.');
-    const whole = parts[0] || '0';
-    const fraction = (parts[1] || '').padEnd(7, '0').slice(0, 7);
-    return BigInt(whole) * 10_000_000n + BigInt(fraction);
+  if (!str || str.startsWith('-')) {
+    throw new Error(`Invalid payment amount: '${amount}'. Amount must be positive.`);
   }
-  return BigInt(str) * 10_000_000n;
+
+  if (!/^\d+(\.\d+)?$/.test(str)) {
+    throw new Error(`Invalid payment amount format: '${amount}'. Expected valid numeric string.`);
+  }
+
+  const [whole, fraction = ''] = str.split('.');
+  if (fraction.length > 7) {
+    throw new Error(`Excess decimal precision in '${amount}'. Stellar SAC tokens support at most 7 decimal places (stroops).`);
+  }
+
+  const paddedFraction = fraction.padEnd(7, '0');
+  const stroops = BigInt(whole) * 10_000_000n + BigInt(paddedFraction);
+  if (stroops <= 0n) {
+    throw new Error(`Payment amount must be greater than zero stroops, got: '${amount}'`);
+  }
+  return stroops;
 }
 
 export class StellarPaymentVerifier {
@@ -155,7 +167,26 @@ export class StellarPaymentVerifier {
                   const invokeArgs = hostFn.invokeContract();
                   const invokedContract = Address.fromScAddress(invokeArgs.contractAddress()).toString();
                   const fnName = invokeArgs.functionName().toString();
-                  return invokedContract === challenge.contractId && fnName === 'settle_payment';
+                  if (invokedContract !== challenge.contractId || fnName !== 'settle_payment') {
+                    return false;
+                  }
+
+                  const args = invokeArgs.args();
+                  if (!args || args.length < 5) {
+                    return false;
+                  }
+
+                  // Cryptographic challenge hash binding: argument 4 must match expected challenge hash
+                  try {
+                    const opHash = args[4].bytes();
+                    if (!opHash || !opHash.equals(hashBytes)) {
+                      return false;
+                    }
+                  } catch {
+                    return false;
+                  }
+
+                  return true;
                 }
               }
               return false;
@@ -164,7 +195,7 @@ export class StellarPaymentVerifier {
             if (!matchingOp) {
               return {
                 valid: false,
-                reason: `Transaction ${txHash} did not invoke 'settle_payment' on target contract ${challenge.contractId}`,
+                reason: `Transaction ${txHash} did not invoke 'settle_payment' for challenge '${challenge.challengeId}' on target contract ${challenge.contractId}`,
                 txHash,
               };
             }

@@ -28,7 +28,7 @@ describe('BudgetManager', () => {
 
     const check = budget.canAfford(0.8);
     expect(check.allowed).toBe(false);
-    expect(check.reason).toContain('exceed total budget limit');
+    expect(check.reason).toContain('would exceed total ceiling');
   });
 
   it('keeps track of payment receipts', () => {
@@ -41,5 +41,31 @@ describe('BudgetManager', () => {
     expect(receipts[0].amount).toBe(0.5);
     expect(receipts[0].destination).toBe('GDEST1');
     expect(receipts[0].txHash).toBe('tx100');
+  });
+
+  it('atomically reserves budget under concurrency and prevents overdraft', () => {
+    const budget = new BudgetManager(1.0, 1.5);
+
+    // Call 1 reserves 0.8 XLM
+    const resId1 = budget.reserve(0.8);
+    expect(resId1).toBeDefined();
+    expect(budget.getPendingReservedXlm()).toBe(0.8);
+
+    // Call 2 tries to reserve 0.8 XLM -> total 1.6 > 1.5 -> must fail!
+    expect(() => budget.reserve(0.8)).toThrow(/Budget reservation rejected/);
+
+    // Call 1 completes on ledger
+    budget.finalize(resId1, 'GDEST1', 'tx123');
+    expect(budget.getPendingReservedXlm()).toBe(0);
+    expect(budget.getSpentTotal()).toBe(0.8);
+
+    // Now remaining budget is 1.5 - 0.8 = 0.7. Try reserve 0.5 -> succeeds!
+    const resId2 = budget.reserve(0.5);
+    expect(budget.getPendingReservedXlm()).toBe(0.5);
+
+    // Call 2 fails or is aborted -> release reservation
+    budget.release(resId2);
+    expect(budget.getPendingReservedXlm()).toBe(0);
+    expect(budget.getSpentTotal()).toBe(0.8);
   });
 });

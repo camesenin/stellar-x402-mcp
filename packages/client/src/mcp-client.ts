@@ -64,16 +64,19 @@ export class StellarPaidMcpClient {
         throw err;
       }
 
-      // Budget check
+      // Budget check & concurrent reservation
       const costXlm = parseFloat(challenge.amount);
-      const budgetCheck = this.budget.canAfford(costXlm);
-      if (!budgetCheck.allowed) {
-        throw new Error(`[Stellar x402 MCP Client] Tool '${name}' payment rejected: ${budgetCheck.reason}`);
-      }
+      const reservationId = this.budget.reserve(costXlm);
 
-      // Settle challenge on Stellar
-      const receipt = await this.payer.settleChallenge(challenge);
-      this.budget.recordPayment(costXlm, challenge.destination, receipt.txHash);
+      let receipt;
+      try {
+        // Settle challenge on Stellar
+        receipt = await this.payer.settleChallenge(challenge);
+        this.budget.finalize(reservationId, challenge.destination, receipt.txHash);
+      } catch (paymentErr) {
+        this.budget.release(reservationId);
+        throw paymentErr;
+      }
 
       // Re-invoke with payment proof
       return await this.mcpClient.callTool({

@@ -43,6 +43,23 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
     expect(amountToStroops('10.2500000')).toBe(102_500_000n);
   });
 
+  it('enforces rigorous decimal constraints on amountToStroops', () => {
+    // Negative amounts must throw
+    expect(() => amountToStroops('-1')).toThrow(/Amount must be positive/i);
+    expect(() => amountToStroops('-0.05')).toThrow(/Amount must be positive/i);
+
+    // Non-numeric strings must throw
+    expect(() => amountToStroops('abc')).toThrow(/Expected valid numeric string/i);
+    expect(() => amountToStroops('1.2.3')).toThrow(/Expected valid numeric string/i);
+
+    // Excess precision (>7 decimal places) must throw
+    expect(() => amountToStroops('0.12345678')).toThrow(/Excess decimal precision/i);
+
+    // Zero or empty must throw
+    expect(() => amountToStroops('0')).toThrow(/must be greater than zero stroops/i);
+    expect(() => amountToStroops('')).toThrow(/Amount must be positive/i);
+  });
+
   it('rejects verification if transaction hash has already been redeemed', async () => {
     const dummyTx = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
     const challenge: X402Challenge = store.createChallenge(

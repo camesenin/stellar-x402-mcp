@@ -34,16 +34,19 @@ export function createX402Fetch(config: ClientConfig) {
     // 3. Parse challenge
     const challenge = parseX402Challenge(response.headers, jsonBody);
 
-    // 4. Budget check
+    // 4. Concurrency-safe budget reservation
     const costXlm = parseFloat(challenge.amount);
-    const budgetCheck = budget.canAfford(costXlm);
-    if (!budgetCheck.allowed) {
-      throw new Error(`[Stellar x402 Client] Payment rejected: ${budgetCheck.reason}`);
-    }
+    const reservationId = budget.reserve(costXlm);
 
-    // 5. Submit payment on Stellar
-    const receipt = await payer.settleChallenge(challenge);
-    budget.recordPayment(costXlm, challenge.destination, receipt.txHash);
+    let receipt;
+    try {
+      // 5. Submit payment on Stellar
+      receipt = await payer.settleChallenge(challenge);
+      budget.finalize(reservationId, challenge.destination, receipt.txHash);
+    } catch (paymentErr) {
+      budget.release(reservationId);
+      throw paymentErr;
+    }
 
     // 6. Retry request with payment proof headers
     const newHeaders = new Headers(init?.headers);
