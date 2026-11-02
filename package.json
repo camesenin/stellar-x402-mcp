@@ -1,0 +1,24 @@
+{
+  "name": "stellar-x402-mcp-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Stellar Agent Gateway & x402 Micropayment Facilitator for Model Context Protocol (MCP)",
+  "author": "Carlos Murillo <camesenin@gmail.com>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/camesenin/stellar-x402-mcp.git"
+  },
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm -r run test",
+    "lint": "pnpm -r run lint",
+    "build:contracts": "cargo build --manifest-path packages/contracts/Cargo.toml --target wasm32-unknown-unknown --release",
+    "test:contracts": "cargo test --manifest-path packages/contracts/Cargo.toml"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+dist/
+build/
+*.tsbuildinfo
+
+# Rust / Cargo
+target/
+Cargo.lock
+
+# Environment & Keys
+.env
+.env.local
+*.secret
+*.key
+
+# Logs & Cache
+*.log
+.DS_Store
+Thumbs.db

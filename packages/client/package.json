@@ -1,0 +1,21 @@
+{
+  "name": "@stellar-x402/client",
+  "version": "0.1.0",
+  "description": "Autonomous AI Agent Client SDK for Stellar x402 Micropayments",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.0",
+    "@stellar/stellar-sdk": "^13.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

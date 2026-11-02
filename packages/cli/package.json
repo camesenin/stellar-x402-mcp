@@ -1,0 +1,31 @@
+{
+  "name": "@stellar-x402/cli",
+  "version": "0.1.0",
+  "description": "CLI tool for Stellar x402 Gateway and Autonomous Agents",
+  "bin": {
+    "x402-stellar": "./dist/bin.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@stellar-x402/client": "workspace:*",
+    "@stellar-x402/gateway": "workspace:*",
+    "@stellar/stellar-sdk": "^13.3.0",
+    "commander": "^13.1.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
