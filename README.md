@@ -144,6 +144,7 @@ The repository includes a compiled and **on-chain deployed Soroban smart contrac
 - **Contract ID**: [`CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA`](https://stellar.expert/explorer/testnet/contract/CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA)
 - **Wasm Hash**: `a3e512cc196ff88ac2e2df83b19bac5415b9a89a569f03a881f65b5a4d91fbd5`
 - **Instantiation Ledger**: `5526238` (TxHash: `ae152d8104b4e4b8bd100498f7e6245cbd68aecea88eaf5f165f4fc4f7a6e7be`)
+- **Verified Settlement Tx**: [`258669e717a07c8f07addd388ffc9599daa24492c42422031b5c0b462e930874`](https://stellar.expert/explorer/testnet/tx/258669e717a07c8f07addd388ffc9599daa24492c42422031b5c0b462e930874) (Ledger `5526606`)
 
 ### Contract Functions:
 - `settle_payment(env, payer, recipient, token, amount, challenge_hash) -> Result<PaymentReceipt, X402Error>`
@@ -160,13 +161,14 @@ The repository includes a compiled and **on-chain deployed Soroban smart contrac
 ```bash
 cd packages/contracts
 cargo test
-cargo build --target wasm32-unknown-unknown --release
+cargo build --target wasm32v1-none --release
 ```
 
 ---
 
-## 🧪 Testing
+## 🧪 Testing & Empirical Verification
 
+### 1. Monorepo Unit Test Suite (24 tests passing)
 Run all unit and integration tests across both Rust contracts and TypeScript packages:
 
 ```bash
@@ -174,7 +176,26 @@ pnpm test
 cargo test --manifest-path packages/contracts/Cargo.toml
 ```
 
-All 17 tests pass with zero warnings.
+- `@stellar-x402/gateway`: 11 tests (SQLite WAL ACID persistence, atomic rollback on duplicate hash, exact stroop conversion bounds, anti-replay, Soroban verifier).
+- `@stellar-x402/client`: 12 tests (x402 header & JSON parser, concurrency-safe budget reservations, Soroban payer routing, budget ceilings).
+- `@stellar-x402/cli`: 1 test (CLI smoke & command validation).
+- `examples/mcp-payment-demo`: 1 test (Full autonomous agent negotiation demo).
+
+### 2. Live On-Chain Testnet Integration Test
+Execute a live, end-to-end payment settlement against the live deployed Soroban contract using Friendbot-funded ephemeral keys:
+
+```bash
+pnpm --filter @stellar-x402/gateway run test:testnet
+```
+
+This test:
+1. Generates ephemeral payer and merchant keypairs.
+2. Funds both accounts via Friendbot on Stellar Testnet.
+3. Issues an HTTP 402 challenge with contract address `CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA`.
+4. Executes autonomous contract invocation `settle_payment` transferring native XLM SAC.
+5. Polls until inclusion in Testnet ledger consensus.
+6. Verifies transaction envelope argument binding and queries persistent on-chain `PaymentReceipt` struct.
+7. Proves anti-replay blocking by rejecting immediate second redemption attempts.
 
 ---
 

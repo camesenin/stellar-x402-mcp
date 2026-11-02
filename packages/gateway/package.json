@@ -8,6 +8,7 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
+    "test:testnet": "node testnet_e2e_integration.mjs",
     "start": "node dist/index.js"
   },
   "dependencies": {

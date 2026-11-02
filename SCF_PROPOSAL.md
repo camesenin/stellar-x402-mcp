@@ -54,12 +54,15 @@ Unlike high-fee chains where micropayments are economically impossible, Stellarâ
 ## 4. Current State & Verification Evidence
 
 As of proposal preparation:
-- **Deployed Soroban Contract**: Live on Testnet at [`CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA`](https://stellar.expert/explorer/testnet/contract/CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA) (Ledger 5526238, TxHash: `ae152d81...`).
+- **Deployed Soroban Contract**: Live on Testnet at [`CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA`](https://stellar.expert/explorer/testnet/contract/CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA) (Ledger 5526238, TxHash: `ae152d8104b4e4b8bd100498f7e6245cbd68aecea88eaf5f165f4fc4f7a6e7be`).
+- **Live On-Chain Settlement**: Real testnet transaction confirmed at [`258669e717a07c8f07addd388ffc9599daa24492c42422031b5c0b462e930874`](https://stellar.expert/explorer/testnet/tx/258669e717a07c8f07addd388ffc9599daa24492c42422031b5c0b462e930874) (Ledger `5526606`), transferring native XLM SAC with verified contract receipt.
 - **Rust Contract Tests**: 3/3 passing (`packages/contracts/src/lib.rs`).
-- **TypeScript Unit Tests**: 13/13 passing across gateway, client, and CLI packages (`vitest`).
-- **SQLite Persistence & Replay Protection**: Verified against server crash/restart scenarios.
-- **Soroban Wasm Target**: Successfully compiled for WebAssembly MVP v1 (`target/wasm32v1-none/release/stellar_x402_contracts.wasm`).
-- **End-to-End Simulation**: Successfully verified autonomous tool challenge, budget validation, payment settlement, and payload return (`examples/mcp-payment-demo`).
+- **TypeScript Unit Tests**: 24/24 passing across gateway, client, and CLI packages (`vitest`).
+- **SQLite WAL Full Durability & Replay Protection**: Verified against server crash/restart scenarios with atomic rollback on collision.
+- **Soroban Wasm Target**: Successfully compiled for WebAssembly MVP v1 (`target/wasm32v1-none/release/stellar_x402_contracts.wasm`, 15,663 bytes).
+- **Autonomous Soroban Client**: Automated contract footprint preparation, resource fee calculation, payer authorization, and resilient inclusion polling.
+- **Concurrency-Safe Budget Manager**: Atomic reservations preventing runaway agent spending under concurrent tool invocation.
+- **End-to-End Simulation & Live Testnet Integration**: Successfully verified autonomous tool challenge, budget validation, payment settlement, and payload return (`pnpm --filter @stellar-x402/gateway run test:testnet`).
 - **CI/CD Pipeline**: GitHub Actions running on every commit.
 
 ---
