@@ -41,20 +41,46 @@ export function amountToStroops(amount: string | number): bigint {
   return stroops;
 }
 
+/**
+ * Standard RFC 7159 / JSON-RPC 2.0 query to Soroban RPC for transaction status.
+ * Replaces any reliance on private SDK methods.
+ */
+async function fetchSorobanTxJsonRpc(rpcUrl: string, txHash: string): Promise<any> {
+  const response = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getTransaction',
+      params: { hash: txHash },
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`Soroban JSON-RPC HTTP error: ${response.status} ${response.statusText}`);
+  }
+  const json: any = await response.json();
+  if (json.error) {
+    throw new Error(`Soroban JSON-RPC error: ${JSON.stringify(json.error)}`);
+  }
+  return json.result;
+}
+
 export class StellarPayer {
   private keypair: Keypair;
   private horizonServer: Horizon.Server;
   private sorobanServer: rpc.Server;
   private networkPassphrase: string;
+  private sorobanRpcUrl: string;
 
   constructor(private config: ClientConfig) {
     this.keypair = Keypair.fromSecret(config.secretKey);
     this.horizonServer = new Horizon.Server(
       config.horizonUrl || 'https://horizon-testnet.stellar.org'
     );
-    this.sorobanServer = new rpc.Server(
-      config.sorobanRpcUrl || 'https://soroban-testnet.stellar.org'
-    );
+    this.sorobanRpcUrl =
+      config.sorobanRpcUrl || 'https://soroban-testnet.stellar.org';
+    this.sorobanServer = new rpc.Server(this.sorobanRpcUrl);
     this.networkPassphrase =
       config.network === 'public' ? Networks.PUBLIC : Networks.TESTNET;
   }
@@ -65,6 +91,14 @@ export class StellarPayer {
 
   public getKeypair(): Keypair {
     return this.keypair;
+  }
+
+  /**
+   * Cryptographically sign proof of challenge ownership for anti-front-running redemption
+   */
+  public signRequesterProof(challengeId: string, txHash: string): string {
+    const message = Buffer.from(`${challengeId}:${txHash}`);
+    return this.keypair.sign(message).toString('base64');
   }
 
   /**
@@ -158,7 +192,7 @@ export class StellarPayer {
 
     const txHash = sendRes.hash;
 
-    // Poll for ledger inclusion safely using raw _getTransaction (bypassing Protocol 22 parser bug)
+    // Poll for ledger inclusion safely using standard JSON-RPC 2.0 (protocol-version agnostic)
     let status: string = sendRes.status;
     let ledger: number | undefined;
     const maxPollAttempts = 30;
@@ -166,7 +200,7 @@ export class StellarPayer {
     for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
       await new Promise((r) => setTimeout(r, 1000));
 
-      const rawTx = await (this.sorobanServer as any)._getTransaction(txHash);
+      const rawTx = await fetchSorobanTxJsonRpc(this.sorobanRpcUrl, txHash);
       if (rawTx) {
         status = rawTx.status;
         ledger = rawTx.ledger || rawTx.latestLedger;

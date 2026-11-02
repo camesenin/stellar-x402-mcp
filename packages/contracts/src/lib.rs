@@ -228,4 +228,101 @@ mod test {
 
         client.settle_payment(&payer, &recipient, &token, &0, &challenge_hash);
     }
+
+    #[test]
+    #[should_panic]
+    fn test_unauthorized_payer_call_fails() {
+        let env = Env::default();
+        // Do NOT mock all auths: payer authorization MUST be checked
+
+        let contract_id = env.register(X402PaymentVault, ());
+        let client = X402PaymentVaultClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token = Address::generate(&env);
+        let challenge_hash = BytesN::from_array(&env, &[7u8; 32]);
+
+        // Must fail because payer did not authorize transaction
+        client.settle_payment(&payer, &recipient, &token, &100_000, &challenge_hash);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_insufficient_payer_balance_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(X402PaymentVault, ());
+        let client = X402PaymentVaultClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_id = env.register_stellar_asset_contract_v2(admin);
+        let token_client = StellarAssetClient::new(&env, &token_id.address());
+        token_client.mint(&payer, &100); // Only 100 stroops
+
+        let challenge_hash = BytesN::from_array(&env, &[15u8; 32]);
+
+        // Attempts to transfer 500,000 stroops -> must panic with InsufficientBalance
+        client.settle_payment(
+            &payer,
+            &recipient,
+            &token_id.address(),
+            &500_000,
+            &challenge_hash,
+        );
+    }
+
+    #[test]
+    fn test_receipt_not_found_on_unsettled_hash() {
+        let env = Env::default();
+        let contract_id = env.register(X402PaymentVault, ());
+        let client = X402PaymentVaultClient::new(&env, &contract_id);
+
+        let random_hash = BytesN::from_array(&env, &[88u8; 32]);
+        assert_eq!(client.is_settled(&random_hash), false);
+        assert_eq!(
+            client.try_get_receipt(&random_hash),
+            Err(Ok(X402Error::ReceiptNotFound))
+        );
+    }
+
+    #[test]
+    fn test_distinct_challenges_settle_independently() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(X402PaymentVault, ());
+        let client = X402PaymentVaultClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let recipient_a = Address::generate(&env);
+        let recipient_b = Address::generate(&env);
+
+        let token_id = env.register_stellar_asset_contract_v2(admin);
+        let token_client = StellarAssetClient::new(&env, &token_id.address());
+        token_client.mint(&payer, &10_000_000);
+
+        let hash_a = BytesN::from_array(&env, &[101u8; 32]);
+        let hash_b = BytesN::from_array(&env, &[102u8; 32]);
+
+        client.settle_payment(&payer, &recipient_a, &token_id.address(), &200_000, &hash_a);
+        client.settle_payment(&payer, &recipient_b, &token_id.address(), &300_000, &hash_b);
+
+        assert_eq!(client.total_settlements(), 2);
+        assert!(client.is_settled(&hash_a));
+        assert!(client.is_settled(&hash_b));
+
+        let r_a = client.get_receipt(&hash_a);
+        let r_b = client.get_receipt(&hash_b);
+
+        assert_eq!(r_a.amount, 200_000);
+        assert_eq!(r_a.recipient, recipient_a);
+        assert_eq!(r_b.amount, 300_000);
+        assert_eq!(r_b.recipient, recipient_b);
+    }
 }

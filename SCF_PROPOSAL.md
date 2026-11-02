@@ -55,32 +55,45 @@ Unlike high-fee chains where micropayments are economically impossible, Stellar�
 
 As of proposal preparation:
 - **Deployed Soroban Contract**: Live on Testnet at [`CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA`](https://stellar.expert/explorer/testnet/contract/CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA) (Ledger 5526238, TxHash: `ae152d8104b4e4b8bd100498f7e6245cbd68aecea88eaf5f165f4fc4f7a6e7be`).
-- **Live On-Chain Settlement**: Real testnet transaction confirmed at [`258669e717a07c8f07addd388ffc9599daa24492c42422031b5c0b462e930874`](https://stellar.expert/explorer/testnet/tx/258669e717a07c8f07addd388ffc9599daa24492c42422031b5c0b462e930874) (Ledger `5526606`), transferring native XLM SAC with verified contract receipt.
-- **Rust Contract Tests**: 3/3 passing (`packages/contracts/src/lib.rs`).
-- **TypeScript Unit Tests**: 24/24 passing across gateway, client, and CLI packages (`vitest`).
-- **SQLite WAL Full Durability & Replay Protection**: Verified against server crash/restart scenarios with atomic rollback on collision.
+- **Live On-Chain Settlement**: Real testnet transaction confirmed at [`700760f41b7266bc50c05e9eb66446433e9c518c120c9352c6adf0e0588bcb24`](https://stellar.expert/explorer/testnet/tx/700760f41b7266bc50c05e9eb66446433e9c518c120c9352c6adf0e0588bcb24) (Ledger `5526687`), transferring native XLM SAC with verified contract receipt.
+- **Cryptographic Durability Artifact**: Raw RPC response, envelope XDR, and diagnostic events preserved in [`testnet_evidence_pack.json`](./testnet_evidence_pack.json), ensuring persistent verification immune to Testnet ledger resets.
+- **Rust Contract Unit Tests**: 7/7 passing (`packages/contracts/src/lib.rs`), asserting amount validation, payer authorization, insufficient balance checks, receipt retrieval, replay panic, and multi-challenge isolation.
+- **TypeScript Test Suite**: 31/31 passing across `@stellar-x402/gateway` (16), `@stellar-x402/client` (13), `@stellar-x402/cli` (1), and `examples/mcp-payment-demo` (1).
+- **Adversarial Testnet Integration Suite**: 4/4 passing (`packages/gateway/testnet_e2e_integration.mjs`), including cross-challenge hash mismatch rejection, envelope argument binding, on-chain storage query, and double-redemption blocking.
+- **Total Test Count**: Exactly 42 automated tests (7 Rust + 31 TS + 4 Testnet E2E).
+- **SQLite WAL Durability**: Zero-lock contention under 100 concurrent requests, atomic rollback on duplicate hash collision.
 - **Soroban Wasm Target**: Successfully compiled for WebAssembly MVP v1 (`target/wasm32v1-none/release/stellar_x402_contracts.wasm`, 15,663 bytes).
-- **Autonomous Soroban Client**: Automated contract footprint preparation, resource fee calculation, payer authorization, and resilient inclusion polling.
-- **Concurrency-Safe Budget Manager**: Atomic reservations preventing runaway agent spending under concurrent tool invocation.
-- **End-to-End Simulation & Live Testnet Integration**: Successfully verified autonomous tool challenge, budget validation, payment settlement, and payload return (`pnpm --filter @stellar-x402/gateway run test:testnet`).
+- **Standard Protocol Integration**: Pure RFC 7159 / JSON-RPC 2.0 communication with Soroban RPC (Protocol 23+ compatible, zero reliance on private SDK methods).
 - **CI/CD Pipeline**: GitHub Actions running on every commit.
 
 ---
 
-## 5. Roadmap & Milestones
+## 5. Security & Threat Model Defenses
 
-### Milestone 1: Core Tooling & Testnet Gateway (Completed Prior to Submission)
+1. **Anti-Griefing Parameter Binding**: Challenges commit to `(destination, token, amount, nonce)` in the challenge hash. The gateway enforces full 4-tuple envelope matching (`recipient`, `token`, `amount_stroops`, `challenge_hash`). An attacker attempting to burn a challenge with 1 stroop to an arbitrary address is strictly rejected.
+2. **Pinned Vault Contract Enforcement**: Gateway verifies `contractId` against `pinnedVaultContractId`, rejecting spoofed contract instances.
+3. **Redemption Front-Running Mitigation**: Cryptographic signature validation (`X-Payer-Signature`) binds `${challengeId}:${txHash}` to the payer keypair. Public ledger observers cannot front-run or steal paid resources without possessing the private key.
+4. **Budget In-Flight Overdraft Quarantine**: In-flight transactions are quarantined until `timeBounds.maxTime` has elapsed, preventing budget leaks or overdrafts on RPC timeouts.
+5. **Contract Immutability & State TTL**: `X402PaymentVault` has zero admin keys and zero upgrade entry points. Persistent receipts are refreshed with `extend_ttl(100k, 500k)` to maintain on-chain audit trails.
+
+---
+
+## 6. Roadmap & Milestones (Forward-Looking Scope)
+
+> **Important**: Milestone 1 was fully completed and verified prior to submission to thoroughly de-risk the technical foundation. The requested $35,000 USD Build Award funds the forward-looking work across Milestones 2 and 3.
+
+### Milestone 1: Core Tooling & Testnet Gateway (Completed Prior to Submission — Self-Funded)
 - [x] Monorepo architecture with pnpm workspaces.
 - [x] Soroban `X402PaymentVault` contract in Rust with anti-replay guarantees.
-- [x] HTTP 402 Express middleware and Horizon transaction verifier.
-- [x] Autonomous Agent Client SDK with budget safety manager.
+- [x] HTTP 402 Express middleware and Soroban JSON-RPC 2.0 transaction verifier.
+- [x] Autonomous Agent Client SDK with in-flight budget quarantine manager.
 - [x] Working MCP server wrapper with paid tool demonstration.
 
 ### Milestone 2: Mainnet Hardening, Soroban SAC Token Support & SDK Packaging (Weeks 1 – 4)
 - [ ] Publish `@stellar-x402/gateway` and `@stellar-x402/client` to npm registry.
-- [ ] Support native Soroban Stellar Asset Contract (SAC) multi-asset payments (USDC, EURC).
+- [ ] Multi-asset Soroban Stellar Asset Contract (SAC) routing (USDC, EURC) with slippage bounds.
 - [ ] Batch settlement contract for high-frequency agent tool calling (reducing fees by 80%).
-- [ ] Formal audit of Soroban `X402PaymentVault` contract.
+- [ ] Formal independent security audit of Soroban `X402PaymentVault` contract for Mainnet deployment.
 
 ### Milestone 3: Ecosystem Integrations & Hosted Gateway Directory (Weeks 5 – 8)
 - [ ] Pre-packaged MCP Server adapters for popular tools (Brave Search, Postgres, GitHub API).
@@ -90,14 +103,14 @@ As of proposal preparation:
 
 ---
 
-## 6. Budget Request
+## 7. Budget Request
 
 - **Requested Amount**: $35,000 USD (in XLM)
-- **Breakdown**:
-  - Engineering & Soroban contract optimization: $18,000
-  - SDK packaging, npm distribution & MCP integrations: $9,000
-  - Documentation, tutorials, and developer outreach: $5,000
-  - Infrastructure, RPC endpoints & testnet funding: $3,000
+- **Forward-Looking Allocation**:
+  - Independent security audit & Mainnet contract hardening: $10,000
+  - Multi-asset SAC router, batch settlement & npm packaging: $12,000
+  - Ecosystem MCP adapters (LangChain, Claude Desktop, Docker): $8,000
+  - Developer portal, interactive sandboxes & testnet infrastructure: $5,000
 
 ---
 

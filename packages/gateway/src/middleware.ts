@@ -17,11 +17,12 @@ export class RateLimiter {
 
   constructor(
     private maxRequests: number = 60,
-    private windowMs: number = 60_000
+    private windowMs: number = 60_000,
+    private clock: () => number = () => Date.now()
   ) {}
 
   public isAllowed(clientIp: string): boolean {
-    const now = Date.now();
+    const now = this.clock();
     let bucket = this.buckets.get(clientIp);
 
     if (!bucket || now > bucket.resetAt) {
@@ -39,7 +40,7 @@ export class RateLimiter {
   }
 
   public cleanup(): void {
-    const now = Date.now();
+    const now = this.clock();
     for (const [ip, bucket] of this.buckets.entries()) {
       if (now > bucket.resetAt) {
         this.buckets.delete(ip);
@@ -48,17 +49,29 @@ export class RateLimiter {
   }
 }
 
+export function getClientIp(req: Request, trustProxy?: boolean | string[]): string {
+  if (trustProxy) {
+    const forwarded = req.header('x-forwarded-for');
+    if (forwarded) {
+      const ips = forwarded.split(',').map((s) => s.trim());
+      if (ips[0]) return ips[0];
+    }
+  }
+  return req.ip || req.socket?.remoteAddress || '127.0.0.1';
+}
+
 export function createX402Middleware(
   config: GatewayConfig,
   store: ChallengeStore,
   verifier: StellarPaymentVerifier,
-  getRoutePrice?: (req: Request) => { amount: string; asset?: string }
+  getRoutePrice?: (req: Request) => { amount: string; asset?: string },
+  rateLimiterClock?: () => number
 ) {
-  const rateLimiter = new RateLimiter(60, 60_000);
+  const rateLimiter = new RateLimiter(60, 60_000, rateLimiterClock);
 
   return async (req: X402Request, res: Response, next: NextFunction): Promise<void> => {
-    // 1. Rate Limiting Protection (Anti-DoS)
-    const clientIp = req.ip || req.socket.remoteAddress || 'unknown-client';
+    // 1. Safe IP Determination & Rate Limiting (Anti-DoS)
+    const clientIp = getClientIp(req, config.trustProxy);
     if (!rateLimiter.isAllowed(clientIp)) {
       res.status(429).json({
         error: 'Too Many Requests',
@@ -72,6 +85,8 @@ export function createX402Middleware(
       (req.header('X-Stellar-TxHash') || req.header('x-stellar-txhash'))?.trim();
     const challengeId =
       (req.header('X-Challenge-Id') || req.header('x-challenge-id') || (req.query.challengeId as string))?.trim();
+    const payerSignature =
+      (req.header('X-Payer-Signature') || req.header('x-payer-signature'))?.trim();
 
     // Determine price for this specific resource/route
     const pricing = getRoutePrice
@@ -95,7 +110,20 @@ export function createX402Middleware(
         return;
       }
 
-      const result = await verifier.verifyPayment(txHash, challenge, store);
+      // Requester binding defense (anti front-running)
+      if (config.requireRequesterAuth && !payerSignature) {
+        res.status(401).json({
+          error: 'Requester Signature Required',
+          message: 'This gateway requires X-Payer-Signature header binding challengeId and txHash.',
+        });
+        return;
+      }
+
+      const requesterAuth = payerSignature
+        ? { message: `${challengeId}:${txHash}`, signatureBase64: payerSignature }
+        : undefined;
+
+      const result = await verifier.verifyPayment(txHash, challenge, store, requesterAuth);
       if (!result.valid) {
         res.status(402).json({
           error: 'Payment verification failed',

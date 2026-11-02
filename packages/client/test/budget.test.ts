@@ -68,4 +68,31 @@ describe('BudgetManager', () => {
     expect(budget.getPendingReservedXlm()).toBe(0);
     expect(budget.getSpentTotal()).toBe(0.8);
   });
+
+  it('quarantines reservation when released with in-flight timebound to prevent overdraft', () => {
+    let mockTime = 1000;
+    const budget = new BudgetManager(1.0, 1.5, 120_000, () => mockTime);
+
+    // Reserve 0.8 XLM
+    const resId = budget.reserve(0.8);
+    expect(budget.getPendingReservedXlm()).toBe(0.8);
+
+    // Release called because RPC poll timed out, but tx has maxTime bound of mockTime + 30_000
+    const inFlightUntil = mockTime + 30_000;
+    budget.release(resId, inFlightUntil);
+
+    // Reservation is NOT freed immediately: still quarantined in pending status
+    expect(budget.getPendingReservedXlm()).toBe(0.8);
+
+    // A competing call attempting to reserve 0.8 XLM is still blocked!
+    expect(() => budget.reserve(0.8)).toThrow(/would exceed total ceiling/);
+
+    // Advance clock past the in-flight timebound
+    mockTime += 30_001;
+
+    // Now reservation is pruned and budget is freed safely
+    expect(budget.getPendingReservedXlm()).toBe(0);
+    const newRes = budget.reserve(0.8);
+    expect(newRes).toBeDefined();
+  });
 });

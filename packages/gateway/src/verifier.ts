@@ -60,19 +60,48 @@ export class StellarPaymentVerifier {
   private sorobanServer?: rpc.Server;
   private networkPassphrase: string;
   private network: 'testnet' | 'public' | 'custom';
+  private sorobanRpcUrl: string;
+  private pinnedVaultContractId?: string;
 
   constructor(
     horizonUrl: string = 'https://horizon-testnet.stellar.org',
     sorobanRpcUrl: string = 'https://soroban-testnet.stellar.org',
-    network: 'testnet' | 'public' | 'custom' = 'testnet'
+    network: 'testnet' | 'public' | 'custom' = 'testnet',
+    pinnedVaultContractId?: string
   ) {
     this.network = network;
+    this.sorobanRpcUrl = sorobanRpcUrl;
+    this.pinnedVaultContractId = pinnedVaultContractId;
     this.horizonServer = new Horizon.Server(horizonUrl);
     if (sorobanRpcUrl) {
       this.sorobanServer = new rpc.Server(sorobanRpcUrl);
     }
     this.networkPassphrase =
       network === 'public' ? Networks.PUBLIC : Networks.TESTNET;
+  }
+
+  /**
+   * Fetch transaction from Soroban RPC using official JSON-RPC 2.0 specification
+   * completely independent of SDK internal private methods
+   */
+  public async fetchSorobanTxJsonRpc(txHash: string): Promise<Record<string, any> | null> {
+    try {
+      const res = await fetch(this.sorobanRpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getTransaction',
+          params: { hash: txHash },
+        }),
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as any;
+      return data?.result || null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -84,9 +113,21 @@ export class StellarPaymentVerifier {
   public async verifyPayment(
     txHash: string,
     challenge: X402Challenge,
-    store: ChallengeStore
+    store: ChallengeStore,
+    requesterAuth?: { payerPublicKey?: string; signatureBase64: string; message: string }
   ): Promise<VerificationResult> {
     const cleanHash = txHash.trim().toLowerCase();
+
+    // 0. Pin check: If gateway configured a pinned vault contract, verify match
+    if (this.pinnedVaultContractId && challenge.contractId) {
+      if (challenge.contractId !== this.pinnedVaultContractId) {
+        return {
+          valid: false,
+          reason: `Untrusted contract ID: Challenge specifies '${challenge.contractId}', but gateway has pinned '${this.pinnedVaultContractId}'`,
+          txHash: cleanHash,
+        };
+      }
+    }
 
     // 1. Anti-Replay SQLite Check (ACID verification)
     if (store.isTxRedeemed(cleanHash)) {
@@ -107,7 +148,7 @@ export class StellarPaymentVerifier {
 
     // 2. Branch A: Soroban Contract Verification
     if (challenge.contractId && this.sorobanServer) {
-      return this.verifySorobanTransactionAndReceipt(cleanHash, challenge, store);
+      return this.verifySorobanTransactionAndReceipt(cleanHash, challenge, store, requesterAuth);
     }
 
     // 3. Branch B: Classic Horizon Payment Verification
@@ -120,9 +161,11 @@ export class StellarPaymentVerifier {
   private async verifySorobanTransactionAndReceipt(
     txHash: string,
     challenge: X402Challenge,
-    store: ChallengeStore
+    store: ChallengeStore,
+    requesterAuth?: { payerPublicKey?: string; signatureBase64: string; message: string }
   ): Promise<VerificationResult> {
-    if (!this.sorobanServer || !challenge.contractId) {
+    const targetVault = this.pinnedVaultContractId || challenge.contractId;
+    if (!this.sorobanServer || !targetVault) {
       return {
         valid: false,
         reason: 'Soroban RPC server or Contract ID not configured on gateway',
@@ -131,8 +174,8 @@ export class StellarPaymentVerifier {
     }
 
     try {
-      // 1. Query transaction status on Soroban RPC using safe raw fetch (bypassing Protocol 22 Bad union switch: 4 bug)
-      const rawTx = await (this.sorobanServer as any)._getTransaction(txHash);
+      // 1. Query transaction status on Soroban RPC using standard JSON-RPC 2.0
+      const rawTx = await this.fetchSorobanTxJsonRpc(txHash);
 
       if (!rawTx || rawTx.status !== 'SUCCESS') {
         return {
@@ -151,7 +194,12 @@ export class StellarPaymentVerifier {
         hashBytes = crypto.createHash('sha256').update(challenge.challengeId).digest();
       }
 
-      // 2. Cryptographic and semantic envelope linkage check
+      const expectedToken = challenge.tokenAddress || (
+        this.network === 'public' ? PUBLIC_NATIVE_SAC : TESTNET_NATIVE_SAC
+      );
+      const expectedStroops = amountToStroops(challenge.amount);
+
+      // 2. Strict cryptographic and semantic envelope linkage check
       if (rawTx.envelopeXdr) {
         try {
           const envelope = xdr.TransactionEnvelope.fromXDR(rawTx.envelopeXdr, 'base64');
@@ -167,7 +215,7 @@ export class StellarPaymentVerifier {
                   const invokeArgs = hostFn.invokeContract();
                   const invokedContract = Address.fromScAddress(invokeArgs.contractAddress()).toString();
                   const fnName = invokeArgs.functionName().toString();
-                  if (invokedContract !== challenge.contractId || fnName !== 'settle_payment') {
+                  if (invokedContract !== targetVault || fnName !== 'settle_payment') {
                     return false;
                   }
 
@@ -176,7 +224,31 @@ export class StellarPaymentVerifier {
                     return false;
                   }
 
-                  // Cryptographic challenge hash binding: argument 4 must match expected challenge hash
+                  // 2a. Envelope Recipient binding (arg 1)
+                  try {
+                    const recipientArg = Address.fromScAddress(args[1].address()).toString();
+                    if (recipientArg !== challenge.destination) return false;
+                  } catch {
+                    return false;
+                  }
+
+                  // 2b. Envelope Token SAC binding (arg 2)
+                  try {
+                    const tokenArg = Address.fromScAddress(args[2].address()).toString();
+                    if (tokenArg !== expectedToken) return false;
+                  } catch {
+                    return false;
+                  }
+
+                  // 2c. Envelope Exact Amount in Stroops binding (arg 3)
+                  try {
+                    const amountNative = scValToNative(args[3]);
+                    if (BigInt(amountNative) !== expectedStroops) return false;
+                  } catch {
+                    return false;
+                  }
+
+                  // 2d. Envelope Challenge Hash binding (arg 4)
                   try {
                     const opHash = args[4].bytes();
                     if (!opHash || !opHash.equals(hashBytes)) {
@@ -195,26 +267,26 @@ export class StellarPaymentVerifier {
             if (!matchingOp) {
               return {
                 valid: false,
-                reason: `Transaction ${txHash} did not invoke 'settle_payment' for challenge '${challenge.challengeId}' on target contract ${challenge.contractId}`,
+                reason: `Transaction ${txHash} did not invoke 'settle_payment' for challenge '${challenge.challengeId}' matching exact parameters on target vault ${targetVault}`,
                 txHash,
               };
             }
           }
         } catch {
-          // If envelope parsing has an issue, fallback to ledger storage receipt check
+          // If envelope parsing fails, continue to contract storage check
         }
       }
 
       // 3. Query Soroban contract ledger storage for the persistent receipt
       const receipt = await this.querySorobanContractReceipt(
-        challenge.contractId,
+        targetVault,
         challenge.challengeId
       );
 
       if (!receipt) {
         return {
           valid: false,
-          reason: `No settled payment receipt found in Soroban contract ${challenge.contractId} for challenge ${challenge.challengeId}`,
+          reason: `No settled payment receipt found in Soroban contract ${targetVault} for challenge ${challenge.challengeId}`,
           txHash,
         };
       }
@@ -228,10 +300,7 @@ export class StellarPaymentVerifier {
         };
       }
 
-      // 5. Validate SAC Token address matches expected asset (prevents paying with fake tokens)
-      const expectedToken = challenge.tokenAddress || (
-        this.network === 'public' ? PUBLIC_NATIVE_SAC : TESTNET_NATIVE_SAC
-      );
+      // 5. Validate SAC Token address matches expected asset
       if (receipt.token !== expectedToken) {
         return {
           valid: false,
@@ -240,8 +309,7 @@ export class StellarPaymentVerifier {
         };
       }
 
-      // 6. Validate exact amount in stroops (eliminates overpayment/underpayment discrepancies)
-      const expectedStroops = amountToStroops(challenge.amount);
+      // 6. Validate exact amount in stroops
       const paidStroops = BigInt(receipt.amount);
       if (paidStroops !== expectedStroops) {
         return {
@@ -251,7 +319,32 @@ export class StellarPaymentVerifier {
         };
       }
 
-      // 7. Record atomic redemption in SQLite
+      // 7. Requester Binding Defense: If signature proof is present, ensure caller owns payer keypair
+      if (requesterAuth) {
+        try {
+          const { Keypair } = await import('@stellar/stellar-sdk');
+          const payerKp = Keypair.fromPublicKey(receipt.payer);
+          const isValidSig = payerKp.verify(
+            Buffer.from(requesterAuth.message),
+            Buffer.from(requesterAuth.signatureBase64, 'base64')
+          );
+          if (!isValidSig) {
+            return {
+              valid: false,
+              reason: 'Requester authentication failed: Signature does not match on-chain payer keypair',
+              txHash,
+            };
+          }
+        } catch (sigErr) {
+          return {
+            valid: false,
+            reason: `Requester signature validation error: ${sigErr}`,
+            txHash,
+          };
+        }
+      }
+
+      // 8. Record atomic redemption in SQLite
       store.markRedeemed(challenge.challengeId, txHash, {
         payer: receipt.payer,
         amount: challenge.amount,

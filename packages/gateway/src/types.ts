@@ -18,6 +18,11 @@ export interface PaymentProof {
   challengeId: string;
 }
 
+export interface RequesterAuth {
+  message: string;
+  signatureBase64: string;
+}
+
 export interface GatewayConfig {
   destinationPublicKey: string;
   network?: StellarNetwork;
@@ -27,6 +32,9 @@ export interface GatewayConfig {
   defaultFeeAsset?: string;
   challengeTtlMs?: number;
   contractId?: string;
+  pinnedVaultContractId?: string;
+  trustProxy?: boolean | string[];
+  requireRequesterAuth?: boolean;
 }
 
 export interface VerificationResult {

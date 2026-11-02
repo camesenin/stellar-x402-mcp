@@ -168,7 +168,7 @@ cargo build --target wasm32v1-none --release
 
 ## 🧪 Testing & Empirical Verification
 
-### 1. Monorepo Unit Test Suite (24 tests passing)
+### 1. Monorepo Test Suite (38 unit & simulation tests + 4 on-chain = 42 tests passing)
 Run all unit and integration tests across both Rust contracts and TypeScript packages:
 
 ```bash
@@ -176,26 +176,51 @@ pnpm test
 cargo test --manifest-path packages/contracts/Cargo.toml
 ```
 
-- `@stellar-x402/gateway`: 11 tests (SQLite WAL ACID persistence, atomic rollback on duplicate hash, exact stroop conversion bounds, anti-replay, Soroban verifier).
-- `@stellar-x402/client`: 12 tests (x402 header & JSON parser, concurrency-safe budget reservations, Soroban payer routing, budget ceilings).
-- `@stellar-x402/cli`: 1 test (CLI smoke & command validation).
-- `examples/mcp-payment-demo`: 1 test (Full autonomous agent negotiation demo).
+- `@stellar-x402/contracts`: **7 unit tests** (amount > 0 validation, payer auth requirement, insufficient balance rejection, receipt not found handling, happy-path settlement, contract anti-replay panic, multi-challenge isolation).
+- `@stellar-x402/gateway`: **16 unit tests** (SQLite WAL ACID persistence, atomic rollback on duplicate hash, exact 7-decimal stroop bounds, anti-replay, envelope parameter binding, pinned vault rejection, deterministic clock rate limiting, anti-spoofing proxy handling, requester signature validation).
+- `@stellar-x402/client`: **13 unit tests** (x402 header & JSON parser, concurrency-safe budget reservations, in-flight reservation timeout quarantine, budget ceilings, autonomous key signing).
+- `@stellar-x402/cli`: **1 test** (CLI smoke & command validation).
+- `examples/mcp-payment-demo`: **1 test** (Full autonomous agent negotiation simulation).
 
-### 2. Live On-Chain Testnet Integration Test
-Execute a live, end-to-end payment settlement against the live deployed Soroban contract using Friendbot-funded ephemeral keys:
+### 2. Live On-Chain Testnet Integration Test (4 adversarial integration tests)
+Execute live, end-to-end settlement and adversarial verification against the deployed Soroban contract:
 
 ```bash
 pnpm --filter @stellar-x402/gateway run test:testnet
 ```
 
-This test:
-1. Generates ephemeral payer and merchant keypairs.
-2. Funds both accounts via Friendbot on Stellar Testnet.
-3. Issues an HTTP 402 challenge with contract address `CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA`.
-4. Executes autonomous contract invocation `settle_payment` transferring native XLM SAC.
-5. Polls until inclusion in Testnet ledger consensus.
-6. Verifies transaction envelope argument binding and queries persistent on-chain `PaymentReceipt` struct.
-7. Proves anti-replay blocking by rejecting immediate second redemption attempts.
+This automated suite executes:
+1. **Challenge Issuance**: Ephemeral merchant issues Challenge A and Challenge B.
+2. **On-Chain Settlement**: Ephemeral payer settles Challenge A via Soroban contract `CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA` on Protocol 23+ Testnet.
+3. **Adversarial Envelope Mismatch Test**: Submits TxHash A against Challenge B *before* database redemption; verifier inspects envelope args, detects hash mismatch, and rejects it cleanly.
+4. **Legitimate Verification**: Submits TxHash A against Challenge A; verifier verifies 4-tuple binding, checks contract persistent storage, and confirms valid settlement.
+5. **Anti-Replay Blocking**: Submits TxHash A again to Challenge A; database uniqueness constraint prevents duplicate redemption.
+6. **Cryptographic Durability Artifact**: Raw RPC response, envelope XDR, and diagnostic events are persisted in [`testnet_evidence_pack.json`](./testnet_evidence_pack.json) to survive Testnet resets.
+
+---
+
+## 🛡️ Threat Model & Security Defenses
+
+| Attack Vector | Vulnerability Scenario | Mitigation Implemented | Tested & Proven In |
+| :--- | :--- | :--- | :--- |
+| **Griefing / DoS Pre-Consumption** | Attacker grabs public challenge hash from 402 header and settles 1 stroop to attacker address, burning the hash. | **4-Tuple Parameter Binding**: Challenge hash commits to `(destination, token, amount, nonce)`. Verifier enforces `args[1] == destination`, `args[2] == token`, `args[3] == amount_stroops`, and `args[4] == hash`. A 1-stroop or wrong-address call fails verifier checks. | `packages/gateway/src/verifier.ts`, `testnet_e2e_integration.mjs` |
+| **Vault Contract Spoofing** | Attacker deploys malicious contract emitting identical `PaymentReceipt` struct. | **Pinned Vault Contract ID**: Gateway enforces strict contract whitelist (`pinnedVaultContractId`). Calls to any unauthorized contract are rejected before ledger queries. | `packages/gateway/test/verifier.test.ts` |
+| **Redemption Front-Running Race** | Observer spots public confirmed `txHash` on ledger and redeems resource before the legitimate payer. | **Requester Cryptographic Binding**: Client signs `${challengeId}:${txHash}` with the payer keypair (`X-Payer-Signature`). Gateway verifies signature matches `receipt.payer`. Front-runner cannot forge signature. | `packages/gateway/test/middleware.test.ts` |
+| **In-Flight Budget Overdraft** | RPC poll times out on network lag; releasing budget immediately allows in-flight tx to land later, exceeding ceiling. | **In-Flight Quarantine Timebounds**: `BudgetManager.release(resId, keepUntilTime)` holds reservation until `timeBounds.maxTime` has elapsed. In-flight tx cannot cause overspend. | `packages/client/test/budget.test.ts` |
+| **State Storage & Immutability** | Soroban persistent entries expire; upgradeable contracts have admin keys. | **Persistent TTL Extension & Zero Admin**: Contract calls `extend_ttl(100k, 500k)` on receipt. Contract has NO admin keys, NO upgrade hooks (immutable bytecode). SQLite WAL provides instant local anti-replay. | `packages/contracts/src/lib.rs` |
+| **Rate Limit Evasion via Spoofed IP** | Attacker injects fake `X-Forwarded-For` headers to cycle rate limit buckets. | **Proxy Trust Whitelist & Deterministic Clock**: `trustProxy` setting ignores untrusted proxy headers; `RateLimiter` supports injected clock for deterministic testing. | `packages/gateway/test/middleware.test.ts` |
+
+---
+
+## 🌐 Layer-3 Facilitator Architecture vs Pay-Then-Prove
+
+Standard x402 specifications envision a 3-party protocol: Client, Resource Server, and Facilitator. In high-latency or custodial models, facilitators hold pre-funded credit lines. 
+
+`stellar-x402-mcp` implements a **decentralized Layer-3 Facilitator pattern**:
+1. **Resource Server (Gateway)** issues standard `WWW-Authenticate: StellarX402 ...` headers containing pricing and challenge parameters.
+2. **Client Agent** signs and submits the transaction directly to Stellar / Soroban without intermediary custodial risk.
+3. **Facilitator (Verification Engine)** cryptographically checks on-chain receipts, inspects contract invocation envelopes, and enforces anti-replay via SQLite WAL before delivering protected MCP tool responses.
+This gives AI agents complete self-sovereignty without centralized escrow or KYC bottlenecks.
 
 ---
 

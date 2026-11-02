@@ -4,6 +4,7 @@ interface ActiveReservation {
   id: string;
   amountXlm: number;
   reservedAt: number;
+  releaseAt?: number;
 }
 
 export class BudgetManager {
@@ -19,13 +20,18 @@ export class BudgetManager {
   constructor(
     private maxPerCallXlm: number = 1.0,
     private totalCeilingXlm: number = 10.0,
-    private reservationTtlMs: number = 120_000
+    private reservationTtlMs: number = 120_000,
+    private clock: () => number = () => Date.now()
   ) {}
 
   private pruneExpiredReservations(): void {
-    const now = Date.now();
+    const now = this.clock();
     for (const [id, res] of this.reservations.entries()) {
-      if (now - res.reservedAt > this.reservationTtlMs) {
+      if (res.releaseAt) {
+        if (now >= res.releaseAt) {
+          this.reservations.delete(id);
+        }
+      } else if (now - res.reservedAt > this.reservationTtlMs) {
         this.reservations.delete(id);
       }
     }
@@ -105,10 +111,20 @@ export class BudgetManager {
   }
 
   /**
-   * Release reservation if transaction was cancelled, failed or timed out
+   * Release reservation if transaction was cancelled, failed or timed out.
+   * If keepUntilTime is provided (e.g. transaction maxTime / maxLedger timeout bound),
+   * the reservation is quarantined in pending status until that timestamp has passed
+   * to strictly prevent double-spending / overdraft from in-flight transactions landing later.
    */
-  public release(reservationId: string): void {
-    this.reservations.delete(reservationId);
+  public release(reservationId: string, keepUntilTime?: number): void {
+    const res = this.reservations.get(reservationId);
+    if (!res) return;
+
+    if (keepUntilTime && keepUntilTime > this.clock()) {
+      res.releaseAt = keepUntilTime;
+    } else {
+      this.reservations.delete(reservationId);
+    }
   }
 
   public recordPayment(amountXlm: number, destination: string, txHash: string): void {

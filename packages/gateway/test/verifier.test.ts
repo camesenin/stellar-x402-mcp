@@ -95,4 +95,29 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
     expect(result.valid).toBe(false);
     expect(result.reason).toMatch(/already been settled/i);
   });
+
+  it('rejects verification if contractId does not match pinnedVaultContractId', async () => {
+    const pinnedVerifier = new StellarPaymentVerifier(
+      'https://horizon-testnet.stellar.org',
+      'https://soroban-testnet.stellar.org',
+      'testnet',
+      'CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA' // Pinned legitimate contract
+    );
+
+    const spoofedChallenge: X402Challenge = {
+      challengeId: 'spoofed_challenge_123',
+      destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      amount: '0.05',
+      asset: 'XLM',
+      memo: 'spoofed_memo',
+      network: 'testnet',
+      contractId: 'CATTACKER_SPOOFED_CONTRACT_ID_11111111111111111111111111',
+      resource: '/resource',
+      expiresAt: Date.now() + 60_000,
+    };
+
+    const result = await pinnedVerifier.verifyPayment('any_tx_hash', spoofedChallenge, store);
+    expect(result.valid).toBe(false);
+    expect(result.reason).toContain('Untrusted contract ID');
+  });
 });
