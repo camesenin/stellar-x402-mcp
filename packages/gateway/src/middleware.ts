@@ -7,14 +7,67 @@ export interface X402Request extends Request {
   stellarPayment?: VerificationResult;
 }
 
+interface RateLimitBucket {
+  count: number;
+  resetAt: number;
+}
+
+export class RateLimiter {
+  private buckets = new Map<string, RateLimitBucket>();
+
+  constructor(
+    private maxRequests: number = 60,
+    private windowMs: number = 60_000
+  ) {}
+
+  public isAllowed(clientIp: string): boolean {
+    const now = Date.now();
+    let bucket = this.buckets.get(clientIp);
+
+    if (!bucket || now > bucket.resetAt) {
+      bucket = { count: 1, resetAt: now + this.windowMs };
+      this.buckets.set(clientIp, bucket);
+      return true;
+    }
+
+    if (bucket.count >= this.maxRequests) {
+      return false;
+    }
+
+    bucket.count += 1;
+    return true;
+  }
+
+  public cleanup(): void {
+    const now = Date.now();
+    for (const [ip, bucket] of this.buckets.entries()) {
+      if (now > bucket.resetAt) {
+        this.buckets.delete(ip);
+      }
+    }
+  }
+}
+
 export function createX402Middleware(
   config: GatewayConfig,
   store: ChallengeStore,
   verifier: StellarPaymentVerifier,
   getRoutePrice?: (req: Request) => { amount: string; asset?: string }
 ) {
+  const rateLimiter = new RateLimiter(60, 60_000);
+
   return async (req: X402Request, res: Response, next: NextFunction): Promise<void> => {
-    // 1. Extract payment headers
+    // 1. Rate Limiting Protection (Anti-DoS)
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown-client';
+    if (!rateLimiter.isAllowed(clientIp)) {
+      res.status(429).json({
+        error: 'Too Many Requests',
+        message: 'Rate limit exceeded for x402 challenge generation. Please retry in 1 minute.',
+      });
+      return;
+    }
+
+    // 2. Extract payment headers
     const txHash =
       (req.header('X-Stellar-TxHash') || req.header('x-stellar-txhash'))?.trim();
     const challengeId =
@@ -31,7 +84,7 @@ export function createX402Middleware(
     const targetAsset = pricing.asset ?? 'XLM';
     const targetAmount = pricing.amount;
 
-    // 2. If txHash and challengeId are present, attempt verification
+    // 3. If txHash and challengeId are present, attempt verification
     if (txHash && challengeId) {
       const challenge = store.getChallenge(challengeId);
       if (!challenge) {
@@ -62,7 +115,7 @@ export function createX402Middleware(
       return;
     }
 
-    // 3. No payment provided: issue 402 challenge
+    // 4. No payment provided: issue 402 challenge with SQLite persistence
     const challenge = store.createChallenge(
       config.destinationPublicKey,
       targetAmount,

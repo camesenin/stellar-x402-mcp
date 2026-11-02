@@ -4,13 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node --loader ts-node/esm demo.ts",
-    "test": "node --loader ts-node/esm demo.ts"
+    "build": "tsc",
+    "test": "tsc && node dist/demo.js",
+    "start": "tsc && node dist/demo.js"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.0",
     "@stellar-x402/client": "workspace:*",
     "@stellar-x402/gateway": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.6.0",
     "@stellar/stellar-sdk": "^13.3.0"
   }
 }

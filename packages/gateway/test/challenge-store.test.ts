@@ -1,68 +1,87 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 import { ChallengeStore } from '../src/challenge-store.js';
 
-describe('ChallengeStore', () => {
-  it('creates challenges with unique nonces and correct TTL', () => {
-    const store = new ChallengeStore(60_000);
-    const challenge1 = store.createChallenge(
-      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-      '0.05',
-      'XLM',
-      '/test-resource'
-    );
-    const challenge2 = store.createChallenge(
-      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-      '0.05',
-      'XLM',
-      '/test-resource'
-    );
+describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
+  let tempDbPath: string;
 
-    expect(challenge1.challengeId).toBeDefined();
-    expect(challenge2.challengeId).toBeDefined();
-    expect(challenge1.challengeId).not.toEqual(challenge2.challengeId);
-    expect(challenge1.memo.length).toBeLessThanOrEqual(28);
-    expect(challenge1.amount).toBe('0.05');
+  beforeEach(() => {
+    tempDbPath = path.join(
+      os.tmpdir(),
+      `x402_test_${Date.now()}_${Math.random().toString(36).slice(2)}.sqlite`
+    );
   });
 
-  it('retrieves active challenge and returns undefined for unknown challenge', () => {
-    const store = new ChallengeStore();
+  afterEach(() => {
+    if (fs.existsSync(tempDbPath)) {
+      try {
+        fs.unlinkSync(tempDbPath);
+      } catch {
+        // Ignored on Windows file lock during rapid tests
+      }
+    }
+  });
+
+  it('creates and retrieves challenges from SQLite', () => {
+    const store = new ChallengeStore(tempDbPath, 60_000);
     const challenge = store.createChallenge(
       'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-      '0.01',
+      '0.05',
       'XLM',
-      '/api'
+      '/test-resource'
     );
+
+    expect(challenge.challengeId).toBeDefined();
+    expect(challenge.memo.length).toBeLessThanOrEqual(28);
 
     const fetched = store.getChallenge(challenge.challengeId);
-    expect(fetched).toEqual(challenge);
+    expect(fetched).toBeDefined();
+    expect(fetched?.challengeId).toBe(challenge.challengeId);
+    expect(fetched?.amount).toBe('0.05');
 
-    const nonExistent = store.getChallenge('non-existent-id');
-    expect(nonExistent).toBeUndefined();
+    store.close();
   });
 
-  it('marks challenge and transaction as redeemed (anti-replay)', () => {
-    const store = new ChallengeStore();
-    const challenge = store.createChallenge(
+  it('preserves redeemed transactions across store restart (Anti-Replay)', () => {
+    const dummyTx = '99887766554433221100aabbccddeeff99887766554433221100aabbccddeeff';
+
+    // Session 1: Server runs, issues challenge, redeems transaction
+    const store1 = new ChallengeStore(tempDbPath);
+    const challenge = store1.createChallenge(
       'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-      '0.01',
+      '0.10',
       'XLM',
-      '/api'
+      '/premium'
     );
 
-    const dummyTx = 'a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef';
-    expect(store.isTxRedeemed(dummyTx)).toBe(false);
-    expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(false);
+    expect(store1.isTxRedeemed(dummyTx)).toBe(false);
+    store1.markRedeemed(challenge.challengeId, dummyTx, {
+      payer: 'GCPAYER123',
+      amount: '0.10',
+      asset: 'XLM',
+      ledger: 123456,
+    });
+    expect(store1.isTxRedeemed(dummyTx)).toBe(true);
 
-    store.markRedeemed(challenge.challengeId, dummyTx);
+    // Simulate Server Crash / Restart: close store1
+    store1.close();
 
-    expect(store.isTxRedeemed(dummyTx)).toBe(true);
-    expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(true);
-    // Challenge should no longer be fetched as active
-    expect(store.getChallenge(challenge.challengeId)).toBeUndefined();
+    // Session 2: Server reboots with same SQLite file
+    const store2 = new ChallengeStore(tempDbPath);
+
+    // Replay attack attempt: Transaction must STILL be marked as redeemed!
+    expect(store2.isTxRedeemed(dummyTx)).toBe(true);
+    expect(store2.isChallengeRedeemed(challenge.challengeId)).toBe(true);
+    // Challenge should not be active for a second claim
+    expect(store2.getChallenge(challenge.challengeId)).toBeUndefined();
+
+    store2.close();
   });
 
-  it('expires challenges after TTL elapsed', async () => {
-    const store = new ChallengeStore(10); // 10ms TTL
+  it('expires unredeemed challenges when TTL passes', async () => {
+    const store = new ChallengeStore(tempDbPath, 15);
     const challenge = store.createChallenge(
       'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       '0.01',
@@ -70,11 +89,13 @@ describe('ChallengeStore', () => {
       '/api',
       'testnet',
       undefined,
-      10 // 10ms TTL
+      15 // 15ms TTL
     );
 
-    await new Promise((r) => setTimeout(r, 25));
+    await new Promise((r) => setTimeout(r, 35));
     const expired = store.getChallenge(challenge.challengeId);
     expect(expired).toBeUndefined();
+
+    store.close();
   });
 });

@@ -15,6 +15,13 @@ Cargo.lock
 *.secret
 *.key
 
+# SQLite Databases
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.db
+
 # Logs & Cache
 *.log
 .DS_Store
