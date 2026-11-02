@@ -140,6 +140,9 @@ export function createX402Middleware(
     if (challenge.contractId) {
       res.setHeader('X-Payment-Contract', challenge.contractId);
     }
+    if (challenge.tokenAddress) {
+      res.setHeader('X-Payment-Token', challenge.tokenAddress);
+    }
 
     res.json({
       status: 402,

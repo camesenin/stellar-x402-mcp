@@ -98,4 +98,61 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
 
     store.close();
   });
+
+  it('guarantees atomic rollback on duplicate transaction hash replay', () => {
+    const store = new ChallengeStore(tempDbPath);
+    const txHash = '11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff';
+
+    const challenge1 = store.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/resource-1'
+    );
+    const challenge2 = store.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/resource-2'
+    );
+
+    // First redemption succeeds
+    store.markRedeemed(challenge1.challengeId, txHash);
+    expect(store.isChallengeRedeemed(challenge1.challengeId)).toBe(true);
+    expect(store.isTxRedeemed(txHash)).toBe(true);
+
+    // Second redemption with SAME txHash MUST throw and roll back challenge2
+    expect(() => {
+      store.markRedeemed(challenge2.challengeId, txHash);
+    }).toThrow();
+
+    // Verify ACID rollback: challenge2 was NOT marked as redeemed!
+    expect(store.isChallengeRedeemed(challenge2.challengeId)).toBe(false);
+    expect(store.getChallenge(challenge2.challengeId)).toBeDefined();
+
+    store.close();
+  });
+
+  it('rejects double redemption of the same challenge', () => {
+    const store = new ChallengeStore(tempDbPath);
+    const tx1 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const tx2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+    const challenge = store.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/resource'
+    );
+
+    store.markRedeemed(challenge.challengeId, tx1);
+
+    expect(() => {
+      store.markRedeemed(challenge.challengeId, tx2);
+    }).toThrow(/already redeemed/i);
+
+    expect(store.isTxRedeemed(tx2)).toBe(false);
+
+    store.close();
+  });
 });

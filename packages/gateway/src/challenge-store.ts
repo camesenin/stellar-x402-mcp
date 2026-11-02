@@ -21,7 +21,7 @@ export class ChallengeStore {
   ) {
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = NORMAL');
+    this.db.pragma('synchronous = FULL');
     this.initSchema();
   }
 
@@ -35,6 +35,7 @@ export class ChallengeStore {
         memo TEXT NOT NULL,
         network TEXT NOT NULL,
         contract_id TEXT,
+        token_address TEXT,
         resource TEXT NOT NULL,
         expires_at INTEGER NOT NULL,
         created_at INTEGER NOT NULL,
@@ -66,12 +67,21 @@ export class ChallengeStore {
     resource: string,
     network: 'testnet' | 'public' | 'custom' = 'testnet',
     contractId?: string,
-    ttlMs?: number
+    ttlMs?: number,
+    tokenAddress?: string
   ): X402Challenge {
     const challengeId = crypto.randomBytes(16).toString('hex');
     const memo = challengeId.slice(0, 28);
     const now = Date.now();
     const expiresAt = now + (ttlMs ?? this.defaultTtlMs);
+
+    // If Soroban contract is specified and no tokenAddress given, default to native XLM SAC on testnet
+    let resolvedToken = tokenAddress;
+    if (contractId && !resolvedToken && (asset.toUpperCase() === 'XLM' || asset.toUpperCase() === 'NATIVE')) {
+      resolvedToken = network === 'public'
+        ? 'CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA'
+        : 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
+    }
 
     const challenge: X402Challenge = {
       challengeId,
@@ -81,6 +91,7 @@ export class ChallengeStore {
       memo,
       network,
       contractId,
+      tokenAddress: resolvedToken,
       resource,
       expiresAt,
     };
@@ -88,8 +99,8 @@ export class ChallengeStore {
     const stmt = this.db.prepare(`
       INSERT INTO challenges (
         challenge_id, destination, amount, asset, memo,
-        network, contract_id, resource, expires_at, created_at, is_redeemed
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        network, contract_id, token_address, resource, expires_at, created_at, is_redeemed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
     `);
 
     stmt.run(
@@ -100,6 +111,7 @@ export class ChallengeStore {
       challenge.memo,
       challenge.network,
       challenge.contractId ?? null,
+      challenge.tokenAddress ?? null,
       challenge.resource,
       challenge.expiresAt,
       now
@@ -118,6 +130,7 @@ export class ChallengeStore {
         memo,
         network,
         contract_id as contractId,
+        token_address as tokenAddress,
         resource,
         expires_at as expiresAt
       FROM challenges
@@ -139,6 +152,7 @@ export class ChallengeStore {
       memo: row.memo,
       network: row.network,
       contractId: row.contractId || undefined,
+      tokenAddress: row.tokenAddress || undefined,
       resource: row.resource,
       expiresAt: Number(row.expiresAt),
     };
@@ -168,13 +182,20 @@ export class ChallengeStore {
     const now = Date.now();
 
     const transaction = this.db.transaction(() => {
+      // 1. Enforce that challenge exists and is currently unredeemed
       const updateChallenge = this.db.prepare(`
-        UPDATE challenges SET is_redeemed = 1 WHERE challenge_id = ?
+        UPDATE challenges SET is_redeemed = 1 WHERE challenge_id = ? AND is_redeemed = 0
       `);
-      updateChallenge.run(challengeId);
+      const updateResult = updateChallenge.run(challengeId);
+      if (updateResult.changes === 0) {
+        throw new Error(
+          `Atomic redemption failed: Challenge '${challengeId}' not found or already redeemed.`
+        );
+      }
 
+      // 2. Insert into redeemed_transactions (strict PRIMARY KEY constraint: aborts transaction if already redeemed)
       const insertRedeemed = this.db.prepare(`
-        INSERT OR IGNORE INTO redeemed_transactions (
+        INSERT INTO redeemed_transactions (
           tx_hash, challenge_id, redeemed_at, payer, amount, asset, ledger
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
       `);

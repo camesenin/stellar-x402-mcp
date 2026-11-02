@@ -4,6 +4,7 @@ import {
   rpc,
   xdr,
   scValToNative,
+  Address,
 } from '@stellar/stellar-sdk';
 import { X402Challenge, VerificationResult } from './types.js';
 import { ChallengeStore } from './challenge-store.js';
@@ -28,16 +29,32 @@ export interface SorobanReceiptRecord {
   challenge_hash: Buffer | Uint8Array;
 }
 
+const TESTNET_NATIVE_SAC = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
+const PUBLIC_NATIVE_SAC = 'CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA';
+
+export function amountToStroops(amount: string | number): bigint {
+  const str = String(amount).trim();
+  if (str.includes('.')) {
+    const parts = str.split('.');
+    const whole = parts[0] || '0';
+    const fraction = (parts[1] || '').padEnd(7, '0').slice(0, 7);
+    return BigInt(whole) * 10_000_000n + BigInt(fraction);
+  }
+  return BigInt(str) * 10_000_000n;
+}
+
 export class StellarPaymentVerifier {
   private horizonServer: Horizon.Server;
   private sorobanServer?: rpc.Server;
   private networkPassphrase: string;
+  private network: 'testnet' | 'public' | 'custom';
 
   constructor(
     horizonUrl: string = 'https://horizon-testnet.stellar.org',
     sorobanRpcUrl: string = 'https://soroban-testnet.stellar.org',
     network: 'testnet' | 'public' | 'custom' = 'testnet'
   ) {
+    this.network = network;
     this.horizonServer = new Horizon.Server(horizonUrl);
     if (sorobanRpcUrl) {
       this.sorobanServer = new rpc.Server(sorobanRpcUrl);
@@ -102,18 +119,62 @@ export class StellarPaymentVerifier {
     }
 
     try {
-      // 1. Query transaction status on Soroban RPC
-      const tx = await this.sorobanServer.getTransaction(txHash);
+      // 1. Query transaction status on Soroban RPC using safe raw fetch (bypassing Protocol 22 Bad union switch: 4 bug)
+      const rawTx = await (this.sorobanServer as any)._getTransaction(txHash);
 
-      if (tx.status !== 'SUCCESS') {
+      if (!rawTx || rawTx.status !== 'SUCCESS') {
         return {
           valid: false,
-          reason: `Soroban transaction status is '${tx.status}', expected 'SUCCESS'`,
+          reason: `Soroban transaction status is '${rawTx?.status || 'NOT_FOUND'}', expected 'SUCCESS'`,
           txHash,
         };
       }
 
-      // 2. Query Soroban contract ledger storage for the receipt
+      // Compute expected 32-byte challenge hash buffer
+      let hashBytes: Buffer;
+      if (challenge.challengeId.length === 64) {
+        hashBytes = Buffer.from(challenge.challengeId, 'hex');
+      } else {
+        const crypto = await import('node:crypto');
+        hashBytes = crypto.createHash('sha256').update(challenge.challengeId).digest();
+      }
+
+      // 2. Cryptographic and semantic envelope linkage check
+      if (rawTx.envelopeXdr) {
+        try {
+          const envelope = xdr.TransactionEnvelope.fromXDR(rawTx.envelopeXdr, 'base64');
+          const txValue = envelope.value();
+          const txObj = 'tx' in txValue ? (txValue as any).tx() : null;
+          if (txObj) {
+            const ops = txObj.operations();
+            const matchingOp = ops.find((op: any) => {
+              const body = op.body();
+              if (body.switch().name === 'invokeHostFunction') {
+                const hostFn = body.invokeHostFunctionOp().hostFunction();
+                if (hostFn.switch().name === 'hostFunctionTypeInvokeContract') {
+                  const invokeArgs = hostFn.invokeContract();
+                  const invokedContract = Address.fromScAddress(invokeArgs.contractAddress()).toString();
+                  const fnName = invokeArgs.functionName().toString();
+                  return invokedContract === challenge.contractId && fnName === 'settle_payment';
+                }
+              }
+              return false;
+            });
+
+            if (!matchingOp) {
+              return {
+                valid: false,
+                reason: `Transaction ${txHash} did not invoke 'settle_payment' on target contract ${challenge.contractId}`,
+                txHash,
+              };
+            }
+          }
+        } catch {
+          // If envelope parsing has an issue, fallback to ledger storage receipt check
+        }
+      }
+
+      // 3. Query Soroban contract ledger storage for the persistent receipt
       const receipt = await this.querySorobanContractReceipt(
         challenge.contractId,
         challenge.challengeId
@@ -127,7 +188,7 @@ export class StellarPaymentVerifier {
         };
       }
 
-      // 3. Validate receipt contents against challenge requirements
+      // 4. Validate recipient address matches challenge destination
       if (receipt.recipient !== challenge.destination) {
         return {
           valid: false,
@@ -136,30 +197,43 @@ export class StellarPaymentVerifier {
         };
       }
 
-      const paidAmount = Number(receipt.amount);
-      const expectedAmount = parseFloat(challenge.amount);
-      if (paidAmount < expectedAmount) {
+      // 5. Validate SAC Token address matches expected asset (prevents paying with fake tokens)
+      const expectedToken = challenge.tokenAddress || (
+        this.network === 'public' ? PUBLIC_NATIVE_SAC : TESTNET_NATIVE_SAC
+      );
+      if (receipt.token !== expectedToken) {
         return {
           valid: false,
-          reason: `Underpaid: Contract received ${paidAmount}, required >= ${expectedAmount}`,
+          reason: `Receipt token mismatch. Expected '${expectedToken}', found '${receipt.token}'`,
           txHash,
         };
       }
 
-      // 4. Record redemption in SQLite
+      // 6. Validate exact amount in stroops (eliminates overpayment/underpayment discrepancies)
+      const expectedStroops = amountToStroops(challenge.amount);
+      const paidStroops = BigInt(receipt.amount);
+      if (paidStroops !== expectedStroops) {
+        return {
+          valid: false,
+          reason: `Amount mismatch: Contract received ${paidStroops} stroops, expected exact ${expectedStroops} stroops`,
+          txHash,
+        };
+      }
+
+      // 7. Record atomic redemption in SQLite
       store.markRedeemed(challenge.challengeId, txHash, {
         payer: receipt.payer,
-        amount: paidAmount.toString(),
+        amount: challenge.amount,
         asset: challenge.asset,
-        ledger: tx.latestLedger,
+        ledger: rawTx.ledger || rawTx.latestLedger,
       });
 
       return {
         valid: true,
         payer: receipt.payer,
-        amount: paidAmount.toString(),
+        amount: challenge.amount,
         asset: challenge.asset,
-        ledger: tx.latestLedger,
+        ledger: rawTx.ledger || rawTx.latestLedger,
         txHash,
       };
     } catch (err: unknown) {
@@ -173,7 +247,7 @@ export class StellarPaymentVerifier {
   }
 
   /**
-   * Query Soroban contract ledger storage for DataKey::Receipt(challenge_hash)
+   * Query Soroban contract ledger storage for DataKey::Receipt(challenge_hash) with defensive schema validation
    */
   public async querySorobanContractReceipt(
     contractId: string,
@@ -208,13 +282,35 @@ export class StellarPaymentVerifier {
       }
 
       const contractData = data.val.contractData();
-      const native = scValToNative(contractData.val()) as Record<string, unknown>;
+      let native: unknown;
+      try {
+        native = scValToNative(contractData.val());
+      } catch {
+        return null;
+      }
+
+      // Strict defensive schema validation of the deserialized receipt struct
+      if (!native || typeof native !== 'object') {
+        return null;
+      }
+
+      const rec = native as Record<string, unknown>;
+      if (
+        typeof rec.payer !== 'string' ||
+        typeof rec.recipient !== 'string' ||
+        typeof rec.token !== 'string' ||
+        rec.amount === undefined ||
+        rec.timestamp === undefined
+      ) {
+        return null;
+      }
+
       return {
-        payer: String(native.payer),
-        recipient: String(native.recipient),
-        token: String(native.token),
-        amount: native.amount as bigint | number | string,
-        timestamp: native.timestamp as number | bigint,
+        payer: rec.payer,
+        recipient: rec.recipient,
+        token: rec.token,
+        amount: rec.amount as bigint | number | string,
+        timestamp: rec.timestamp as number | bigint,
         challenge_hash: hashBytes,
       };
     } catch {

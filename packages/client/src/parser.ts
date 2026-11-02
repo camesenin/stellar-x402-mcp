@@ -9,6 +9,7 @@ export function parseX402Challenge(headers: Headers, jsonBody?: Record<string, u
   const headerMemo = headers.get('x-payment-memo');
   const headerNetwork = headers.get('x-payment-network');
   const headerContract = headers.get('x-payment-contract');
+  const headerToken = headers.get('x-payment-token');
 
   if (headerChallengeId && headerDestination && headerAmount) {
     return {
@@ -19,6 +20,7 @@ export function parseX402Challenge(headers: Headers, jsonBody?: Record<string, u
       memo: headerMemo || headerChallengeId.slice(0, 28),
       network: (headerNetwork as 'testnet' | 'public' | 'custom') || 'testnet',
       contractId: headerContract || undefined,
+      tokenAddress: headerToken || undefined,
     };
   }
 
@@ -33,7 +35,8 @@ export function parseX402Challenge(headers: Headers, jsonBody?: Record<string, u
         asset: String(rawChallenge.asset || 'XLM'),
         memo: String(rawChallenge.memo || rawChallenge.challengeId || rawChallenge.challenge_id).slice(0, 28),
         network: (rawChallenge.network as 'testnet' | 'public') || 'testnet',
-        contractId: rawChallenge.contractId ? String(rawChallenge.contractId) : undefined,
+        contractId: rawChallenge.contractId ? String(rawChallenge.contractId) : (rawChallenge.contract_id ? String(rawChallenge.contract_id) : undefined),
+        tokenAddress: rawChallenge.tokenAddress ? String(rawChallenge.tokenAddress) : (rawChallenge.token_address ? String(rawChallenge.token_address) : undefined),
         expiresAt: rawChallenge.expiresAt ? Number(rawChallenge.expiresAt) : undefined,
       };
     }

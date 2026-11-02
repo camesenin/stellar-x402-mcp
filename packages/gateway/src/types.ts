@@ -8,6 +8,7 @@ export interface X402Challenge {
   memo: string;
   network: StellarNetwork;
   contractId?: string;
+  tokenAddress?: string;
   resource: string;
   expiresAt: number;
 }
