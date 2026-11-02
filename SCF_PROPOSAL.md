@@ -53,10 +53,12 @@ Unlike high-fee chains where micropayments are economically impossible, Stellarâ
 
 ## 4. Current State & Verification Evidence
 
-As of proposal submission:
+As of proposal preparation:
+- **Deployed Soroban Contract**: Live on Testnet at [`CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA`](https://stellar.expert/explorer/testnet/contract/CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA) (Ledger 5526238, TxHash: `ae152d81...`).
 - **Rust Contract Tests**: 3/3 passing (`packages/contracts/src/lib.rs`).
-- **TypeScript Unit Tests**: 14/14 passing across gateway, client, and CLI packages (`vitest`).
-- **Soroban Wasm Target**: Successfully compiled (`target/wasm32-unknown-unknown/release/stellar_x402_contracts.wasm`).
+- **TypeScript Unit Tests**: 13/13 passing across gateway, client, and CLI packages (`vitest`).
+- **SQLite Persistence & Replay Protection**: Verified against server crash/restart scenarios.
+- **Soroban Wasm Target**: Successfully compiled for WebAssembly MVP v1 (`target/wasm32v1-none/release/stellar_x402_contracts.wasm`).
 - **End-to-End Simulation**: Successfully verified autonomous tool challenge, budget validation, payment settlement, and payload return (`examples/mcp-payment-demo`).
 - **CI/CD Pipeline**: GitHub Actions running on every commit.
 

@@ -136,15 +136,20 @@ pnpm --filter mcp-payment-demo test
 
 ---
 
-## 🔒 Soroban Smart Contract (`X402PaymentVault`)
+## 🔒 Deployed Soroban Smart Contract (`X402PaymentVault`)
 
-The repository includes a compiled Soroban smart contract (`packages/contracts/src/lib.rs`) designed for on-chain verifiable audit trails and atomic token transfers:
+The repository includes a compiled and **on-chain deployed Soroban smart contract** on Stellar Testnet designed for verifiable audit trails and atomic token transfers:
 
-- **Functions**:
-  - `settle_payment(env, payer, recipient, token, amount, challenge_hash) -> Result<PaymentReceipt, X402Error>`
-  - `is_settled(env, challenge_hash) -> bool`
-  - `get_receipt(env, challenge_hash) -> Result<PaymentReceipt, X402Error>`
-  - `total_settlements(env) -> u64`
+- **Network**: Stellar Testnet
+- **Contract ID**: [`CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA`](https://stellar.expert/explorer/testnet/contract/CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA)
+- **Wasm Hash**: `a3e512cc196ff88ac2e2df83b19bac5415b9a89a569f03a881f65b5a4d91fbd5`
+- **Instantiation Ledger**: `5526238` (TxHash: `ae152d8104b4e4b8bd100498f7e6245cbd68aecea88eaf5f165f4fc4f7a6e7be`)
+
+### Contract Functions:
+- `settle_payment(env, payer, recipient, token, amount, challenge_hash) -> Result<PaymentReceipt, X402Error>`
+- `is_settled(env, challenge_hash) -> bool`
+- `get_receipt(env, challenge_hash) -> Result<PaymentReceipt, X402Error>`
+- `total_settlements(env) -> u64`
 - **Features**:
   - Cryptographic anti-replay guarantee preventing duplicate challenge claims.
   - Emits `(settle, payer, recipient)` contract event for real-time indexing.
