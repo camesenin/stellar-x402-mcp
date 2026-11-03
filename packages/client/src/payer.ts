@@ -95,9 +95,16 @@ export class StellarPayer {
 
   /**
    * Cryptographically sign proof of challenge ownership for anti-front-running redemption
+   * Includes strict domain separation: protocol version, network passphrase, gateway URL, challengeId, txHash, and expiration.
    */
-  public signRequesterProof(challengeId: string, txHash: string): string {
-    const message = Buffer.from(`${challengeId}:${txHash}`);
+  public signRequesterProof(
+    challengeId: string,
+    txHash: string,
+    gatewayUrl: string = 'default',
+    expiresAt: number = 0
+  ): string {
+    const domainPrefix = `stellar-x402:v1:${this.networkPassphrase}:${gatewayUrl}:${challengeId}:${txHash}:${expiresAt}`;
+    const message = Buffer.from(domainPrefix, 'utf-8');
     return this.keypair.sign(message).toString('base64');
   }
 

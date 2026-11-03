@@ -1,11 +1,13 @@
 {
   "network": "testnet",
-  "contractId": "CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA",
-  "wasmHash": "a3e512cc196ff88ac2e2df83b19bac5415b9a89a569f03a881f65b5a4d91fbd5",
-  "deployerPublicKey": "GBA6EH56ANZXDH4BMLY662DZGBOX4Q67O76W7JWSTL5DDBXW3R3PVRZT",
-  "deployedAt": "2026-11-02T21:27:11.304Z",
-  "ledger": 5526238,
-  "txHash": "ae152d8104b4e4b8bd100498f7e6245cbd68aecea88eaf5f165f4fc4f7a6e7be",
+  "contractId": "CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO",
+  "wasmHash": "c91cdea4d7bf8c50160445ee4db9d4af4cc31c4e016ec53c5040ecd36aedee15",
+  "wasmSizeBytes": 17421,
+  "deployerPublicKey": "GAJ4M4YU5XC4GV5SZBV3MMIR6KQ5P3S3W4L332JTTXAX6RWLTGEQP3VS",
+  "deployedAt": "2026-11-03T00:18:16.383Z",
+  "ledger": 5528291,
+  "instantiateTxHash": "8b123ea331abcf692dd70e1d808992dcf97988db64b36496cf7a276e6024a88e",
+  "uploadTxHash": "be3ab18a0c7fac1bead3aecce885eb7fb19adbfc219846a93691fd78abaab970",
   "rpcUrl": "https://soroban-testnet.stellar.org",
-  "explorerUrl": "https://stellar.expert/explorer/testnet/contract/CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA"
+  "explorerUrl": "https://stellar.expert/explorer/testnet/contract/CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO"
 }

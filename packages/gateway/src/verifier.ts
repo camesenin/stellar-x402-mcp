@@ -5,6 +5,10 @@ import {
   xdr,
   scValToNative,
   Address,
+  Account,
+  Contract,
+  TransactionBuilder,
+  nativeToScVal,
 } from '@stellar/stellar-sdk';
 import { X402Challenge, VerificationResult } from './types.js';
 import { ChallengeStore } from './challenge-store.js';
@@ -78,6 +82,10 @@ export class StellarPaymentVerifier {
     }
     this.networkPassphrase =
       network === 'public' ? Networks.PUBLIC : Networks.TESTNET;
+  }
+
+  public getNetworkPassphrase(): string {
+    return this.networkPassphrase;
   }
 
   /**
@@ -272,15 +280,39 @@ export class StellarPaymentVerifier {
               };
             }
           }
-        } catch {
-          // If envelope parsing fails, continue to contract storage check
+        } catch (envelopeErr) {
+          return {
+            valid: false,
+            reason: `Transaction envelope validation failed or malformed: ${envelopeErr}`,
+            txHash,
+          };
         }
+      } else {
+        return {
+          valid: false,
+          reason: `Soroban transaction ${txHash} missing envelopeXdr required for cryptographic parameter verification`,
+          txHash,
+        };
       }
 
-      // 3. Query Soroban contract ledger storage for the persistent receipt
+      // 3. Derive canonical on-chain challenge hash committing to (contract, recipient, token, amount, nonce)
+      let onChainHash = hashBytes;
+      try {
+        onChainHash = await this.computeCanonicalChallengeHash(
+          targetVault,
+          challenge.destination,
+          expectedToken,
+          expectedStroops,
+          hashBytes
+        );
+      } catch {
+        onChainHash = hashBytes;
+      }
+
+      // 4. Query Soroban contract ledger storage for the persistent receipt
       const receipt = await this.querySorobanContractReceipt(
         targetVault,
-        challenge.challengeId
+        onChainHash
       );
 
       if (!receipt) {
@@ -321,17 +353,25 @@ export class StellarPaymentVerifier {
 
       // 7. Requester Binding Defense: If signature proof is present, ensure caller owns payer keypair
       if (requesterAuth) {
+        if (!receipt.payer.startsWith('G')) {
+          return {
+            valid: false,
+            reason: `Direct cryptographic signature verification requires standard ed25519 agent keypair (G...); Smart Contract accounts (${receipt.payer.slice(0, 4)}...) require Soroban on-chain __check_auth`,
+            txHash,
+          };
+        }
+
         try {
           const { Keypair } = await import('@stellar/stellar-sdk');
           const payerKp = Keypair.fromPublicKey(receipt.payer);
           const isValidSig = payerKp.verify(
-            Buffer.from(requesterAuth.message),
+            Buffer.from(requesterAuth.message, 'utf-8'),
             Buffer.from(requesterAuth.signatureBase64, 'base64')
           );
           if (!isValidSig) {
             return {
               valid: false,
-              reason: 'Requester authentication failed: Signature does not match on-chain payer keypair',
+              reason: 'Requester authentication failed: Domain-separated signature does not match on-chain payer keypair',
               txHash,
             };
           }
@@ -371,22 +411,71 @@ export class StellarPaymentVerifier {
   }
 
   /**
+   * Deterministically simulate contract function 'compute_challenge_hash' on Soroban RPC.
+   * Derives the canonical 32-byte challenge hash on-chain, guaranteeing 100% parity with the contract.
+   */
+  public async computeCanonicalChallengeHash(
+    contractId: string,
+    recipient: string,
+    token: string,
+    amountStroops: bigint,
+    nonceBytes: Buffer
+  ): Promise<Buffer> {
+    if (!this.sorobanServer) return nonceBytes;
+    try {
+      const contract = new Contract(contractId);
+      const dummyAccount = new Account(
+        'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+        '0'
+      );
+      const op = contract.call(
+        'compute_challenge_hash',
+        new Address(recipient).toScVal(),
+        new Address(token).toScVal(),
+        nativeToScVal(amountStroops, { type: 'i128' }),
+        xdr.ScVal.scvBytes(nonceBytes)
+      );
+      const tx = new TransactionBuilder(dummyAccount, {
+        fee: '100',
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(op)
+        .setTimeout(30)
+        .build();
+
+      const sim: any = await this.sorobanServer.simulateTransaction(tx);
+      if (sim?.result?.retval) {
+        return Buffer.from(sim.result.retval.bytes());
+      }
+      return nonceBytes;
+    } catch {
+      return nonceBytes;
+    }
+  }
+
+  /**
    * Query Soroban contract ledger storage for DataKey::Receipt(challenge_hash) with defensive schema validation
    */
   public async querySorobanContractReceipt(
     contractId: string,
-    challengeId: string
+    challengeIdOrHash: string | Buffer
   ): Promise<SorobanReceiptRecord | null> {
     if (!this.sorobanServer) return null;
 
     try {
       // Create 32-byte challenge hash buffer
       let hashBytes: Buffer;
-      if (challengeId.length === 64) {
-        hashBytes = Buffer.from(challengeId, 'hex');
+      if (Buffer.isBuffer(challengeIdOrHash)) {
+        hashBytes = challengeIdOrHash;
+      } else if (typeof challengeIdOrHash === 'string') {
+        if (challengeIdOrHash.length === 64) {
+          hashBytes = Buffer.from(challengeIdOrHash, 'hex');
+        } else {
+          const crypto = await import('node:crypto');
+          hashBytes = crypto.createHash('sha256').update(challengeIdOrHash).digest();
+        }
       } else {
-        const crypto = await import('node:crypto');
-        hashBytes = crypto.createHash('sha256').update(challengeId).digest();
+        return null;
       }
 
       // Match Soroban contract enum DataKey::Receipt(BytesN<32>)

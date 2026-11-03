@@ -49,6 +49,7 @@
         }
       ]
     ],
+    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
@@ -194,7 +195,7 @@
                   "symbol": "Receipt"
                 },
                 {
-                  "bytes": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+                  "bytes": "2a741db73d3cb1b1240220b07ab7111a2b95d241b6a9038dd455163b05864e14"
                 }
               ]
             },
@@ -214,7 +215,7 @@
                       "symbol": "Receipt"
                     },
                     {
-                      "bytes": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+                      "bytes": "2a741db73d3cb1b1240220b07ab7111a2b95d241b6a9038dd455163b05864e14"
                     }
                   ]
                 },
@@ -237,7 +238,7 @@
                         "symbol": "challenge_hash"
                       },
                       "val": {
-                        "bytes": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+                        "bytes": "2a741db73d3cb1b1240220b07ab7111a2b95d241b6a9038dd455163b05864e14"
                       }
                     },
                     {

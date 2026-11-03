@@ -87,12 +87,28 @@ describe('BudgetManager', () => {
     // A competing call attempting to reserve 0.8 XLM is still blocked!
     expect(() => budget.reserve(0.8)).toThrow(/would exceed total ceiling/);
 
-    // Advance clock past the in-flight timebound
-    mockTime += 30_001;
+    // Advance clock past the in-flight timebound + 15s ledger clock-skew safety margin
+    mockTime += 45_001;
 
     // Now reservation is pruned and budget is freed safely
     expect(budget.getPendingReservedXlm()).toBe(0);
     const newRes = budget.reserve(0.8);
     expect(newRes).toBeDefined();
+  });
+
+  it('applies default 60s safety quarantine when release is called with maxTime=0', () => {
+    let mockTime = 5000;
+    const budget = new BudgetManager(1.0, 1.5, 120_000, () => mockTime);
+
+    const resId = budget.reserve(0.5);
+    // Release with maxTime=0 or undefined in-flight bound
+    budget.release(resId, 0);
+
+    // Still quarantined by default 60s
+    expect(budget.getPendingReservedXlm()).toBe(0.5);
+
+    // Advance 60_001 ms
+    mockTime += 60_001;
+    expect(budget.getPendingReservedXlm()).toBe(0);
   });
 });

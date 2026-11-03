@@ -49,15 +49,42 @@ export class RateLimiter {
   }
 }
 
-export function getClientIp(req: Request, trustProxy?: boolean | string[]): string {
-  if (trustProxy) {
-    const forwarded = req.header('x-forwarded-for');
-    if (forwarded) {
-      const ips = forwarded.split(',').map((s) => s.trim());
-      if (ips[0]) return ips[0];
+export function getClientIp(req: Request, trustProxy?: boolean | number | string[]): string {
+  const remoteSocketIp = req.socket?.remoteAddress || '127.0.0.1';
+
+  if (!trustProxy) {
+    return req.ip || remoteSocketIp;
+  }
+
+  const forwarded = req.header('x-forwarded-for');
+  if (!forwarded) {
+    return req.ip || remoteSocketIp;
+  }
+
+  const ips = forwarded.split(',').map((s) => s.trim()).filter(Boolean);
+  if (ips.length === 0) return remoteSocketIp;
+
+  if (typeof trustProxy === 'number') {
+    // Parse N hops from the right (upstream reverse proxy traversal)
+    const index = Math.max(0, ips.length - trustProxy);
+    return ips[index] || remoteSocketIp;
+  }
+
+  if (Array.isArray(trustProxy)) {
+    // Only trust XFF if the immediate upstream socket IP is in the trusted allowlist
+    const isImmediateTrusted = trustProxy.includes(remoteSocketIp);
+    if (!isImmediateTrusted) {
+      return remoteSocketIp;
+    }
+    // Return rightmost client IP not in the trusted proxy allowlist
+    for (let i = ips.length - 1; i >= 0; i--) {
+      if (!trustProxy.includes(ips[i])) {
+        return ips[i];
+      }
     }
   }
-  return req.ip || req.socket?.remoteAddress || '127.0.0.1';
+
+  return ips[0] || remoteSocketIp;
 }
 
 export function createX402Middleware(
@@ -119,8 +146,12 @@ export function createX402Middleware(
         return;
       }
 
+      const gatewayResource = req.originalUrl || req.path || 'default';
+      const cleanHash = txHash.trim().toLowerCase();
+      const domainMessage = `stellar-x402:v1:${verifier.getNetworkPassphrase()}:${gatewayResource}:${challengeId}:${cleanHash}:${challenge.expiresAt}`;
+
       const requesterAuth = payerSignature
-        ? { message: `${challengeId}:${txHash}`, signatureBase64: payerSignature }
+        ? { message: domainMessage, signatureBase64: payerSignature }
         : undefined;
 
       const result = await verifier.verifyPayment(txHash, challenge, store, requesterAuth);

@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short,
-    token, Address, BytesN, Env, Symbol,
+    token, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol,
 };
 
 #[contracterror]
@@ -40,8 +40,35 @@ pub struct X402PaymentVault;
 
 #[contractimpl]
 impl X402PaymentVault {
+    /// Deterministically derive the canonical 32-byte challenge hash on-chain:
+    /// SHA256(contract_address || recipient || token || amount_i128_be || nonce)
+    /// Guarantees that any parameter alteration generates a disjoint hash,
+    /// mathematically preventing griefing/pre-consumption attacks.
+    pub fn compute_challenge_hash(
+        env: Env,
+        recipient: Address,
+        token: Address,
+        amount: i128,
+        nonce: BytesN<32>,
+    ) -> BytesN<32> {
+        let contract_id = env.current_contract_address();
+        let mut payload = Bytes::new(&env);
+        payload.append(&contract_id.to_xdr(&env));
+        payload.append(&recipient.to_xdr(&env));
+        payload.append(&token.to_xdr(&env));
+        let be_bytes = (amount as u128).to_be_bytes();
+        let mut amt_sc_bytes = Bytes::new(&env);
+        for b in be_bytes.iter() {
+            amt_sc_bytes.push_back(*b);
+        }
+        payload.append(&amt_sc_bytes);
+        payload.append(&nonce.to_xdr(&env));
+        env.crypto().sha256(&payload).into()
+    }
+
     /// Settle an x402 payment challenge on-chain.
     /// Transfers `amount` of `token` from `payer` to `recipient`,
+    /// derives canonical `challenge_hash` internally from call arguments and `nonce`,
     /// verifies anti-replay of `challenge_hash`, stores the receipt,
     /// and emits a `settle` event.
     pub fn settle_payment(
@@ -50,7 +77,7 @@ impl X402PaymentVault {
         recipient: Address,
         token: Address,
         amount: i128,
-        challenge_hash: BytesN<32>,
+        nonce: BytesN<32>,
     ) -> Result<PaymentReceipt, X402Error> {
         // Payer must authorize this transfer
         payer.require_auth();
@@ -59,7 +86,16 @@ impl X402PaymentVault {
             return Err(X402Error::InvalidAmount);
         }
 
-        // Anti-replay: Ensure this challenge hash hasn't already been fulfilled
+        // Derive canonical challenge hash on-chain from call parameters and nonce
+        let challenge_hash = Self::compute_challenge_hash(
+            env.clone(),
+            recipient.clone(),
+            token.clone(),
+            amount,
+            nonce,
+        );
+
+        // Anti-replay: Ensure this canonical challenge hash hasn't already been fulfilled
         let receipt_key = DataKey::Receipt(challenge_hash.clone());
         if env.storage().persistent().has(&receipt_key) {
             return Err(X402Error::AlreadySettled);
@@ -146,25 +182,27 @@ mod test {
         let token_client = StellarAssetClient::new(&env, &token_id.address());
         token_client.mint(&payer, &10_000_000);
 
-        let challenge_hash = BytesN::from_array(&env, &[42u8; 32]);
+        let nonce = BytesN::from_array(&env, &[42u8; 32]);
         let amount = 1_000_000i128; // 0.1 XLM in stroops
+
+        let expected_hash = client.compute_challenge_hash(&recipient, &token_id.address(), &amount, &nonce);
 
         let receipt = client.settle_payment(
             &payer,
             &recipient,
             &token_id.address(),
             &amount,
-            &challenge_hash,
+            &nonce,
         );
 
         assert_eq!(receipt.amount, amount);
         assert_eq!(receipt.payer, payer);
         assert_eq!(receipt.recipient, recipient);
-        assert_eq!(receipt.challenge_hash, challenge_hash);
+        assert_eq!(receipt.challenge_hash, expected_hash);
 
         // Verification checks
-        assert!(client.is_settled(&challenge_hash));
-        let fetched = client.get_receipt(&challenge_hash);
+        assert!(client.is_settled(&expected_hash));
+        let fetched = client.get_receipt(&expected_hash);
         assert_eq!(fetched, receipt);
         assert_eq!(client.total_settlements(), 1);
 
@@ -191,7 +229,7 @@ mod test {
         let token_client = StellarAssetClient::new(&env, &token_id.address());
         token_client.mint(&payer, &10_000_000);
 
-        let challenge_hash = BytesN::from_array(&env, &[99u8; 32]);
+        let nonce = BytesN::from_array(&env, &[99u8; 32]);
 
         // First settlement succeeds
         client.settle_payment(
@@ -199,16 +237,16 @@ mod test {
             &recipient,
             &token_id.address(),
             &500_000,
-            &challenge_hash,
+            &nonce,
         );
 
-        // Second settlement with same challenge_hash must fail
+        // Second settlement with identical canonical parameters must panic with AlreadySettled
         client.settle_payment(
             &payer,
             &recipient,
             &token_id.address(),
             &500_000,
-            &challenge_hash,
+            &nonce,
         );
     }
 
@@ -224,9 +262,9 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let token = Address::generate(&env);
-        let challenge_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let nonce = BytesN::from_array(&env, &[1u8; 32]);
 
-        client.settle_payment(&payer, &recipient, &token, &0, &challenge_hash);
+        client.settle_payment(&payer, &recipient, &token, &0, &nonce);
     }
 
     #[test]
@@ -241,10 +279,10 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let token = Address::generate(&env);
-        let challenge_hash = BytesN::from_array(&env, &[7u8; 32]);
+        let nonce = BytesN::from_array(&env, &[7u8; 32]);
 
         // Must fail because payer did not authorize transaction
-        client.settle_payment(&payer, &recipient, &token, &100_000, &challenge_hash);
+        client.settle_payment(&payer, &recipient, &token, &100_000, &nonce);
     }
 
     #[test]
@@ -264,7 +302,7 @@ mod test {
         let token_client = StellarAssetClient::new(&env, &token_id.address());
         token_client.mint(&payer, &100); // Only 100 stroops
 
-        let challenge_hash = BytesN::from_array(&env, &[15u8; 32]);
+        let nonce = BytesN::from_array(&env, &[15u8; 32]);
 
         // Attempts to transfer 500,000 stroops -> must panic with InsufficientBalance
         client.settle_payment(
@@ -272,7 +310,7 @@ mod test {
             &recipient,
             &token_id.address(),
             &500_000,
-            &challenge_hash,
+            &nonce,
         );
     }
 
@@ -307,22 +345,85 @@ mod test {
         let token_client = StellarAssetClient::new(&env, &token_id.address());
         token_client.mint(&payer, &10_000_000);
 
-        let hash_a = BytesN::from_array(&env, &[101u8; 32]);
-        let hash_b = BytesN::from_array(&env, &[102u8; 32]);
+        let nonce_a = BytesN::from_array(&env, &[101u8; 32]);
+        let nonce_b = BytesN::from_array(&env, &[102u8; 32]);
 
-        client.settle_payment(&payer, &recipient_a, &token_id.address(), &200_000, &hash_a);
-        client.settle_payment(&payer, &recipient_b, &token_id.address(), &300_000, &hash_b);
+        let receipt_a = client.settle_payment(&payer, &recipient_a, &token_id.address(), &200_000, &nonce_a);
+        let receipt_b = client.settle_payment(&payer, &recipient_b, &token_id.address(), &300_000, &nonce_b);
 
         assert_eq!(client.total_settlements(), 2);
-        assert!(client.is_settled(&hash_a));
-        assert!(client.is_settled(&hash_b));
+        assert!(client.is_settled(&receipt_a.challenge_hash));
+        assert!(client.is_settled(&receipt_b.challenge_hash));
 
-        let r_a = client.get_receipt(&hash_a);
-        let r_b = client.get_receipt(&hash_b);
+        let r_a = client.get_receipt(&receipt_a.challenge_hash);
+        let r_b = client.get_receipt(&receipt_b.challenge_hash);
 
         assert_eq!(r_a.amount, 200_000);
         assert_eq!(r_a.recipient, recipient_a);
         assert_eq!(r_b.amount, 300_000);
         assert_eq!(r_b.recipient, recipient_b);
+    }
+
+    #[test]
+    fn test_adversarial_griefing_attempt_fails_to_burn_challenge() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(X402PaymentVault, ());
+        let client = X402PaymentVaultClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let alice_payer = Address::generate(&env);
+        let bob_merchant = Address::generate(&env);
+        let eve_attacker = Address::generate(&env);
+
+        let token_id = env.register_stellar_asset_contract_v2(admin);
+        let token_client = StellarAssetClient::new(&env, &token_id.address());
+        token_client.mint(&alice_payer, &10_000_000);
+        token_client.mint(&eve_attacker, &10_000_000);
+
+        // Bob issues challenge to Alice with a public nonce
+        let public_nonce = BytesN::from_array(&env, &[250u8; 32]);
+        let alice_expected_amount = 500_000i128; // 0.05 XLM
+
+        let alice_challenge_hash = client.compute_challenge_hash(
+            &bob_merchant,
+            &token_id.address(),
+            &alice_expected_amount,
+            &public_nonce,
+        );
+
+        // Attacker Eve attempts to grief the challenge by calling vault with 1 stroop to Eve herself
+        let eve_receipt = client.settle_payment(
+            &eve_attacker,
+            &eve_attacker, // Attacker's own address
+            &token_id.address(),
+            &1i128,        // Only 1 stroop!
+            &public_nonce,
+        );
+
+        // Eve's hash is completely different from Alice's hash
+        assert_ne!(eve_receipt.challenge_hash, alice_challenge_hash);
+        assert!(client.is_settled(&eve_receipt.challenge_hash));
+        assert_eq!(client.is_settled(&alice_challenge_hash), false);
+
+        // Alice settles her legitimate challenge to Bob: MUST SUCCEED (Zero griefing!)
+        let alice_receipt = client.settle_payment(
+            &alice_payer,
+            &bob_merchant,
+            &token_id.address(),
+            &alice_expected_amount,
+            &public_nonce,
+        );
+
+        assert_eq!(alice_receipt.challenge_hash, alice_challenge_hash);
+        assert_eq!(alice_receipt.amount, alice_expected_amount);
+        assert_eq!(alice_receipt.recipient, bob_merchant);
+        assert!(client.is_settled(&alice_challenge_hash));
+        assert_eq!(client.total_settlements(), 2);
+
+        // Bob the merchant received the full amount
+        let token_query = token::Client::new(&env, &token_id.address());
+        assert_eq!(token_query.balance(&bob_merchant), alice_expected_amount);
     }
 }

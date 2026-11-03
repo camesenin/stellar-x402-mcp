@@ -120,11 +120,15 @@ export class BudgetManager {
     const res = this.reservations.get(reservationId);
     if (!res) return;
 
-    if (keepUntilTime && keepUntilTime > this.clock()) {
-      res.releaseAt = keepUntilTime;
-    } else {
-      this.reservations.delete(reservationId);
+    if (keepUntilTime !== undefined) {
+      // If maxTime was 0 or unassigned, default to 60s quarantine; otherwise apply timestamp + 15s clock skew margin
+      const effectiveKeepUntil = keepUntilTime > 0 ? keepUntilTime + 15_000 : this.clock() + 60_000;
+      if (effectiveKeepUntil > this.clock()) {
+        res.releaseAt = effectiveKeepUntil;
+        return;
+      }
     }
+    this.reservations.delete(reservationId);
   }
 
   public recordPayment(amountXlm: number, destination: string, txHash: string): void {

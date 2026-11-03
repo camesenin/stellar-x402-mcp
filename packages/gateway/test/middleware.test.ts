@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Response } from 'express';
-import { createX402Middleware, X402Request } from '../src/middleware.js';
+import { createX402Middleware, getClientIp, X402Request } from '../src/middleware.js';
 import { ChallengeStore } from '../src/challenge-store.js';
 import { StellarPaymentVerifier } from '../src/verifier.js';
 
@@ -236,5 +236,37 @@ describe('createX402Middleware with SQLite', () => {
     expect(jsonBody.error).toBe('Requester Signature Required');
 
     store.close();
+  });
+
+  it('securely extracts client IP using hop-count traversal and proxy allowlist', () => {
+    // Untrusted proxy -> strictly socket IP
+    const req1 = {
+      header: (h: string) => (h.toLowerCase() === 'x-forwarded-for' ? '203.0.113.195, 70.41.3.18' : undefined),
+      ip: undefined,
+      socket: { remoteAddress: '10.0.0.1' },
+    } as any;
+    expect(getClientIp(req1, false)).toBe('10.0.0.1');
+
+    // Hop count = 1: selects 1 hop from the right (client behind 1 reverse proxy)
+    expect(getClientIp(req1, 1)).toBe('70.41.3.18');
+
+    // Hop count = 2: selects 2 hops from the right
+    expect(getClientIp(req1, 2)).toBe('203.0.113.195');
+
+    // Proxy allowlist: socket 10.0.0.1 is trusted; returns rightmost untrusted IP
+    const req2 = {
+      header: (h: string) => (h.toLowerCase() === 'x-forwarded-for' ? '198.51.100.22, 10.0.0.2' : undefined),
+      ip: undefined,
+      socket: { remoteAddress: '10.0.0.1' },
+    } as any;
+    expect(getClientIp(req2, ['10.0.0.1', '10.0.0.2'])).toBe('198.51.100.22');
+
+    // Socket is untrusted -> ignores XFF even if allowlist configured
+    const req3 = {
+      header: (h: string) => (h.toLowerCase() === 'x-forwarded-for' ? '1.2.3.4' : undefined),
+      ip: undefined,
+      socket: { remoteAddress: '192.168.1.99' },
+    } as any;
+    expect(getClientIp(req3, ['10.0.0.1'])).toBe('192.168.1.99');
   });
 });
