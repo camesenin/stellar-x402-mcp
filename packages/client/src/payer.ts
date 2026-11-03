@@ -71,10 +71,12 @@ export class StellarPayer {
   private horizonServer: Horizon.Server;
   private sorobanServer: rpc.Server;
   private networkPassphrase: string;
+  private network: string;
   private sorobanRpcUrl: string;
 
   constructor(private config: ClientConfig) {
     this.keypair = Keypair.fromSecret(config.secretKey);
+    this.network = config.network || 'testnet';
     this.horizonServer = new Horizon.Server(
       config.horizonUrl || 'https://horizon-testnet.stellar.org'
     );
@@ -82,7 +84,7 @@ export class StellarPayer {
       config.sorobanRpcUrl || 'https://soroban-testnet.stellar.org';
     this.sorobanServer = new rpc.Server(this.sorobanRpcUrl);
     this.networkPassphrase =
-      config.network === 'public' ? Networks.PUBLIC : Networks.TESTNET;
+      this.network === 'public' ? Networks.PUBLIC : Networks.TESTNET;
   }
 
   public getPublicKey(): string {
@@ -114,6 +116,13 @@ export class StellarPayer {
    * otherwise executes a classic Stellar payment.
    */
   public async settleChallenge(challenge: ParsedChallenge): Promise<ClientPaymentReceipt> {
+    // 0. Client Policy: Network passphrase validation
+    if (challenge.network && challenge.network !== this.network) {
+      throw new Error(
+        `Network mismatch: Challenge specified network '${challenge.network}', but client is configured for '${this.network}'`
+      );
+    }
+
     // 1. Client Policy: Hard cap per single tool call
     const maxPerCall = this.config.maxPaymentPerCallXlm ?? 1.0;
     const requestedAmount = parseFloat(challenge.amount);
@@ -215,22 +224,37 @@ export class StellarPayer {
     // Prepare transaction on Soroban (calculates ledger footprints, resource fees and auth entries)
     const prepared = await this.sorobanServer.prepareTransaction(tx);
 
-    // Client Security Policy: Inspect simulated auth tree before signing
+    // Client Security Policy: Recursively inspect simulated auth tree before signing
     if (this.config.validateSimulationAuth !== false) {
       try {
+        const allowedContracts = new Set([contractId, tokenAddress]);
+        const checkInvocation = (inv: any) => {
+          if (!inv) return;
+          if (typeof inv.contractAddress === 'function') {
+            const targetContract = Address.fromScAddress(inv.contractAddress()).toString();
+            if (!allowedContracts.has(targetContract)) {
+              throw new Error(
+                `Malicious auth tree detected: simulation attempted authorization on unauthorized contract '${targetContract}'`
+              );
+            }
+          }
+          if (typeof inv.subInvocations === 'function') {
+            const subs = inv.subInvocations() || [];
+            for (const sub of subs) {
+              checkInvocation(sub);
+            }
+          }
+        };
+
         const ops = (prepared as any).operations || [];
         for (const operation of ops) {
           if (operation.auth && Array.isArray(operation.auth)) {
             for (const authEntry of operation.auth) {
-              const rootInvocation = typeof authEntry.rootInvocation === 'function' ? authEntry.rootInvocation() : null;
-              if (rootInvocation && typeof rootInvocation.contractAddress === 'function') {
-                const targetContract = Address.fromScAddress(rootInvocation.contractAddress()).toString();
-                if (targetContract !== contractId && targetContract !== tokenAddress) {
-                  throw new Error(
-                    `Malicious auth tree detected: simulation attempted authorization on unauthorized contract '${targetContract}'`
-                  );
-                }
-              }
+              const rootInvocation =
+                typeof authEntry.rootInvocation === 'function'
+                  ? authEntry.rootInvocation()
+                  : null;
+              checkInvocation(rootInvocation);
             }
           }
         }

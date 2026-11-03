@@ -1,34 +1,70 @@
 import crypto from 'node:crypto';
 
-interface ActiveReservation {
+export interface ActiveReservation {
   id: string;
-  amountXlm: number;
+  amountStroops: bigint;
   reservedAt: number;
   releaseAt?: number;
   txHash?: string;
   destination?: string;
 }
 
+export type QuarantineTimeInput =
+  | { epochMs: number }
+  | { durationMs: number }
+  | number; // explicit epochMs or relative seconds if < 100_000
+
+export const STROOPS_PER_XLM = 10_000_000n;
+
+export function xlmToStroopsBigInt(xlm: number | string): bigint {
+  const val = typeof xlm === 'string' ? parseFloat(xlm) : xlm;
+  return BigInt(Math.round(val * 10_000_000));
+}
+
+export function stroopsToXlmNumber(stroops: bigint): number {
+  return Number(stroops) / 10_000_000;
+}
+
 export class BudgetManager {
-  private totalSettledXlm: number = 0;
+  private totalSettledStroops: bigint = 0n;
   private reservations = new Map<string, ActiveReservation>();
   private receipts: Array<{
     amount: number;
+    amountXlm: number;
+    amountStroops: string;
     destination: string;
     timestamp: number;
     txHash: string;
   }> = [];
 
+  private maxPerCallStroops: bigint;
+  private totalCeilingStroops: bigint;
+
   constructor(
-    private maxPerCallXlm: number = 1.0,
-    private totalCeilingXlm: number = 10.0,
+    maxPerCallXlm: number = 1.0,
+    totalCeilingXlm: number = 10.0,
     private reservationTtlMs: number = 120_000,
     private clock: () => number = () => Date.now()
-  ) {}
+  ) {
+    this.maxPerCallStroops = xlmToStroopsBigInt(maxPerCallXlm);
+    this.totalCeilingStroops = xlmToStroopsBigInt(totalCeilingXlm);
+  }
 
+  /**
+   * Prunes expired unconfirmed reservations.
+   * Invariants:
+   * - If a reservation has a txHash (in-flight on network), it is NEVER silently pruned.
+   *   It must be explicitly reconciled against on-chain status via resolveQuarantine().
+   * - If a reservation has no txHash and was released with releaseAt, it is pruned once releaseAt passes.
+   * - If a reservation was never finalized/released and TTL passes, it is pruned as abandoned.
+   */
   private pruneExpiredReservations(): void {
     const now = this.clock();
     for (const [id, res] of this.reservations.entries()) {
+      if (res.txHash) {
+        // In-flight broadcast transaction: protect from silent unmetered pruning
+        continue;
+      }
       if (res.releaseAt) {
         if (now >= res.releaseAt) {
           this.reservations.delete(id);
@@ -39,13 +75,17 @@ export class BudgetManager {
     }
   }
 
-  public getPendingReservedXlm(): number {
+  public getPendingReservedStroops(): bigint {
     this.pruneExpiredReservations();
-    let pending = 0;
+    let pending = 0n;
     for (const res of this.reservations.values()) {
-      pending += res.amountXlm;
+      pending += res.amountStroops;
     }
     return pending;
+  }
+
+  public getPendingReservedXlm(): number {
+    return stroopsToXlmNumber(this.getPendingReservedStroops());
   }
 
   public canAfford(amountXlm: number): { allowed: boolean; reason?: string } {
@@ -53,20 +93,22 @@ export class BudgetManager {
       return { allowed: false, reason: 'Payment amount must be greater than zero' };
     }
 
-    if (amountXlm > this.maxPerCallXlm) {
+    const requestedStroops = xlmToStroopsBigInt(amountXlm);
+
+    if (requestedStroops > this.maxPerCallStroops) {
       return {
         allowed: false,
-        reason: `Requested payment ${amountXlm} XLM exceeds per-call limit of ${this.maxPerCallXlm} XLM`,
+        reason: `Requested payment ${amountXlm} XLM exceeds per-call limit of ${stroopsToXlmNumber(this.maxPerCallStroops)} XLM`,
       };
     }
 
-    const pendingReserved = this.getPendingReservedXlm();
-    const projectedTotal = this.totalSettledXlm + pendingReserved + amountXlm;
+    const pendingReserved = this.getPendingReservedStroops();
+    const projectedTotal = this.totalSettledStroops + pendingReserved + requestedStroops;
 
-    if (projectedTotal > this.totalCeilingXlm) {
+    if (projectedTotal > this.totalCeilingStroops) {
       return {
         allowed: false,
-        reason: `Projected cumulative spending ${projectedTotal.toFixed(4)} XLM (settled: ${this.totalSettledXlm.toFixed(4)}, reserved: ${pendingReserved.toFixed(4)}) would exceed total ceiling of ${this.totalCeilingXlm} XLM`,
+        reason: `Projected cumulative spending ${stroopsToXlmNumber(projectedTotal).toFixed(4)} XLM (settled: ${stroopsToXlmNumber(this.totalSettledStroops).toFixed(4)}, reserved: ${stroopsToXlmNumber(pendingReserved).toFixed(4)}) would exceed total ceiling of ${stroopsToXlmNumber(this.totalCeilingStroops)} XLM`,
       };
     }
 
@@ -75,7 +117,7 @@ export class BudgetManager {
 
   /**
    * Concurrency-safe budget reservation.
-   * Atomically locks amount from total ceiling while transaction is prepared and confirmed.
+   * Atomically locks exact stroops from total ceiling while transaction is prepared and submitted.
    */
   public reserve(amountXlm: number): string {
     const check = this.canAfford(amountXlm);
@@ -86,8 +128,8 @@ export class BudgetManager {
     const reservationId = crypto.randomUUID();
     this.reservations.set(reservationId, {
       id: reservationId,
-      amountXlm,
-      reservedAt: Date.now(),
+      amountStroops: xlmToStroopsBigInt(amountXlm),
+      reservedAt: this.clock(),
     });
 
     return reservationId;
@@ -98,29 +140,27 @@ export class BudgetManager {
    */
   public finalize(reservationId: string, destination: string, txHash: string): void {
     const res = this.reservations.get(reservationId);
-    const amount = res ? res.amountXlm : 0;
-    if (res) {
-      this.reservations.delete(reservationId);
-    }
+    if (!res) return;
 
-    this.totalSettledXlm += amount;
+    this.reservations.delete(reservationId);
+    this.totalSettledStroops += res.amountStroops;
     this.receipts.push({
-      amount,
+      amount: stroopsToXlmNumber(res.amountStroops),
+      amountXlm: stroopsToXlmNumber(res.amountStroops),
+      amountStroops: res.amountStroops.toString(),
       destination,
-      timestamp: Date.now(),
+      timestamp: this.clock(),
       txHash,
     });
   }
 
   /**
-   * Release reservation if transaction was cancelled, failed or timed out.
-   * If keepUntilTime is provided (e.g. transaction maxTime / maxLedger timeout bound),
-   * the reservation is quarantined in pending status until that timestamp has passed
-   * to strictly prevent double-spending / overdraft from in-flight transactions landing later.
+   * Quarantine a failed, timed-out or cancelled reservation.
+   * If in-flight on ledger, keepUntil specifies the ledger maxTime validity boundary.
    */
   public release(
     reservationId: string,
-    keepUntilTime?: number,
+    keepUntil?: QuarantineTimeInput,
     txHash?: string,
     destination?: string
   ): void {
@@ -130,27 +170,66 @@ export class BudgetManager {
     if (txHash) res.txHash = txHash;
     if (destination) res.destination = destination;
 
-    if (keepUntilTime !== undefined) {
-      // If provided as unix epoch seconds (e.g. 1.7B+), normalize to milliseconds
-      const keepMs =
-        keepUntilTime > 1_000_000_000 && keepUntilTime < 10_000_000_000
-          ? keepUntilTime * 1000
-          : keepUntilTime;
-      // If maxTime was 0 or unassigned, default to 60s quarantine; otherwise apply timestamp + 15s clock skew margin
-      const effectiveKeepUntil =
-        keepMs > 0 ? keepMs + 15_000 : this.clock() + 60_000;
+    if (keepUntil !== undefined) {
+      let targetEpochMs: number;
+      if (typeof keepUntil === 'object') {
+        if ('epochMs' in keepUntil) {
+          targetEpochMs = keepUntil.epochMs;
+        } else {
+          targetEpochMs = this.clock() + keepUntil.durationMs;
+        }
+      } else if (typeof keepUntil === 'number') {
+        // Explicit boundary: if > 1_000_000_000_000, epoch ms.
+        // If between 1_000_000_000 and 10_000_000_000, epoch seconds.
+        // If relative duration (< 100_000), interpret as delta seconds.
+        if (keepUntil > 1_000_000_000_000) {
+          targetEpochMs = keepUntil;
+        } else if (keepUntil > 1_000_000_000) {
+          targetEpochMs = keepUntil * 1000;
+        } else if (keepUntil > 0 && keepUntil <= 600) {
+          targetEpochMs = this.clock() + keepUntil * 1000;
+        } else if (keepUntil > 600) {
+          targetEpochMs = keepUntil;
+        } else {
+          targetEpochMs = this.clock() + 60_000;
+        }
+      } else {
+        targetEpochMs = this.clock() + 60_000;
+      }
+
+      // Add 15s ledger clock-skew buffer
+      const effectiveKeepUntil = targetEpochMs + 15_000;
       if (effectiveKeepUntil > this.clock()) {
         res.releaseAt = effectiveKeepUntil;
         return;
       }
     }
-    this.reservations.delete(reservationId);
+
+    // Only delete immediately if no txHash was broadcast
+    if (!res.txHash) {
+      this.reservations.delete(reservationId);
+    }
+  }
+
+  public recordPayment(amountXlm: number, destination: string, txHash: string): void {
+    const stroops = xlmToStroopsBigInt(amountXlm);
+    this.totalSettledStroops += stroops;
+    this.receipts.push({
+      amount: amountXlm,
+      amountXlm,
+      amountStroops: stroops.toString(),
+      destination,
+      timestamp: this.clock(),
+      txHash,
+    });
   }
 
   /**
-   * Reconciles a quarantined reservation after timeout expiration.
-   * - If on-chain status is SUCCESS: converts reservation to settled expenditure.
-   * - If on-chain status is NOT_FOUND or FAILED: safely releases reserved funds without penalty.
+   * Reconciles a quarantined reservation after inspecting on-chain status.
+   * Guarantees:
+   * - Cannot unquarantine with NOT_FOUND/FAILED before releaseAt expiration.
+   * - If SUCCESS: permanently converts reserved stroops into settled expenditure.
+   * - If NOT_FOUND / FAILED (after releaseAt): safely frees budget reservation.
    */
   public resolveQuarantine(
     reservationId: string,
@@ -159,21 +238,32 @@ export class BudgetManager {
     const res = this.reservations.get(reservationId);
     if (!res) return;
 
-    if (outcome === 'SUCCESS') {
-      this.totalSettledXlm += res.amountXlm;
-      this.receipts.push({
-        amount: res.amountXlm,
-        destination: res.destination || 'quarantine-settled',
-        timestamp: this.clock(),
-        txHash: res.txHash || 'quarantine-tx',
-      });
+    const now = this.clock();
+
+    // SEC-06 Guard: reject premature unquarantine of in-flight transaction
+    if (outcome !== 'SUCCESS' && res.releaseAt && now < res.releaseAt) {
+      throw new Error(
+        `Cannot release quarantined reservation '${reservationId}' before in-flight timeout boundary has elapsed (releaseAt: ${res.releaseAt}, current: ${now})`
+      );
     }
+
+    if (outcome === 'SUCCESS') {
+      this.totalSettledStroops += res.amountStroops;
+      if (res.txHash && res.destination) {
+        this.receipts.push({
+          amount: stroopsToXlmNumber(res.amountStroops),
+          amountXlm: stroopsToXlmNumber(res.amountStroops),
+          amountStroops: res.amountStroops.toString(),
+          destination: res.destination,
+          timestamp: now,
+          txHash: res.txHash,
+        });
+      }
+    }
+
     this.reservations.delete(reservationId);
   }
 
-  /**
-   * Returns list of currently quarantined reservations pending ledger finality reconciliation.
-   */
   public getQuarantinedReservations(): Array<{
     id: string;
     amountXlm: number;
@@ -187,10 +277,10 @@ export class BudgetManager {
       releaseAt?: number;
     }> = [];
     for (const res of this.reservations.values()) {
-      if (res.releaseAt) {
+      if (res.releaseAt || res.txHash) {
         list.push({
           id: res.id,
-          amountXlm: res.amountXlm,
+          amountXlm: stroopsToXlmNumber(res.amountStroops),
           txHash: res.txHash,
           releaseAt: res.releaseAt,
         });
@@ -199,18 +289,12 @@ export class BudgetManager {
     return list;
   }
 
-  public recordPayment(amountXlm: number, destination: string, txHash: string): void {
-    this.totalSettledXlm += amountXlm;
-    this.receipts.push({
-      amount: amountXlm,
-      destination,
-      timestamp: Date.now(),
-      txHash,
-    });
+  public getSpentTotal(): number {
+    return stroopsToXlmNumber(this.totalSettledStroops);
   }
 
-  public getSpentTotal(): number {
-    return this.totalSettledXlm;
+  public getSpentStroops(): bigint {
+    return this.totalSettledStroops;
   }
 
   public getReceipts() {

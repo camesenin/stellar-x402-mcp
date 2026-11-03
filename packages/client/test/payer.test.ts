@@ -169,5 +169,24 @@ describe('StellarPayer & Autonomous Soroban Execution', () => {
         /Untrusted vault contract .* rejected by client policy/
       );
     });
+
+    it('blocks challenge specifying mismatched network passphrase', async () => {
+      const payer = new StellarPayer({
+        secretKey: dummySecret,
+        network: 'testnet',
+      });
+
+      const badNetworkChallenge: ParsedChallenge = {
+        challengeId: 'spoofed-network',
+        destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        amount: '0.1',
+        asset: 'XLM',
+        network: 'public', // Client is testnet, challenge asks for public!
+      };
+
+      await expect(payer.settleChallenge(badNetworkChallenge)).rejects.toThrow(
+        /Network mismatch: Challenge specified network 'public'/
+      );
+    });
   });
 });

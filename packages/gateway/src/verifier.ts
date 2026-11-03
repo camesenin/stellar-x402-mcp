@@ -207,6 +207,8 @@ export class StellarPaymentVerifier {
       );
       const expectedStroops = amountToStroops(challenge.amount);
 
+      let extractedPayer: string | null = null;
+
       // 2. Strict cryptographic and semantic envelope linkage check
       if (rawTx.envelopeXdr) {
         try {
@@ -243,7 +245,16 @@ export class StellarPaymentVerifier {
                     return false;
                   }
 
-                  // 2a. Envelope Recipient binding (arg 1)
+                  // 2a. Envelope Payer extraction (arg 0)
+                  try {
+                    if (typeof args[0].address === 'function') {
+                      extractedPayer = Address.fromScAddress(args[0].address()).toString();
+                    }
+                  } catch {
+                    // Optional payer extraction
+                  }
+
+                  // 2b. Envelope Recipient binding (arg 1)
                   try {
                     const recipientArg = Address.fromScAddress(args[1].address()).toString();
                     if (recipientArg !== challenge.destination) return false;
@@ -251,7 +262,7 @@ export class StellarPaymentVerifier {
                     return false;
                   }
 
-                  // 2b. Envelope Token SAC binding (arg 2)
+                  // 2c. Envelope Token SAC binding (arg 2)
                   try {
                     const tokenArg = Address.fromScAddress(args[2].address()).toString();
                     if (tokenArg !== expectedToken) return false;
@@ -259,7 +270,7 @@ export class StellarPaymentVerifier {
                     return false;
                   }
 
-                  // 2c. Envelope Exact Amount in Stroops binding (arg 3)
+                  // 2d. Envelope Exact Amount in Stroops binding (arg 3)
                   try {
                     const amountNative = scValToNative(args[3]);
                     if (BigInt(amountNative) !== expectedStroops) return false;
@@ -267,7 +278,7 @@ export class StellarPaymentVerifier {
                     return false;
                   }
 
-                  // 2d. Envelope Challenge Hash binding (arg 4)
+                  // 2e. Envelope Challenge Hash binding (arg 4)
                   try {
                     const opHash = args[4].bytes();
                     if (!opHash || !opHash.equals(hashBytes)) {
@@ -290,6 +301,13 @@ export class StellarPaymentVerifier {
                 txHash,
               };
             }
+          } else {
+            // Fail-closed if transaction envelope operations cannot be parsed
+            return {
+              valid: false,
+              reason: `Malformed or unsupported transaction envelope: unable to parse operations from envelopeXdr`,
+              txHash,
+            };
           }
         } catch (envelopeErr) {
           return {
@@ -358,6 +376,15 @@ export class StellarPaymentVerifier {
         return {
           valid: false,
           reason: `Amount mismatch: Contract received ${paidStroops} stroops, expected exact ${expectedStroops} stroops`,
+          txHash,
+        };
+      }
+
+      // 6b. Defense-in-Depth: Validate payer in operation matches persistent ledger receipt
+      if (extractedPayer && receipt.payer !== extractedPayer) {
+        return {
+          valid: false,
+          reason: `Payer mismatch: Envelope invokes payment from '${extractedPayer}', but ledger receipt records payer '${receipt.payer}'`,
           txHash,
         };
       }

@@ -107,8 +107,8 @@ describe('BudgetManager', () => {
     // Still quarantined by default 60s
     expect(budget.getPendingReservedXlm()).toBe(0.5);
 
-    // Advance 60_001 ms
-    mockTime += 60_001;
+    // Advance 60s quarantine + 15s clock skew safety margin
+    mockTime += 75_001;
     expect(budget.getPendingReservedXlm()).toBe(0);
   });
 
@@ -131,9 +131,33 @@ describe('BudgetManager', () => {
     budget.release(res2, mockTime + 20_000, 'tx_dropped_never_landed', 'GMERCHANT_2');
     expect(budget.getPendingReservedXlm()).toBe(0.8);
 
+    // Guard check: cannot unquarantine with NOT_FOUND before timeout boundary elapses
+    expect(() => budget.resolveQuarantine(res2, 'NOT_FOUND')).toThrow(/Cannot release quarantined reservation/);
+
+    // Advance clock past releaseAt (20s + 15s clock skew = 35_000ms)
+    mockTime += 36_000;
     budget.resolveQuarantine(res2, 'NOT_FOUND');
     expect(budget.getPendingReservedXlm()).toBe(0);
     // Spending total remains 0.6, res2 budget was freed without charge
     expect(budget.getSpentTotal()).toBe(0.6);
+  });
+
+  it('protects in-flight tx with txHash from silent lazy pruning when timeout elapses without resolution', () => {
+    let mockTime = 1000;
+    const budget = new BudgetManager(1.0, 2.0, 120_000, () => mockTime);
+
+    const res = budget.reserve(0.5);
+    budget.release(res, mockTime + 10_000, 'tx_broadcast_inflight', 'GMERCHANT_3');
+
+    // Advance clock past releaseAt
+    mockTime += 30_000;
+
+    // Because txHash is attached, lazy pruning does NOT silently delete it!
+    expect(budget.getPendingReservedXlm()).toBe(0.5);
+    expect(budget.getQuarantinedReservations().length).toBe(1);
+
+    // Explicit resolution frees it safely
+    budget.resolveQuarantine(res, 'NOT_FOUND');
+    expect(budget.getPendingReservedXlm()).toBe(0);
   });
 });
