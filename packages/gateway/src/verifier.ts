@@ -381,10 +381,10 @@ export class StellarPaymentVerifier {
       }
 
       // 6b. Defense-in-Depth: Validate payer in operation matches persistent ledger receipt
-      if (extractedPayer && receipt.payer !== extractedPayer) {
+      if (!extractedPayer || receipt.payer !== extractedPayer) {
         return {
           valid: false,
-          reason: `Payer mismatch: Envelope invokes payment from '${extractedPayer}', but ledger receipt records payer '${receipt.payer}'`,
+          reason: `Payer mismatch or unextractable: Envelope invokes payment from '${extractedPayer ?? 'unextractable'}', but ledger receipt records payer '${receipt.payer}'`,
           txHash,
         };
       }

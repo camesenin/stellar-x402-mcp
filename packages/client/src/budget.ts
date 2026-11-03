@@ -16,9 +16,30 @@ export type QuarantineTimeInput =
 
 export const STROOPS_PER_XLM = 10_000_000n;
 
-export function xlmToStroopsBigInt(xlm: number | string): bigint {
-  const val = typeof xlm === 'string' ? parseFloat(xlm) : xlm;
-  return BigInt(Math.round(val * 10_000_000));
+export function xlmToStroopsBigInt(xlm: number | string | bigint): bigint {
+  if (typeof xlm === 'bigint') {
+    if (xlm <= 0n) throw new Error(`Payment amount must be positive, got ${xlm}`);
+    return xlm;
+  }
+  const str = String(xlm).trim();
+  if (!str || str.startsWith('-')) {
+    throw new Error(`Invalid payment amount: '${xlm}'. Amount must be positive.`);
+  }
+  if (!/^\d+(\.\d+)?$/.test(str)) {
+    throw new Error(`Invalid payment amount format: '${xlm}'. Expected valid numeric string.`);
+  }
+  const [whole, fraction = ''] = str.split('.');
+  if (fraction.length > 7) {
+    throw new Error(
+      `Excess decimal precision in '${xlm}'. Stellar supports at most 7 decimal places (stroops).`
+    );
+  }
+  const padded = fraction.padEnd(7, '0');
+  const stroops = BigInt(whole) * 10_000_000n + BigInt(padded);
+  if (stroops <= 0n) {
+    throw new Error(`Payment amount must be greater than zero stroops, got: '${xlm}'`);
+  }
+  return stroops;
 }
 
 export function stroopsToXlmNumber(stroops: bigint): number {
@@ -262,6 +283,37 @@ export class BudgetManager {
     }
 
     this.reservations.delete(reservationId);
+  }
+
+  /**
+   * Active pool reconciler: queries an asynchronous transaction status checker for all
+   * quarantined in-flight reservations and resolves them to prevent memory/budget leaks.
+   */
+  public async reconcileQuarantinedPool(
+    statusChecker: (txHash: string) => Promise<'SUCCESS' | 'FAILED' | 'NOT_FOUND'>
+  ): Promise<{ resolved: number; pending: number }> {
+    const now = this.clock();
+    let resolved = 0;
+    let pending = 0;
+
+    for (const [id, res] of Array.from(this.reservations.entries())) {
+      if (res.txHash) {
+        // If releaseAt boundary has elapsed, inspect on-chain status
+        if (!res.releaseAt || now >= res.releaseAt) {
+          try {
+            const status = await statusChecker(res.txHash);
+            this.resolveQuarantine(id, status);
+            resolved++;
+          } catch {
+            pending++;
+          }
+        } else {
+          pending++;
+        }
+      }
+    }
+
+    return { resolved, pending };
   }
 
   public getQuarantinedReservations(): Array<{

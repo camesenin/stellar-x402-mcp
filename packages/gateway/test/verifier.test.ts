@@ -155,7 +155,7 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
                     contractAddress: () => Address.fromString('CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA').toScAddress(),
                     functionName: () => Buffer.from('settle_payment'),
                     args: () => [
-                      nativeToScVal(1),
+                      new Address('CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM').toScVal(),
                       new Address('GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5').toScVal(),
                       new Address('CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC').toScVal(),
                       nativeToScVal(500_000n, { type: 'i128' }),
@@ -245,7 +245,7 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
                           contractAddress: () => Address.fromString('CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO').toScAddress(),
                           functionName: () => Buffer.from('settle_payment'),
                           args: () => [
-                            nativeToScVal(1),
+                            new Address('GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5').toScVal(),
                             new Address('GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5').toScVal(),
                             new Address('CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC').toScVal(),
                             nativeToScVal(500_000n, { type: 'i128' }),

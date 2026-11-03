@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { BudgetManager } from '../src/budget.js';
+import { BudgetManager, xlmToStroopsBigInt } from '../src/budget.js';
 
 describe('BudgetManager', () => {
   it('allows payments below per-call and cumulative ceiling', () => {
@@ -159,5 +159,37 @@ describe('BudgetManager', () => {
     // Explicit resolution frees it safely
     budget.resolveQuarantine(res, 'NOT_FOUND');
     expect(budget.getPendingReservedXlm()).toBe(0);
+  });
+
+  it('validates numeric format in xlmToStroopsBigInt rejecting NaN, negatives and excess decimals', () => {
+    expect(() => xlmToStroopsBigInt('NaN')).toThrow(/Expected valid numeric string/);
+    expect(() => xlmToStroopsBigInt('-0.5')).toThrow(/Amount must be positive/);
+    expect(() => xlmToStroopsBigInt('0.12345678')).toThrow(/Excess decimal precision/);
+    expect(xlmToStroopsBigInt('1.5')).toBe(15_000_000n);
+    expect(xlmToStroopsBigInt(10_000_000n)).toBe(10_000_000n);
+  });
+
+  it('reconciles quarantined pool automatically via status checker callback', async () => {
+    let mockTime = 1000;
+    const budget = new BudgetManager(1.0, 5.0, 120_000, () => mockTime);
+
+    const r1 = budget.reserve(0.5);
+    budget.release(r1, mockTime + 5000, 'tx_hash_confirmed', 'GMERCHANT_1');
+
+    const r2 = budget.reserve(0.8);
+    budget.release(r2, mockTime + 5000, 'tx_hash_dropped', 'GMERCHANT_2');
+
+    // Advance past timeout boundary
+    mockTime += 25_000;
+
+    const mockChecker = async (hash: string): Promise<'SUCCESS' | 'FAILED' | 'NOT_FOUND'> => {
+      if (hash === 'tx_hash_confirmed') return 'SUCCESS';
+      return 'NOT_FOUND';
+    };
+
+    const result = await budget.reconcileQuarantinedPool(mockChecker);
+    expect(result.resolved).toBe(2);
+    expect(budget.getPendingReservedXlm()).toBe(0);
+    expect(budget.getSpentTotal()).toBe(0.5);
   });
 });
