@@ -5,6 +5,8 @@ interface ActiveReservation {
   amountXlm: number;
   reservedAt: number;
   releaseAt?: number;
+  txHash?: string;
+  destination?: string;
 }
 
 export class BudgetManager {
@@ -116,23 +118,85 @@ export class BudgetManager {
    * the reservation is quarantined in pending status until that timestamp has passed
    * to strictly prevent double-spending / overdraft from in-flight transactions landing later.
    */
-  public release(reservationId: string, keepUntilTime?: number): void {
+  public release(
+    reservationId: string,
+    keepUntilTime?: number,
+    txHash?: string,
+    destination?: string
+  ): void {
     const res = this.reservations.get(reservationId);
     if (!res) return;
 
+    if (txHash) res.txHash = txHash;
+    if (destination) res.destination = destination;
+
     if (keepUntilTime !== undefined) {
       // If provided as unix epoch seconds (e.g. 1.7B+), normalize to milliseconds
-      const keepMs = keepUntilTime > 1_000_000_000 && keepUntilTime < 10_000_000_000
-        ? keepUntilTime * 1000
-        : keepUntilTime;
+      const keepMs =
+        keepUntilTime > 1_000_000_000 && keepUntilTime < 10_000_000_000
+          ? keepUntilTime * 1000
+          : keepUntilTime;
       // If maxTime was 0 or unassigned, default to 60s quarantine; otherwise apply timestamp + 15s clock skew margin
-      const effectiveKeepUntil = keepMs > 0 ? keepMs + 15_000 : this.clock() + 60_000;
+      const effectiveKeepUntil =
+        keepMs > 0 ? keepMs + 15_000 : this.clock() + 60_000;
       if (effectiveKeepUntil > this.clock()) {
         res.releaseAt = effectiveKeepUntil;
         return;
       }
     }
     this.reservations.delete(reservationId);
+  }
+
+  /**
+   * Reconciles a quarantined reservation after timeout expiration.
+   * - If on-chain status is SUCCESS: converts reservation to settled expenditure.
+   * - If on-chain status is NOT_FOUND or FAILED: safely releases reserved funds without penalty.
+   */
+  public resolveQuarantine(
+    reservationId: string,
+    outcome: 'SUCCESS' | 'FAILED' | 'NOT_FOUND'
+  ): void {
+    const res = this.reservations.get(reservationId);
+    if (!res) return;
+
+    if (outcome === 'SUCCESS') {
+      this.totalSettledXlm += res.amountXlm;
+      this.receipts.push({
+        amount: res.amountXlm,
+        destination: res.destination || 'quarantine-settled',
+        timestamp: this.clock(),
+        txHash: res.txHash || 'quarantine-tx',
+      });
+    }
+    this.reservations.delete(reservationId);
+  }
+
+  /**
+   * Returns list of currently quarantined reservations pending ledger finality reconciliation.
+   */
+  public getQuarantinedReservations(): Array<{
+    id: string;
+    amountXlm: number;
+    txHash?: string;
+    releaseAt?: number;
+  }> {
+    const list: Array<{
+      id: string;
+      amountXlm: number;
+      txHash?: string;
+      releaseAt?: number;
+    }> = [];
+    for (const res of this.reservations.values()) {
+      if (res.releaseAt) {
+        list.push({
+          id: res.id,
+          amountXlm: res.amountXlm,
+          txHash: res.txHash,
+          releaseAt: res.releaseAt,
+        });
+      }
+    }
+    return list;
   }
 
   public recordPayment(amountXlm: number, destination: string, txHash: string): void {

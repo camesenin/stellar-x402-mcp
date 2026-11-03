@@ -119,10 +119,11 @@ impl X402PaymentVault {
         env.storage().persistent().set(&receipt_key, &receipt);
         env.storage().persistent().extend_ttl(&receipt_key, 100_000, 500_000);
 
-        // Update total receipts counter
+        // Update total receipts counter and extend contract instance TTL
         let count_key = DataKey::ReceiptCount;
         let current_count: u64 = env.storage().instance().get(&count_key).unwrap_or(0);
         env.storage().instance().set(&count_key, &(current_count + 1));
+        env.storage().instance().extend_ttl(100_000, 500_000);
 
         // Emit settlement event for off-chain indexing
         env.events().publish(

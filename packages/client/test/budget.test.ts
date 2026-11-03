@@ -111,4 +111,29 @@ describe('BudgetManager', () => {
     mockTime += 60_001;
     expect(budget.getPendingReservedXlm()).toBe(0);
   });
+
+  it('reconciles quarantined reservation: SUCCESS records spending, NOT_FOUND frees budget', () => {
+    let mockTime = 1000;
+    const budget = new BudgetManager(1.0, 2.0, 120_000, () => mockTime);
+
+    // Case 1: In-flight tx lands on ledger (SUCCESS)
+    const res1 = budget.reserve(0.6);
+    budget.release(res1, mockTime + 20_000, 'tx_landing_success', 'GMERCHANT_1');
+    expect(budget.getQuarantinedReservations().length).toBe(1);
+
+    budget.resolveQuarantine(res1, 'SUCCESS');
+    expect(budget.getPendingReservedXlm()).toBe(0);
+    expect(budget.getSpentTotal()).toBe(0.6);
+    expect(budget.getReceipts()[0].txHash).toBe('tx_landing_success');
+
+    // Case 2: In-flight tx expired on ledger (NOT_FOUND / FAILED)
+    const res2 = budget.reserve(0.8);
+    budget.release(res2, mockTime + 20_000, 'tx_dropped_never_landed', 'GMERCHANT_2');
+    expect(budget.getPendingReservedXlm()).toBe(0.8);
+
+    budget.resolveQuarantine(res2, 'NOT_FOUND');
+    expect(budget.getPendingReservedXlm()).toBe(0);
+    // Spending total remains 0.6, res2 budget was freed without charge
+    expect(budget.getSpentTotal()).toBe(0.6);
+  });
 });

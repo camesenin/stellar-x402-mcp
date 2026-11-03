@@ -15,7 +15,7 @@
   "dependencies": {
     "@stellar-x402/client": "workspace:*",
     "@stellar-x402/gateway": "workspace:*",
-    "@stellar/stellar-sdk": "^13.3.0",
+    "@stellar/stellar-sdk": "13.3.0",
     "commander": "^13.1.0",
     "cors": "^2.8.5",
     "express": "^4.21.2",

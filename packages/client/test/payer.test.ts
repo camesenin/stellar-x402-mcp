@@ -81,4 +81,93 @@ describe('StellarPayer & Autonomous Soroban Execution', () => {
     expect(classicSpy).toHaveBeenCalledWith(challenge);
     expect(receipt.txHash).toBe('feedface5678');
   });
+
+  describe('Client Security Policies & Malicious 402 Server Defenses', () => {
+    it('blocks challenge exceeding maxPaymentPerCallXlm hard limit', async () => {
+      const payer = new StellarPayer({
+        secretKey: dummySecret,
+        network: 'testnet',
+        maxPaymentPerCallXlm: 0.5,
+      });
+
+      const expensiveChallenge: ParsedChallenge = {
+        challengeId: 'expensive-server',
+        destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        amount: '2.5', // 2.5 > 0.5 cap
+        asset: 'XLM',
+        network: 'testnet',
+      };
+
+      await expect(payer.settleChallenge(expensiveChallenge)).rejects.toThrow(
+        /exceeds client maxPaymentPerCall limit of 0.5 XLM/
+      );
+    });
+
+    it('blocks challenge with destination not in allowedDestinations allowlist', async () => {
+      const trustedMerchant = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+      const rogueServer = 'GACVH6NMMZ2Y7V64B5L7N3L66S6FUG65476R74LOUX44R6HAKKOCZ776';
+
+      const payer = new StellarPayer({
+        secretKey: dummySecret,
+        network: 'testnet',
+        allowedDestinations: [trustedMerchant],
+      });
+
+      const maliciousChallenge: ParsedChallenge = {
+        challengeId: 'phishing-tool',
+        destination: rogueServer,
+        amount: '0.1',
+        asset: 'XLM',
+        network: 'testnet',
+      };
+
+      await expect(payer.settleChallenge(maliciousChallenge)).rejects.toThrow(
+        /rejected: not in client allowedDestinations whitelist/
+      );
+    });
+
+    it('blocks challenge with asset not in allowedTokens allowlist', async () => {
+      const payer = new StellarPayer({
+        secretKey: dummySecret,
+        network: 'testnet',
+        allowedTokens: ['XLM'],
+      });
+
+      const foreignTokenChallenge: ParsedChallenge = {
+        challengeId: 'drain-usdc',
+        destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        amount: '0.1',
+        asset: 'USDC',
+        network: 'testnet',
+      };
+
+      await expect(payer.settleChallenge(foreignTokenChallenge)).rejects.toThrow(
+        /rejected: not in client allowedTokens whitelist/
+      );
+    });
+
+    it('blocks challenge specifying foreign vault contract when pinnedVaultContractId is configured', async () => {
+      const canonicalVault = 'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO';
+      const attackerContract = 'CDCTANWGJPZ3YUYAP7NGS4ZHESA37YJEEQCHOOTINTVINOFNO5G24NIA';
+
+      const payer = new StellarPayer({
+        secretKey: dummySecret,
+        network: 'testnet',
+        pinnedVaultContractId: canonicalVault,
+      });
+
+      const rogueChallenge: ParsedChallenge = {
+        challengeId: 'rogue-vault-attack',
+        destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        amount: '0.1',
+        asset: 'XLM',
+        network: 'testnet',
+        contractId: attackerContract,
+      };
+
+      await expect(payer.settleChallenge(rogueChallenge)).rejects.toThrow(
+        /Untrusted vault contract .* rejected by client policy/
+      );
+    });
+  });
 });

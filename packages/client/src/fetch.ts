@@ -46,7 +46,7 @@ export function createX402Fetch(config: ClientConfig) {
     } catch (paymentErr: any) {
       // Hold in quarantine if transaction had a time bound or in-flight timeout
       const keepUntil = paymentErr?.maxTime ? paymentErr.maxTime : Date.now() + 75_000;
-      budget.release(reservationId, keepUntil);
+      budget.release(reservationId, keepUntil, paymentErr?.txHash, challenge.destination);
       throw paymentErr;
     }
 

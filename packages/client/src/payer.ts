@@ -114,7 +114,37 @@ export class StellarPayer {
    * otherwise executes a classic Stellar payment.
    */
   public async settleChallenge(challenge: ParsedChallenge): Promise<ClientPaymentReceipt> {
-    const contractId = challenge.contractId || this.config.contractId;
+    // 1. Client Policy: Hard cap per single tool call
+    const maxPerCall = this.config.maxPaymentPerCallXlm ?? 1.0;
+    const requestedAmount = parseFloat(challenge.amount);
+    if (requestedAmount > maxPerCall) {
+      throw new Error(
+        `Payment amount of ${challenge.amount} XLM exceeds client maxPaymentPerCall limit of ${maxPerCall} XLM`
+      );
+    }
+
+    // 2. Client Policy: Destination address whitelist
+    if (this.config.allowedDestinations && !this.config.allowedDestinations.includes(challenge.destination)) {
+      throw new Error(
+        `Destination address '${challenge.destination}' rejected: not in client allowedDestinations whitelist`
+      );
+    }
+
+    // 3. Client Policy: Asset / Token whitelist
+    if (this.config.allowedTokens && !this.config.allowedTokens.includes(challenge.asset)) {
+      throw new Error(
+        `Asset '${challenge.asset}' rejected: not in client allowedTokens whitelist`
+      );
+    }
+
+    // 4. Client Policy: Vault contract pinning
+    if (this.config.pinnedVaultContractId && challenge.contractId && challenge.contractId !== this.config.pinnedVaultContractId) {
+      throw new Error(
+        `Untrusted vault contract '${challenge.contractId}' rejected by client policy (expected: '${this.config.pinnedVaultContractId}')`
+      );
+    }
+
+    const contractId = this.config.pinnedVaultContractId || challenge.contractId || this.config.contractId;
     if (contractId) {
       return this.settleSorobanChallenge({ ...challenge, contractId });
     }
@@ -185,6 +215,30 @@ export class StellarPayer {
     // Prepare transaction on Soroban (calculates ledger footprints, resource fees and auth entries)
     const prepared = await this.sorobanServer.prepareTransaction(tx);
 
+    // Client Security Policy: Inspect simulated auth tree before signing
+    if (this.config.validateSimulationAuth !== false) {
+      try {
+        const ops = (prepared as any).operations || [];
+        for (const operation of ops) {
+          if (operation.auth && Array.isArray(operation.auth)) {
+            for (const authEntry of operation.auth) {
+              const rootInvocation = typeof authEntry.rootInvocation === 'function' ? authEntry.rootInvocation() : null;
+              if (rootInvocation && typeof rootInvocation.contractAddress === 'function') {
+                const targetContract = Address.fromScAddress(rootInvocation.contractAddress()).toString();
+                if (targetContract !== contractId && targetContract !== tokenAddress) {
+                  throw new Error(
+                    `Malicious auth tree detected: simulation attempted authorization on unauthorized contract '${targetContract}'`
+                  );
+                }
+              }
+            }
+          }
+        }
+      } catch (authErr: any) {
+        if (authErr.message?.includes('Malicious auth tree detected')) throw authErr;
+      }
+    }
+
     // Sign transaction with payer keypair
     prepared.sign(this.keypair);
 
@@ -221,7 +275,10 @@ export class StellarPayer {
     }
 
     if (status !== 'SUCCESS') {
-      throw new Error(`Soroban transaction timed out waiting for inclusion. Hash: ${txHash}`);
+      const timeoutErr: any = new Error(`Soroban transaction timed out waiting for inclusion. Hash: ${txHash}`);
+      timeoutErr.txHash = txHash;
+      timeoutErr.maxTime = Math.floor(Date.now() / 1000) + 60;
+      throw timeoutErr;
     }
 
     return {
