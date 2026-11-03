@@ -211,8 +211,19 @@ export class StellarPaymentVerifier {
       if (rawTx.envelopeXdr) {
         try {
           const envelope = xdr.TransactionEnvelope.fromXDR(rawTx.envelopeXdr, 'base64');
-          const txValue = envelope.value();
-          const txObj = 'tx' in txValue ? (txValue as any).tx() : null;
+          let txObj: any = null;
+          if (typeof envelope.switch === 'function' && envelope.switch().name === 'envelopeTypeTxFeeBump') {
+            const feeBump = envelope.feeBump();
+            const innerTx = feeBump.tx().innerTx();
+            if (innerTx.switch().name === 'envelopeTypeTx') {
+              txObj = innerTx.v1().tx();
+            }
+          } else {
+            const txValue = typeof envelope.value === 'function' ? envelope.value() : envelope;
+            if (txValue && 'tx' in txValue) {
+              txObj = (txValue as any).tx();
+            }
+          }
           if (txObj) {
             const ops = txObj.operations();
             const matchingOp = ops.find((op: any) => {

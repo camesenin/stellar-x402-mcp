@@ -121,8 +121,12 @@ export class BudgetManager {
     if (!res) return;
 
     if (keepUntilTime !== undefined) {
+      // If provided as unix epoch seconds (e.g. 1.7B+), normalize to milliseconds
+      const keepMs = keepUntilTime > 1_000_000_000 && keepUntilTime < 10_000_000_000
+        ? keepUntilTime * 1000
+        : keepUntilTime;
       // If maxTime was 0 or unassigned, default to 60s quarantine; otherwise apply timestamp + 15s clock skew margin
-      const effectiveKeepUntil = keepUntilTime > 0 ? keepUntilTime + 15_000 : this.clock() + 60_000;
+      const effectiveKeepUntil = keepMs > 0 ? keepMs + 15_000 : this.clock() + 60_000;
       if (effectiveKeepUntil > this.clock()) {
         res.releaseAt = effectiveKeepUntil;
         return;

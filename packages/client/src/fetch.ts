@@ -43,8 +43,10 @@ export function createX402Fetch(config: ClientConfig) {
       // 5. Submit payment on Stellar
       receipt = await payer.settleChallenge(challenge);
       budget.finalize(reservationId, challenge.destination, receipt.txHash);
-    } catch (paymentErr) {
-      budget.release(reservationId);
+    } catch (paymentErr: any) {
+      // Hold in quarantine if transaction had a time bound or in-flight timeout
+      const keepUntil = paymentErr?.maxTime ? paymentErr.maxTime : Date.now() + 75_000;
+      budget.release(reservationId, keepUntil);
       throw paymentErr;
     }
 

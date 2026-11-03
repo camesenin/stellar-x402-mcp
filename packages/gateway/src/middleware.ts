@@ -137,6 +137,25 @@ export function createX402Middleware(
         return;
       }
 
+      // Verify challenge resource binding to prevent cheap-to-expensive resource substitution
+      const currentResource = req.originalUrl || req.path;
+      if (challenge.resource && currentResource && challenge.resource !== currentResource) {
+        res.status(403).json({
+          error: 'Challenge Resource Mismatch',
+          message: `Challenge '${challengeId}' was issued for resource '${challenge.resource}', but presented for '${currentResource}'.`,
+        });
+        return;
+      }
+
+      // Verify price binding against current route requirement
+      if (challenge.amount !== targetAmount || challenge.asset !== targetAsset) {
+        res.status(402).json({
+          error: 'Challenge Price Mismatch',
+          message: `Challenge price (${challenge.amount} ${challenge.asset}) does not match current required payment (${targetAmount} ${targetAsset}).`,
+        });
+        return;
+      }
+
       // Requester binding defense (anti front-running)
       if (config.requireRequesterAuth && !payerSignature) {
         res.status(401).json({

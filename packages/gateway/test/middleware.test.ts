@@ -269,4 +269,50 @@ describe('createX402Middleware with SQLite', () => {
     } as any;
     expect(getClientIp(req3, ['10.0.0.1'])).toBe('192.168.1.99');
   });
+
+  it('rejects verification if challenge was issued for a different resource/route (resource substitution defense)', async () => {
+    const store = new ChallengeStore(':memory:');
+    const verifier = new StellarPaymentVerifier();
+    // Challenge created specifically for cheap route /api/cheap
+    const challenge = store.createChallenge(dummyDest, '0.001', 'XLM', '/api/cheap');
+
+    const middleware = createX402Middleware(
+      {
+        destinationPublicKey: dummyDest,
+        defaultFeeXlm: '10.0', // expensive endpoint requires 10 XLM
+      },
+      store,
+      verifier
+    );
+
+    // Attacker presents the cheap challenge to the expensive endpoint /api/expensive
+    const req = {
+      header: vi.fn((name: string) => {
+        if (name === 'X-Stellar-TxHash') return 'dummy_tx';
+        if (name === 'X-Challenge-Id') return challenge.challengeId;
+        return undefined;
+      }),
+      query: {},
+      originalUrl: '/api/expensive',
+      path: '/api/expensive',
+      ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as X402Request;
+
+    let statusCode = 0;
+    let jsonBody: any = null;
+    const res = {
+      status: vi.fn((code: number) => { statusCode = code; return res; }),
+      setHeader: vi.fn(),
+      json: vi.fn((b: any) => { jsonBody = b; return res; }),
+    } as unknown as Response;
+
+    const next = vi.fn();
+    await middleware(req, res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(statusCode).toBe(403);
+    expect(jsonBody.error).toContain('Challenge Resource Mismatch');
+    store.close();
+  });
 });

@@ -186,4 +186,93 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
     expect(result.valid).toBe(false);
     expect(result.reason).toContain('Direct cryptographic signature verification requires standard ed25519 agent keypair');
   });
+
+  it('rejects transaction if Soroban RPC status is FAILED even if parameters match', async () => {
+    const challenge = store.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/resource'
+    );
+    challenge.contractId = 'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO';
+
+    // Mock RPC returning FAILED transaction status
+    vi.spyOn(verifier as any, 'fetchSorobanTxJsonRpc').mockResolvedValue({
+      status: 'FAILED',
+      envelopeXdr: 'AAAA',
+    });
+
+    const result = await verifier.verifyPayment('failed_tx_hash', challenge, store);
+    expect(result.valid).toBe(false);
+    expect(result.reason).toContain("Soroban transaction status is 'FAILED'");
+  });
+
+  it('correctly handles and unpacks FeeBump transaction envelopes', async () => {
+    const challenge = store.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/resource'
+    );
+    challenge.contractId = 'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO';
+
+    vi.spyOn(verifier as any, 'fetchSorobanTxJsonRpc').mockResolvedValue({
+      status: 'SUCCESS',
+      envelopeXdr: 'DUMMY_FEE_BUMP_XDR',
+    });
+
+    const crypto = await import('node:crypto');
+    const expectedHash = challenge.challengeId.length === 64
+      ? Buffer.from(challenge.challengeId, 'hex')
+      : crypto.createHash('sha256').update(challenge.challengeId).digest();
+
+    // Mock envelope returning envelopeTypeTxFeeBump
+    vi.spyOn(xdr.TransactionEnvelope, 'fromXDR').mockReturnValue({
+      switch: () => ({ name: 'envelopeTypeTxFeeBump' }),
+      feeBump: () => ({
+        tx: () => ({
+          innerTx: () => ({
+            switch: () => ({ name: 'envelopeTypeTx' }),
+            v1: () => ({
+              tx: () => ({
+                operations: () => [{
+                  body: () => ({
+                    switch: () => ({ name: 'invokeHostFunction' }),
+                    invokeHostFunctionOp: () => ({
+                      hostFunction: () => ({
+                        switch: () => ({ name: 'hostFunctionTypeInvokeContract' }),
+                        invokeContract: () => ({
+                          contractAddress: () => Address.fromString('CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO').toScAddress(),
+                          functionName: () => Buffer.from('settle_payment'),
+                          args: () => [
+                            nativeToScVal(1),
+                            new Address('GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5').toScVal(),
+                            new Address('CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC').toScVal(),
+                            nativeToScVal(500_000n, { type: 'i128' }),
+                            xdr.ScVal.scvBytes(expectedHash),
+                          ],
+                        }),
+                      }),
+                    }),
+                  }),
+                }],
+              }),
+            }),
+          }),
+        }),
+      }),
+    } as any);
+
+    vi.spyOn(verifier as any, 'querySorobanContractReceipt').mockResolvedValue({
+      payer: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      recipient: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      token: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+      amount: 500_000n,
+      timestamp: 1730000000,
+    });
+
+    const result = await verifier.verifyPayment('feebump_tx_hash', challenge, store);
+    expect(result.valid).toBe(true);
+    expect(result.payer).toBe('GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5');
+  });
 });
