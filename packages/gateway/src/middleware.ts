@@ -175,6 +175,18 @@ export function createX402Middleware(
 
       const result = await verifier.verifyPayment(txHash, challenge, store, requesterAuth);
       if (!result.valid) {
+        if (result.retriable && result.statusCode === 503) {
+          res.setHeader('Retry-After', '2');
+          res.status(503).json({
+            error: 'Payment Verification Temporarily Unavailable',
+            details: result.reason,
+            txHash,
+            challengeId,
+            retriable: true,
+          });
+          return;
+        }
+
         res.status(402).json({
           error: 'Payment verification failed',
           details: result.reason,

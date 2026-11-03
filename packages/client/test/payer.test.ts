@@ -188,5 +188,58 @@ describe('StellarPayer & Autonomous Soroban Execution', () => {
         /Network mismatch: Challenge specified network 'public'/
       );
     });
+
+    it('rejects hostile server attempting to inject unauthorized contract in Soroban simulation auth tree', async () => {
+      const payer = new StellarPayer({
+        secretKey: dummySecret,
+        network: 'testnet',
+        validateSimulationAuth: true,
+      });
+
+      const canonicalVault = 'CDO7YEKIEYIJ7KV3S4BGIEVNW3JVEGYLV5Q4525LBK2HNUOULFQ3UPL3';
+      const nativeSac = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
+      const rogueContract = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM';
+
+      const { Account, Address } = await import('@stellar/stellar-sdk');
+      vi.spyOn((payer as any).sorobanServer, 'getAccount').mockResolvedValue(
+        new Account(payer.getPublicKey(), '100')
+      );
+
+      // Mock simulation returning prepared tx with malicious auth tree
+      const mockPreparedTx = {
+        operations: [{
+          auth: [{
+            rootInvocation: () => ({
+              contractAddress: () => Address.fromString(canonicalVault).toScAddress(),
+              subInvocations: () => [{
+                // Malicious nested invocation targeting an unauthorized rogue contract
+                contractAddress: () => Address.fromString(rogueContract).toScAddress(),
+                subInvocations: () => [],
+              }],
+            }),
+          }],
+        }],
+        sign: vi.fn(),
+        toXDR: vi.fn().mockReturnValue('dummy_xdr'),
+      };
+
+      vi.spyOn((payer as any).sorobanServer, 'prepareTransaction').mockResolvedValue(mockPreparedTx);
+
+      const challenge: ParsedChallenge = {
+        challengeId: '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',
+        destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        amount: '0.05',
+        asset: 'XLM',
+        network: 'testnet',
+        contractId: canonicalVault,
+        tokenAddress: nativeSac,
+      };
+
+      await expect(payer.settleSorobanChallenge(challenge)).rejects.toThrow(
+        /Malicious auth tree detected: simulation attempted authorization on unauthorized contract/
+      );
+      // Ensure transaction was NEVER signed!
+      expect(mockPreparedTx.sign).not.toHaveBeenCalled();
+    });
   });
 });

@@ -315,4 +315,65 @@ describe('createX402Middleware with SQLite', () => {
     expect(jsonBody.error).toContain('Challenge Resource Mismatch');
     store.close();
   });
+
+  it('returns HTTP 503 with Retry-After when verifier encounters transient simulation error, leaving tx unconsumed', async () => {
+    const store = new ChallengeStore(':memory:');
+    const verifier = new StellarPaymentVerifier();
+    const challenge = store.createChallenge(dummyDest, '0.05', 'XLM', '/api/resource');
+
+    const dummyTx = '11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff';
+
+    // Mock verifier returning retriable 503
+    vi.spyOn(verifier, 'verifyPayment').mockResolvedValue({
+      valid: false,
+      retriable: true,
+      statusCode: 503,
+      reason: 'Temporary Soroban RPC simulation failure while deriving canonical challenge hash',
+      txHash: dummyTx,
+    });
+
+    const middleware = createX402Middleware(
+      {
+        destinationPublicKey: dummyDest,
+        defaultFeeXlm: '0.05',
+      },
+      store,
+      verifier
+    );
+
+    const req = {
+      header: vi.fn((name: string) => {
+        if (name === 'X-Stellar-TxHash') return dummyTx;
+        if (name === 'X-Challenge-Id') return challenge.challengeId;
+        return undefined;
+      }),
+      query: {},
+      originalUrl: '/api/resource',
+      path: '/api/resource',
+      ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as X402Request;
+
+    const headers: Record<string, string> = {};
+    let statusCode = 0;
+    let jsonBody: any = null;
+    const res = {
+      status: vi.fn((code: number) => { statusCode = code; return res; }),
+      setHeader: vi.fn((k: string, v: string) => { headers[k] = v; return res; }),
+      json: vi.fn((b: any) => { jsonBody = b; return res; }),
+    } as unknown as Response;
+
+    const next = vi.fn();
+    await middleware(req, res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(statusCode).toBe(503);
+    expect(headers['Retry-After']).toBe('2');
+    expect(jsonBody.retriable).toBe(true);
+
+    // Crucial check: txHash must NOT have been consumed in SQLite store!
+    expect(store.isTxRedeemed(dummyTx)).toBe(false);
+    expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(false);
+    store.close();
+  });
 });

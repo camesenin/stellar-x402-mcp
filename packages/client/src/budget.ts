@@ -5,6 +5,8 @@ export interface ActiveReservation {
   amountStroops: bigint;
   reservedAt: number;
   releaseAt?: number;
+  maxTimeSec?: number;
+  broadcastAtSec?: number;
   txHash?: string;
   destination?: string;
 }
@@ -50,6 +52,7 @@ export interface TxStatusReport {
   status: 'SUCCESS' | 'FAILED' | 'NOT_FOUND' | 'PENDING';
   latestLedgerCloseTime?: number; // epoch seconds
   oldestLedgerCloseTime?: number; // epoch seconds
+  onChainReceiptExists?: boolean; // verified via persistent receipt storage lookup
 }
 
 export type StatusCheckerFn = (
@@ -71,6 +74,7 @@ export class BudgetManager {
   private maxPerCallStroops: bigint;
   private totalCeilingStroops: bigint;
   private reconcilerTimer?: NodeJS.Timeout | ReturnType<typeof setInterval>;
+  private isReconciling: boolean = false;
 
   constructor(
     maxPerCallXlm: number = 1.0,
@@ -194,21 +198,27 @@ export class BudgetManager {
     reservationId: string,
     keepUntil?: QuarantineTimeInput,
     txHash?: string,
-    destination?: string
+    destination?: string,
+    broadcastAtSec?: number
   ): void {
     const res = this.reservations.get(reservationId);
     if (!res) return;
 
     if (txHash) res.txHash = txHash;
     if (destination) res.destination = destination;
+    res.broadcastAtSec = broadcastAtSec ?? Math.floor(this.clock() / 1000);
 
     if (keepUntil !== undefined) {
       let targetEpochMs: number;
+      let rawMaxTimeSec: number;
+
       if (typeof keepUntil === 'object') {
         if ('epochMs' in keepUntil) {
           targetEpochMs = keepUntil.epochMs;
+          rawMaxTimeSec = Math.floor(keepUntil.epochMs / 1000);
         } else {
           targetEpochMs = this.clock() + keepUntil.durationMs;
+          rawMaxTimeSec = Math.floor(targetEpochMs / 1000);
         }
       } else if (typeof keepUntil === 'number') {
         // Explicit boundary: if > 1_000_000_000_000, epoch ms.
@@ -216,18 +226,26 @@ export class BudgetManager {
         // If relative duration (< 100_000), interpret as delta seconds.
         if (keepUntil > 1_000_000_000_000) {
           targetEpochMs = keepUntil;
+          rawMaxTimeSec = Math.floor(keepUntil / 1000);
         } else if (keepUntil > 1_000_000_000) {
           targetEpochMs = keepUntil * 1000;
+          rawMaxTimeSec = keepUntil;
         } else if (keepUntil > 0 && keepUntil <= 600) {
           targetEpochMs = this.clock() + keepUntil * 1000;
+          rawMaxTimeSec = Math.floor(targetEpochMs / 1000);
         } else if (keepUntil > 600) {
           targetEpochMs = keepUntil;
+          rawMaxTimeSec = Math.floor(keepUntil / 1000);
         } else {
           targetEpochMs = this.clock() + 60_000;
+          rawMaxTimeSec = Math.floor(targetEpochMs / 1000);
         }
       } else {
         targetEpochMs = this.clock() + 60_000;
+        rawMaxTimeSec = Math.floor(targetEpochMs / 1000);
       }
+
+      res.maxTimeSec = rawMaxTimeSec;
 
       // Add 15s ledger clock-skew buffer
       const effectiveKeepUntil = targetEpochMs + 15_000;
@@ -261,7 +279,7 @@ export class BudgetManager {
    * Guarantees:
    * - Cannot unquarantine with NOT_FOUND/FAILED before releaseAt expiration.
    * - If SUCCESS: permanently converts reserved stroops into settled expenditure.
-   * - If NOT_FOUND / FAILED (after releaseAt): safely frees budget reservation if within retention window.
+   * - If NOT_FOUND / FAILED (after releaseAt): safely frees budget reservation if within retention window or receipt-proven.
    */
   public resolveQuarantine(
     reservationId: string,
@@ -275,13 +293,20 @@ export class BudgetManager {
     let status: 'SUCCESS' | 'FAILED' | 'NOT_FOUND' | 'PENDING';
     let latestLedgerCloseTime: number | undefined;
     let oldestLedgerCloseTime: number | undefined;
+    let onChainReceiptExists: boolean | undefined;
 
     if (typeof outcome === 'object') {
       status = outcome.status;
       latestLedgerCloseTime = outcome.latestLedgerCloseTime;
       oldestLedgerCloseTime = outcome.oldestLedgerCloseTime;
+      onChainReceiptExists = outcome.onChainReceiptExists;
     } else {
       status = outcome;
+    }
+
+    // On-Chain Receipt Override: If receipt exists in contract storage, it definitely succeeded!
+    if (onChainReceiptExists === true) {
+      status = 'SUCCESS';
     }
 
     if (status === 'PENDING') {
@@ -296,20 +321,33 @@ export class BudgetManager {
     }
 
     // Soroban RPC Retention Window Guard for NOT_FOUND:
-    // NOT_FOUND is only definitive proof of non-inclusion if:
-    // 1) latestLedgerCloseTime > maxTime (releaseAt - 15s clock skew)
-    // 2) oldestLedgerCloseTime <= maxTime (meaning the tx validity window has NOT fallen off the retention window into archival oblivion)
     if (status === 'NOT_FOUND' && res.releaseAt) {
-      const maxTimeSec = Math.floor((res.releaseAt - 15_000) / 1000);
-      if (latestLedgerCloseTime !== undefined && oldestLedgerCloseTime !== undefined) {
-        if (latestLedgerCloseTime <= maxTimeSec) {
-          // The network has not yet reached maxTime; tx could still be included in an upcoming block!
-          return; // keep pending quarantined
+      const maxTimeSec = res.maxTimeSec ?? Math.floor((res.releaseAt - 15_000) / 1000);
+      const broadcastSec = res.broadcastAtSec ?? (maxTimeSec - 60);
+
+      // Definite proof via On-Chain Receipt absence after maxTime:
+      // If contract receipt was queried and does NOT exist, and current ledger time > maxTime,
+      // the payment is definitively unexecuted regardless of RPC transaction history pruning!
+      if (onChainReceiptExists === false) {
+        if (latestLedgerCloseTime !== undefined && latestLedgerCloseTime <= maxTimeSec) {
+          return; // Network has not yet closed maxTime ledger; still pending
         }
-        if (oldestLedgerCloseTime > maxTimeSec) {
-          // The tx maxTime is older than the oldest retained ledger in RPC; NOT_FOUND could be an eviction artifact!
-          // Maintain quarantine to fail closed against double spending.
-          return;
+        // Receipt absent and ledger passed maxTime -> definitively never landed, safe to free!
+      } else {
+        // Receipt was not directly checked; rely on RPC transaction retention window.
+        // FAIL-CLOSED: If either retention boundary is missing, do NOT free!
+        if (latestLedgerCloseTime === undefined || oldestLedgerCloseTime === undefined) {
+          return; // Maintain quarantine fail-closed
+        }
+
+        // 1) Network must have advanced beyond transaction maxTime
+        if (latestLedgerCloseTime <= maxTimeSec) {
+          return; // Still pending: tx could be mined before maxTime
+        }
+
+        // 2) RPC retention window must cover the moment of broadcast
+        if (oldestLedgerCloseTime > broadcastSec) {
+          return; // Transaction fell outside RPC retention window; maintain quarantine to avoid leak
         }
       }
     }
@@ -369,19 +407,29 @@ export class BudgetManager {
 
   /**
    * Starts active background timer to periodically reconcile quarantined reservations.
+   * Includes re-entrancy protection, unref() for graceful process exit, and optional error logging.
    */
   public startActiveReconciler(
     statusChecker: StatusCheckerFn,
-    intervalMs: number = 10_000
+    intervalMs: number = 10_000,
+    onError?: (err: unknown) => void
   ): void {
     if (this.reconcilerTimer) return;
     this.reconcilerTimer = setInterval(async () => {
+      if (this.isReconciling) return;
+      this.isReconciling = true;
       try {
         await this.reconcileQuarantinedPool(statusChecker);
-      } catch {
-        // Handled silently in background loop
+      } catch (err) {
+        if (onError) onError(err);
+      } finally {
+        this.isReconciling = false;
       }
     }, intervalMs);
+
+    if (typeof this.reconcilerTimer?.unref === 'function') {
+      this.reconcilerTimer.unref();
+    }
   }
 
   /**

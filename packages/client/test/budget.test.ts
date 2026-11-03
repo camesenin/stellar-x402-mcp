@@ -136,7 +136,11 @@ describe('BudgetManager', () => {
 
     // Advance clock past releaseAt (20s + 15s clock skew = 35_000ms)
     mockTime += 36_000;
-    budget.resolveQuarantine(res2, 'NOT_FOUND');
+    budget.resolveQuarantine(res2, {
+      status: 'NOT_FOUND',
+      latestLedgerCloseTime: Math.floor(mockTime / 1000) + 10,
+      oldestLedgerCloseTime: 0,
+    });
     expect(budget.getPendingReservedXlm()).toBe(0);
     // Spending total remains 0.6, res2 budget was freed without charge
     expect(budget.getSpentTotal()).toBe(0.6);
@@ -156,8 +160,12 @@ describe('BudgetManager', () => {
     expect(budget.getPendingReservedXlm()).toBe(0.5);
     expect(budget.getQuarantinedReservations().length).toBe(1);
 
-    // Explicit resolution frees it safely
-    budget.resolveQuarantine(res, 'NOT_FOUND');
+    // Explicit resolution with retention proof frees it safely
+    budget.resolveQuarantine(res, {
+      status: 'NOT_FOUND',
+      latestLedgerCloseTime: Math.floor(mockTime / 1000) + 10,
+      oldestLedgerCloseTime: 0,
+    });
     expect(budget.getPendingReservedXlm()).toBe(0);
   });
 
@@ -182,9 +190,13 @@ describe('BudgetManager', () => {
     // Advance past timeout boundary
     mockTime += 25_000;
 
-    const mockChecker = async (hash: string): Promise<'SUCCESS' | 'FAILED' | 'NOT_FOUND'> => {
-      if (hash === 'tx_hash_confirmed') return 'SUCCESS';
-      return 'NOT_FOUND';
+    const mockChecker = async (hash: string) => {
+      if (hash === 'tx_hash_confirmed') return 'SUCCESS' as const;
+      return {
+        status: 'NOT_FOUND' as const,
+        latestLedgerCloseTime: Math.floor(mockTime / 1000) + 10,
+        oldestLedgerCloseTime: 0,
+      };
     };
 
     const result = await budget.reconcileQuarantinedPool(mockChecker);
@@ -232,6 +244,60 @@ describe('BudgetManager', () => {
     });
     // Now definitively confirmed expired without inclusion! Budget freed!
     expect(budget.getPendingReservedXlm()).toBe(0);
+  });
+
+  it('fails closed when NOT_FOUND report omits ledger close boundaries and no receipt checked', () => {
+    let mockTime = 100_000;
+    const budget = new BudgetManager(1.0, 5.0, 120_000, () => mockTime);
+
+    const r = budget.reserve(0.5);
+    budget.release(r, 110_000, 'tx_hash_fail_closed_test', 'GMERCHANT_1');
+    mockTime = 130_000;
+
+    // Report omits close times: must fail closed and NOT unquarantine!
+    budget.resolveQuarantine(r, 'NOT_FOUND');
+    expect(budget.getPendingReservedXlm()).toBe(0.5);
+
+    budget.resolveQuarantine(r, {
+      status: 'NOT_FOUND',
+      latestLedgerCloseTime: undefined,
+      oldestLedgerCloseTime: undefined,
+    });
+    expect(budget.getPendingReservedXlm()).toBe(0.5);
+  });
+
+  it('resolves evicted txs via on-chain contract receipt absence, preventing permanent budget lock', () => {
+    let mockTime = 100_000;
+    const budget = new BudgetManager(1.0, 5.0, 120_000, () => mockTime);
+
+    // Reservation with maxTime = 110s
+    const r1 = budget.reserve(0.5);
+    budget.release(r1, 110_000, 'tx_evicted_never_settled', 'GMERCHANT_1');
+    mockTime = 130_000;
+
+    // RPC pruned history (oldest 120s > maxTime 110s), but direct on-chain query confirms receipt is absent!
+    budget.resolveQuarantine(r1, {
+      status: 'NOT_FOUND',
+      latestLedgerCloseTime: 140,
+      oldestLedgerCloseTime: 120,
+      onChainReceiptExists: false,
+    });
+    // Safely freed without leaking budget!
+    expect(budget.getPendingReservedXlm()).toBe(0);
+
+    // Counter-case: On-chain receipt exists -> overrides NOT_FOUND and marks SUCCESS!
+    const r2 = budget.reserve(0.4);
+    budget.release(r2, 110_000, 'tx_evicted_but_settled', 'GMERCHANT_2');
+    mockTime = 130_000;
+
+    budget.resolveQuarantine(r2, {
+      status: 'NOT_FOUND',
+      latestLedgerCloseTime: 140,
+      oldestLedgerCloseTime: 120,
+      onChainReceiptExists: true,
+    });
+    expect(budget.getPendingReservedXlm()).toBe(0);
+    expect(budget.getSpentTotal()).toBe(0.4);
   });
 
   it('manages active background reconciler lifecycle via startActiveReconciler and stopActiveReconciler', async () => {
