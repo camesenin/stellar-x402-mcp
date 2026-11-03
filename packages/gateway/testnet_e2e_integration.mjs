@@ -4,11 +4,23 @@ import { StellarPaymentVerifier } from './dist/verifier.js';
 import { StellarPayer } from '../client/dist/payer.js';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const SOROBAN_RPC_URL = 'https://soroban-testnet.stellar.org';
 const HORIZON_URL = 'https://horizon-testnet.stellar.org';
-const CONTRACT_ID = 'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO';
 const NATIVE_SAC = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
+
+const deployedConfigPath = path.resolve(__dirname, '../contracts/deployed-contracts.json');
+let CONTRACT_ID = 'CDO7YEKIEYIJ7KV3S4BGIEVNW3JVEGYLV5Q4525LBK2HNUOULFQ3UPL3';
+let WASM_HASH = 'db3c7de9877660a1ad16f3a9ae6ba517e8cfb2b24bdab6e1b3442806ff8935b9';
+if (fs.existsSync(deployedConfigPath)) {
+  const deployed = JSON.parse(fs.readFileSync(deployedConfigPath, 'utf-8'));
+  if (deployed.contractId) CONTRACT_ID = deployed.contractId;
+  if (deployed.wasmHash) WASM_HASH = deployed.wasmHash;
+}
 
 async function fundWithFriendbot(publicKey) {
   console.log(`[Friendbot] Requesting funds for: ${publicKey}...`);
@@ -179,8 +191,7 @@ async function runLiveTestnetIntegration() {
 
   // 10. Test Case 5: Direct On-Chain Storage Query
   console.log('\n8. Test Case 5: Querying persistent contract ledger storage for receipt struct...');
-  const crypto = await import('node:crypto');
-  const nonceBytes = crypto.createHash('sha256').update(challengeA.challengeId).digest();
+  const nonceBytes = Buffer.from(challengeA.challengeId, 'hex');
   const onChainHash = await verifier.computeCanonicalChallengeHash(
     CONTRACT_ID,
     challengeA.destination,
@@ -213,7 +224,7 @@ async function runLiveTestnetIntegration() {
       network: 'Stellar Testnet',
       protocolVersion: 29,
       contractId: CONTRACT_ID,
-      wasmHash: 'c91cdea4d7bf8c50160445ee4db9d4af4cc31c4e016ec53c5040ecd36aedee15',
+      wasmHash: WASM_HASH,
       transactionHash: receiptA.txHash,
       settlementAmount: '0.05 XLM (500000 stroops)',
       purpose: 'Reproducible cryptographic artifact matching repository bytecode and on-chain ledger'

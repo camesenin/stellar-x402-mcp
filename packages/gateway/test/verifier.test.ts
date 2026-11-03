@@ -138,9 +138,8 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
     });
 
     const crypto = await import('node:crypto');
-    const expectedHash = challenge.challengeId.length === 64
-      ? Buffer.from(challenge.challengeId, 'hex')
-      : crypto.createHash('sha256').update(challenge.challengeId).digest();
+    const expectedHash = Buffer.from(challenge.challengeId, 'hex');
+    vi.spyOn(verifier, 'computeCanonicalChallengeHash').mockResolvedValue(expectedHash);
 
     vi.spyOn(xdr.TransactionEnvelope, 'fromXDR').mockReturnValue({
       value: () => ({
@@ -221,10 +220,8 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
       envelopeXdr: 'DUMMY_FEE_BUMP_XDR',
     });
 
-    const crypto = await import('node:crypto');
-    const expectedHash = challenge.challengeId.length === 64
-      ? Buffer.from(challenge.challengeId, 'hex')
-      : crypto.createHash('sha256').update(challenge.challengeId).digest();
+    const expectedHash = Buffer.from(challenge.challengeId, 'hex');
+    vi.spyOn(verifier, 'computeCanonicalChallengeHash').mockResolvedValue(expectedHash);
 
     // Mock envelope returning envelopeTypeTxFeeBump
     vi.spyOn(xdr.TransactionEnvelope, 'fromXDR').mockReturnValue({
@@ -274,5 +271,79 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
     const result = await verifier.verifyPayment('feebump_tx_hash', challenge, store);
     expect(result.valid).toBe(true);
     expect(result.payer).toBe('GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5');
+  });
+
+  it('rejects malformed challengeId format fail-closed (strict 64-character hex)', async () => {
+    const malformedChallenge: X402Challenge = {
+      challengeId: 'not_a_valid_hex_string_too_short',
+      destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      amount: '0.05',
+      asset: 'XLM',
+      memo: 'malformed_memo',
+      network: 'testnet',
+      resource: '/resource',
+      expiresAt: Date.now() + 60_000,
+    };
+
+    const result = await verifier.verifyPayment('any_tx_hash', malformedChallenge, store);
+    expect(result.valid).toBe(false);
+    expect(result.reason).toContain('Malformed challengeId');
+    expect(result.reason).toContain('Expected strict 64-character hex string');
+  });
+
+  it('returns retriable 503 error when computeCanonicalChallengeHash RPC simulation fails', async () => {
+    const challenge = store.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/resource'
+    );
+    challenge.contractId = 'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO';
+
+    vi.spyOn(verifier as any, 'fetchSorobanTxJsonRpc').mockResolvedValue({
+      status: 'SUCCESS',
+      envelopeXdr: 'AAAA',
+    });
+
+    const nonceBytes = Buffer.from(challenge.challengeId, 'hex');
+
+    vi.spyOn(xdr.TransactionEnvelope, 'fromXDR').mockReturnValue({
+      value: () => ({
+        tx: () => ({
+          operations: () => [{
+            body: () => ({
+              switch: () => ({ name: 'invokeHostFunction' }),
+              invokeHostFunctionOp: () => ({
+                hostFunction: () => ({
+                  switch: () => ({ name: 'hostFunctionTypeInvokeContract' }),
+                  invokeContract: () => ({
+                    contractAddress: () => Address.fromString('CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO').toScAddress(),
+                    functionName: () => Buffer.from('settle_payment'),
+                    args: () => [
+                      new Address('GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5').toScVal(),
+                      new Address('GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5').toScVal(),
+                      new Address('CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC').toScVal(),
+                      nativeToScVal(500_000n, { type: 'i128' }),
+                      xdr.ScVal.scvBytes(nonceBytes),
+                    ],
+                  }),
+                }),
+              }),
+            }),
+          }],
+        }),
+      }),
+    } as any);
+
+    // Mock computeCanonicalChallengeHash throwing RPC simulation error
+    vi.spyOn(verifier, 'computeCanonicalChallengeHash').mockRejectedValue(
+      new Error('Soroban RPC simulation timed out (504)')
+    );
+
+    const result = await verifier.verifyPayment('dummy_tx_hash', challenge, store);
+    expect(result.valid).toBe(false);
+    expect(result.retriable).toBe(true);
+    expect(result.statusCode).toBe(503);
+    expect(result.reason).toContain('Temporary Soroban RPC simulation failure');
   });
 });

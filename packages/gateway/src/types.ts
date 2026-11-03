@@ -40,6 +40,8 @@ export interface GatewayConfig {
 export interface VerificationResult {
   valid: boolean;
   reason?: string;
+  retriable?: boolean;
+  statusCode?: number;
   payer?: string;
   amount?: string;
   asset?: string;

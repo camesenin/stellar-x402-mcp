@@ -137,7 +137,16 @@ export class StellarPaymentVerifier {
       }
     }
 
-    // 1. Anti-Replay SQLite Check (ACID verification)
+    // 1. Strict challengeId format check: canonical 32-byte CSPRNG nonce in 64 hex characters
+    if (!/^[0-9a-fA-F]{64}$/.test(challenge.challengeId)) {
+      return {
+        valid: false,
+        reason: `Malformed challengeId: '${challenge.challengeId}'. Expected strict 64-character hex string representing a 32-byte nonce.`,
+        txHash: cleanHash,
+      };
+    }
+
+    // 2. Anti-Replay SQLite Check (ACID verification)
     if (store.isTxRedeemed(cleanHash)) {
       return {
         valid: false,
@@ -193,14 +202,8 @@ export class StellarPaymentVerifier {
         };
       }
 
-      // Compute expected 32-byte challenge hash buffer
-      let hashBytes: Buffer;
-      if (challenge.challengeId.length === 64) {
-        hashBytes = Buffer.from(challenge.challengeId, 'hex');
-      } else {
-        const crypto = await import('node:crypto');
-        hashBytes = crypto.createHash('sha256').update(challenge.challengeId).digest();
-      }
+      // 32-byte challenge nonce buffer (strictly validated 64 hex characters)
+      const nonceBytes = Buffer.from(challenge.challengeId, 'hex');
 
       const expectedToken = challenge.tokenAddress || (
         this.network === 'public' ? PUBLIC_NATIVE_SAC : TESTNET_NATIVE_SAC
@@ -278,10 +281,10 @@ export class StellarPaymentVerifier {
                     return false;
                   }
 
-                  // 2e. Envelope Challenge Hash binding (arg 4)
+                  // 2e. Envelope Nonce binding (arg 4)
                   try {
-                    const opHash = args[4].bytes();
-                    if (!opHash || !opHash.equals(hashBytes)) {
+                    const opNonce = args[4].bytes();
+                    if (!opNonce || !opNonce.equals(nonceBytes)) {
                       return false;
                     }
                   } catch {
@@ -325,17 +328,23 @@ export class StellarPaymentVerifier {
       }
 
       // 3. Derive canonical on-chain challenge hash committing to (contract, recipient, token, amount, nonce)
-      let onChainHash = hashBytes;
+      let onChainHash: Buffer;
       try {
         onChainHash = await this.computeCanonicalChallengeHash(
           targetVault,
           challenge.destination,
           expectedToken,
           expectedStroops,
-          hashBytes
+          nonceBytes
         );
-      } catch {
-        onChainHash = hashBytes;
+      } catch (simErr: any) {
+        return {
+          valid: false,
+          retriable: true,
+          statusCode: 503,
+          reason: `Temporary Soroban RPC simulation failure while deriving canonical challenge hash: ${simErr?.message || simErr}. Retry request.`,
+          txHash,
+        };
       }
 
       // 4. Query Soroban contract ledger storage for the persistent receipt
@@ -451,6 +460,7 @@ export class StellarPaymentVerifier {
   /**
    * Deterministically simulate contract function 'compute_challenge_hash' on Soroban RPC.
    * Derives the canonical 32-byte challenge hash on-chain, guaranteeing 100% parity with the contract.
+   * Throws an explicit error upon simulation or network failure, allowing caller to return retriable 503.
    */
   public async computeCanonicalChallengeHash(
     contractId: string,
@@ -459,36 +469,34 @@ export class StellarPaymentVerifier {
     amountStroops: bigint,
     nonceBytes: Buffer
   ): Promise<Buffer> {
-    if (!this.sorobanServer) return nonceBytes;
-    try {
-      const contract = new Contract(contractId);
-      const dummyAccount = new Account(
-        'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-        '0'
-      );
-      const op = contract.call(
-        'compute_challenge_hash',
-        new Address(recipient).toScVal(),
-        new Address(token).toScVal(),
-        nativeToScVal(amountStroops, { type: 'i128' }),
-        xdr.ScVal.scvBytes(nonceBytes)
-      );
-      const tx = new TransactionBuilder(dummyAccount, {
-        fee: '100',
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(op)
-        .setTimeout(30)
-        .build();
-
-      const sim: any = await this.sorobanServer.simulateTransaction(tx);
-      if (sim?.result?.retval) {
-        return Buffer.from(sim.result.retval.bytes());
-      }
-      return nonceBytes;
-    } catch {
-      return nonceBytes;
+    if (!this.sorobanServer) {
+      throw new Error('Soroban RPC server not configured for canonical hash simulation');
     }
+    const contract = new Contract(contractId);
+    const dummyAccount = new Account(
+      'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+      '0'
+    );
+    const op = contract.call(
+      'compute_challenge_hash',
+      new Address(recipient).toScVal(),
+      new Address(token).toScVal(),
+      nativeToScVal(amountStroops, { type: 'i128' }),
+      xdr.ScVal.scvBytes(nonceBytes)
+    );
+    const tx = new TransactionBuilder(dummyAccount, {
+      fee: '100',
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(op)
+      .setTimeout(30)
+      .build();
+
+    const sim: any = await this.sorobanServer.simulateTransaction(tx);
+    if (sim?.result?.retval) {
+      return Buffer.from(sim.result.retval.bytes());
+    }
+    throw new Error(`Soroban RPC simulation failed to return retval: ${sim?.error || JSON.stringify(sim)}`);
   }
 
   /**
@@ -496,22 +504,21 @@ export class StellarPaymentVerifier {
    */
   public async querySorobanContractReceipt(
     contractId: string,
-    challengeIdOrHash: string | Buffer
+    canonicalChallengeHash: string | Buffer
   ): Promise<SorobanReceiptRecord | null> {
     if (!this.sorobanServer) return null;
 
     try {
-      // Create 32-byte challenge hash buffer
+      // Create 32-byte canonical challenge hash buffer
       let hashBytes: Buffer;
-      if (Buffer.isBuffer(challengeIdOrHash)) {
-        hashBytes = challengeIdOrHash;
-      } else if (typeof challengeIdOrHash === 'string') {
-        if (challengeIdOrHash.length === 64) {
-          hashBytes = Buffer.from(challengeIdOrHash, 'hex');
-        } else {
-          const crypto = await import('node:crypto');
-          hashBytes = crypto.createHash('sha256').update(challengeIdOrHash).digest();
+      if (Buffer.isBuffer(canonicalChallengeHash)) {
+        if (canonicalChallengeHash.length !== 32) return null;
+        hashBytes = canonicalChallengeHash;
+      } else if (typeof canonicalChallengeHash === 'string') {
+        if (!/^[0-9a-fA-F]{64}$/.test(canonicalChallengeHash)) {
+          return null;
         }
+        hashBytes = Buffer.from(canonicalChallengeHash, 'hex');
       } else {
         return null;
       }

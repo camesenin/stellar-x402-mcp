@@ -46,6 +46,16 @@ export function stroopsToXlmNumber(stroops: bigint): number {
   return Number(stroops) / 10_000_000;
 }
 
+export interface TxStatusReport {
+  status: 'SUCCESS' | 'FAILED' | 'NOT_FOUND' | 'PENDING';
+  latestLedgerCloseTime?: number; // epoch seconds
+  oldestLedgerCloseTime?: number; // epoch seconds
+}
+
+export type StatusCheckerFn = (
+  txHash: string
+) => Promise<'SUCCESS' | 'FAILED' | 'NOT_FOUND' | 'PENDING' | TxStatusReport>;
+
 export class BudgetManager {
   private totalSettledStroops: bigint = 0n;
   private reservations = new Map<string, ActiveReservation>();
@@ -60,6 +70,7 @@ export class BudgetManager {
 
   private maxPerCallStroops: bigint;
   private totalCeilingStroops: bigint;
+  private reconcilerTimer?: NodeJS.Timeout | ReturnType<typeof setInterval>;
 
   constructor(
     maxPerCallXlm: number = 1.0,
@@ -250,25 +261,60 @@ export class BudgetManager {
    * Guarantees:
    * - Cannot unquarantine with NOT_FOUND/FAILED before releaseAt expiration.
    * - If SUCCESS: permanently converts reserved stroops into settled expenditure.
-   * - If NOT_FOUND / FAILED (after releaseAt): safely frees budget reservation.
+   * - If NOT_FOUND / FAILED (after releaseAt): safely frees budget reservation if within retention window.
    */
   public resolveQuarantine(
     reservationId: string,
-    outcome: 'SUCCESS' | 'FAILED' | 'NOT_FOUND'
+    outcome: 'SUCCESS' | 'FAILED' | 'NOT_FOUND' | 'PENDING' | TxStatusReport
   ): void {
     const res = this.reservations.get(reservationId);
     if (!res) return;
 
     const now = this.clock();
 
+    let status: 'SUCCESS' | 'FAILED' | 'NOT_FOUND' | 'PENDING';
+    let latestLedgerCloseTime: number | undefined;
+    let oldestLedgerCloseTime: number | undefined;
+
+    if (typeof outcome === 'object') {
+      status = outcome.status;
+      latestLedgerCloseTime = outcome.latestLedgerCloseTime;
+      oldestLedgerCloseTime = outcome.oldestLedgerCloseTime;
+    } else {
+      status = outcome;
+    }
+
+    if (status === 'PENDING') {
+      return; // remains quarantined
+    }
+
     // SEC-06 Guard: reject premature unquarantine of in-flight transaction
-    if (outcome !== 'SUCCESS' && res.releaseAt && now < res.releaseAt) {
+    if (status !== 'SUCCESS' && res.releaseAt && now < res.releaseAt) {
       throw new Error(
         `Cannot release quarantined reservation '${reservationId}' before in-flight timeout boundary has elapsed (releaseAt: ${res.releaseAt}, current: ${now})`
       );
     }
 
-    if (outcome === 'SUCCESS') {
+    // Soroban RPC Retention Window Guard for NOT_FOUND:
+    // NOT_FOUND is only definitive proof of non-inclusion if:
+    // 1) latestLedgerCloseTime > maxTime (releaseAt - 15s clock skew)
+    // 2) oldestLedgerCloseTime <= maxTime (meaning the tx validity window has NOT fallen off the retention window into archival oblivion)
+    if (status === 'NOT_FOUND' && res.releaseAt) {
+      const maxTimeSec = Math.floor((res.releaseAt - 15_000) / 1000);
+      if (latestLedgerCloseTime !== undefined && oldestLedgerCloseTime !== undefined) {
+        if (latestLedgerCloseTime <= maxTimeSec) {
+          // The network has not yet reached maxTime; tx could still be included in an upcoming block!
+          return; // keep pending quarantined
+        }
+        if (oldestLedgerCloseTime > maxTimeSec) {
+          // The tx maxTime is older than the oldest retained ledger in RPC; NOT_FOUND could be an eviction artifact!
+          // Maintain quarantine to fail closed against double spending.
+          return;
+        }
+      }
+    }
+
+    if (status === 'SUCCESS') {
       this.totalSettledStroops += res.amountStroops;
       if (res.txHash && res.destination) {
         this.receipts.push({
@@ -290,7 +336,7 @@ export class BudgetManager {
    * quarantined in-flight reservations and resolves them to prevent memory/budget leaks.
    */
   public async reconcileQuarantinedPool(
-    statusChecker: (txHash: string) => Promise<'SUCCESS' | 'FAILED' | 'NOT_FOUND'>
+    statusChecker: StatusCheckerFn
   ): Promise<{ resolved: number; pending: number }> {
     const now = this.clock();
     let resolved = 0;
@@ -301,9 +347,14 @@ export class BudgetManager {
         // If releaseAt boundary has elapsed, inspect on-chain status
         if (!res.releaseAt || now >= res.releaseAt) {
           try {
-            const status = await statusChecker(res.txHash);
-            this.resolveQuarantine(id, status);
-            resolved++;
+            const report = await statusChecker(res.txHash);
+            const initialCount = this.reservations.size;
+            this.resolveQuarantine(id, report);
+            if (this.reservations.size < initialCount) {
+              resolved++;
+            } else {
+              pending++;
+            }
           } catch {
             pending++;
           }
@@ -314,6 +365,33 @@ export class BudgetManager {
     }
 
     return { resolved, pending };
+  }
+
+  /**
+   * Starts active background timer to periodically reconcile quarantined reservations.
+   */
+  public startActiveReconciler(
+    statusChecker: StatusCheckerFn,
+    intervalMs: number = 10_000
+  ): void {
+    if (this.reconcilerTimer) return;
+    this.reconcilerTimer = setInterval(async () => {
+      try {
+        await this.reconcileQuarantinedPool(statusChecker);
+      } catch {
+        // Handled silently in background loop
+      }
+    }, intervalMs);
+  }
+
+  /**
+   * Stops active background reconciler timer.
+   */
+  public stopActiveReconciler(): void {
+    if (this.reconcilerTimer) {
+      clearInterval(this.reconcilerTimer);
+      this.reconcilerTimer = undefined;
+    }
   }
 
   public getQuarantinedReservations(): Array<{

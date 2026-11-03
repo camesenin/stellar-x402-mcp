@@ -192,4 +192,71 @@ describe('BudgetManager', () => {
     expect(budget.getPendingReservedXlm()).toBe(0);
     expect(budget.getSpentTotal()).toBe(0.5);
   });
+
+  it('enforces RPC retention window guards for NOT_FOUND: prevents unquarantining if node is behind or pruned', () => {
+    let mockTime = 100_000;
+    const budget = new BudgetManager(1.0, 5.0, 120_000, () => mockTime);
+
+    // Reservation with maxTime = 110_000ms (110s) -> releaseAt = 125_000ms
+    const r = budget.reserve(0.5);
+    budget.release(r, 110_000, 'tx_hash_window_check', 'GMERCHANT_1');
+
+    // Advance clock past releaseAt (e.g. 130_000ms)
+    mockTime = 130_000;
+
+    // Subcase A: RPC node latestLedgerCloseTime is 105s (behind tx maxTime 110s)
+    // Even though local clock passed releaseAt, RPC node is behind! Tx could still land!
+    budget.resolveQuarantine(r, {
+      status: 'NOT_FOUND',
+      latestLedgerCloseTime: 105,
+      oldestLedgerCloseTime: 90,
+    });
+    // Reservation must NOT be freed!
+    expect(budget.getPendingReservedXlm()).toBe(0.5);
+
+    // Subcase B: RPC node has evicted tx validity window (oldestLedgerCloseTime 115s > maxTime 110s)
+    // NOT_FOUND could be an eviction artifact; fail-closed!
+    budget.resolveQuarantine(r, {
+      status: 'NOT_FOUND',
+      latestLedgerCloseTime: 140,
+      oldestLedgerCloseTime: 115,
+    });
+    // Reservation must STILL NOT be freed!
+    expect(budget.getPendingReservedXlm()).toBe(0.5);
+
+    // Subcase C: Verified within retention window: latest (120s) > maxTime (110s) AND oldest (100s) <= maxTime (110s)
+    budget.resolveQuarantine(r, {
+      status: 'NOT_FOUND',
+      latestLedgerCloseTime: 120,
+      oldestLedgerCloseTime: 100,
+    });
+    // Now definitively confirmed expired without inclusion! Budget freed!
+    expect(budget.getPendingReservedXlm()).toBe(0);
+  });
+
+  it('manages active background reconciler lifecycle via startActiveReconciler and stopActiveReconciler', async () => {
+    let mockTime = 1000;
+    const budget = new BudgetManager(1.0, 5.0, 120_000, () => mockTime);
+    const r = budget.reserve(0.1);
+    budget.release(r, mockTime + 100, 'tx_reconciler_test', 'GMERCHANT');
+    // Advance past releaseAt so the reconciler inspects on-chain status
+    mockTime += 20_000;
+
+    let checkCalls = 0;
+    const mockChecker = async () => {
+      checkCalls++;
+      return 'PENDING' as const;
+    };
+
+    budget.startActiveReconciler(mockChecker, 30);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    budget.stopActiveReconciler();
+
+    const currentCalls = checkCalls;
+    expect(currentCalls).toBeGreaterThanOrEqual(1);
+
+    // Verify timer stopped
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(checkCalls).toBe(currentCalls);
+  });
 });

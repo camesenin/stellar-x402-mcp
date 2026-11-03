@@ -70,7 +70,8 @@ export class ChallengeStore {
     ttlMs?: number,
     tokenAddress?: string
   ): X402Challenge {
-    const challengeId = crypto.randomBytes(16).toString('hex');
+    // Generate canonical 32-byte (64 hex characters) nonce from CSPRNG
+    const challengeId = crypto.randomBytes(32).toString('hex');
     const memo = challengeId.slice(0, 28);
     const now = Date.now();
     const expiresAt = now + (ttlMs ?? this.defaultTtlMs);
