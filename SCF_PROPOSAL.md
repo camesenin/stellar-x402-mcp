@@ -58,11 +58,11 @@ As of proposal preparation:
 - **Live On-Chain Settlement**: Real testnet transaction confirmed at [`e6bf8005c3d0b680257448a2deb4ce785026377237fefab7753318664b4d2d36`](https://stellar.expert/explorer/testnet/tx/e6bf8005c3d0b680257448a2deb4ce785026377237fefab7753318664b4d2d36) (Ledger `5528366`), transferring native XLM SAC with verified contract receipt.
 - **Cryptographic Durability Artifact**: Raw RPC response, envelope XDR, and diagnostic events preserved in [`testnet_evidence_pack.json`](./testnet_evidence_pack.json), ensuring persistent verification immune to Testnet ledger resets.
 - **Rust Contract Unit Tests**: 8/8 passing (`packages/contracts/src/lib.rs`), asserting amount validation, payer authorization, insufficient balance checks, receipt retrieval, replay panic, multi-challenge isolation, and adversarial griefing slot-burning immunity.
-- **TypeScript Test Suite**: 34/34 passing across `@stellar-x402/gateway` (18), `@stellar-x402/client` (14), `@stellar-x402/cli` (1), and `examples/mcp-payment-demo` (1).
+- **TypeScript Test Suite**: 37/37 passing across `@stellar-x402/gateway` (21), `@stellar-x402/client` (14), `@stellar-x402/cli` (1), and `examples/mcp-payment-demo` (1).
 - **Adversarial Testnet Integration Suite**: 5/5 passing (`packages/gateway/testnet_e2e_integration.mjs`), including cross-challenge hash mismatch rejection, requester signature theft rejection, on-chain storage query, double-redemption blocking, and domain-separated proof verification.
-- **Total Test Count**: Exactly 47 automated tests (8 Rust + 34 TS/simulation + 5 Testnet E2E).
+- **Total Test Count**: Exactly 50 automated tests (8 Rust + 37 TS/simulation + 5 Testnet E2E).
 - **SQLite WAL Durability**: Zero-lock contention under 100 concurrent requests, atomic rollback on duplicate hash collision.
-- **Soroban Wasm Target**: Successfully compiled for WebAssembly MVP v1 (`target/wasm32v1-none/release/stellar_x402_contracts.wasm`, 17,421 bytes, SHA-256 matching deployed contract bytecode).
+- **Soroban Wasm Target**: Successfully compiled for WebAssembly MVP v1 (`target/wasm32v1-none/release/stellar_x402_contracts.wasm`, 17,421 bytes, SHA-256 matching deployed contract bytecode). Toolchain pinned via `packages/contracts/rust-toolchain.toml`.
 - **Standard Protocol Integration**: Pure JSON-RPC 2.0 (jsonrpc.org) communication with Soroban RPC (Protocol 29 Testnet compatible, zero reliance on private SDK methods).
 - **CI/CD Pipeline**: GitHub Actions running on every commit.
 
@@ -71,10 +71,10 @@ As of proposal preparation:
 ## 5. Security & Threat Model Defenses
 
 1. **On-Chain Challenge Hash Recomputation (Anti-Griefing)**: The contract computes `compute_challenge_hash(recipient, token, amount, nonce)` on-chain. An attacker attempting to burn an honest payer's challenge by settling 1 stroop or substituting a different recipient generates a completely disjoint hash, leaving the honest payer's receipt slot intact.
-2. **Pinned Vault Contract Enforcement**: Gateway parses envelope XDR and validates `invokedContract === targetVault` and `fnName === 'settle_payment'`, failing closed if the envelope is malformed or targets an unauthorized contract.
-3. **Domain-Separated Requester Binding**: Proof signature covers `stellar-x402:v1:${networkPassphrase}:${gatewayUrl}:${challengeId}:${txHash}:${expiresAt}` signed with the payer keypair. Observers of the public ledger cannot front-run or steal paid resources without possessing the private key. Contract accounts (`C...`) are cleanly rejected with an actionable error.
-4. **Budget In-Flight Overdraft Quarantine**: In-flight transactions are quarantined until `timeBounds.maxTime + 15s` (or 60s default if `maxTime=0`), preventing budget leaks or overdrafts on RPC timeouts.
-5. **Contract Immutability & State TTL**: `X402PaymentVault` has zero admin keys and zero upgrade entry points. Persistent receipts are refreshed with `extend_ttl(100k, 500k)` to maintain on-chain audit trails.
+2. **Pinned Vault Contract Enforcement & FeeBump Unpacking**: Gateway parses envelope XDR, unrolls `envelopeTypeTxFeeBump` (`innerTx`), and validates `invokedContract === targetVault` and `fnName === 'settle_payment'`, failing closed if the envelope is malformed or targets an unauthorized contract.
+3. **Domain-Separated Requester Binding & Resource Route Pinning**: Proof signature covers `stellar-x402:v1:${networkPassphrase}:${gatewayUrl}:${challengeId}:${txHash}:${expiresAt}` signed with the payer keypair. Resource routes are bound strictly (`challenge.resource === currentResource`), blocking cheap-to-expensive resource substitution with HTTP 403. Contract accounts (`C...`) are cleanly rejected with an actionable error.
+4. **Budget In-Flight Overdraft Quarantine**: In-flight transactions are quarantined with normalized epoch seconds until `timeBounds.maxTime + 15s` (or 60s default if `maxTime=0`), preventing budget leaks or overdrafts on RPC timeouts.
+5. **Contract Immutability & State TTL**: `X402PaymentVault` has zero admin keys and zero upgrade entry points (verified with 7 WASM exports). Persistent receipts are refreshed with `extend_ttl(100k, 500k)` to maintain on-chain audit trails.
 
 ---
 

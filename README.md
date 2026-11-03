@@ -170,7 +170,7 @@ cargo build --target wasm32v1-none --release
 
 ## 🧪 Testing & Empirical Verification
 
-### 1. Monorepo Test Suite (42 unit & simulation tests + 5 live on-chain = 47 total tests)
+### 1. Monorepo Test Suite (45 unit & simulation tests + 5 live on-chain = 50 total tests)
 Run all unit and integration tests across both Rust contracts and TypeScript packages:
 
 ```bash
@@ -179,8 +179,8 @@ cargo test --manifest-path packages/contracts/Cargo.toml
 ```
 
 - `@stellar-x402/contracts`: **8 unit tests** (amount > 0 validation, payer auth requirement, insufficient balance rejection, receipt not found handling, happy-path settlement, contract anti-replay panic, multi-challenge isolation, adversarial griefing slot-burning attempt prevention).
-- `@stellar-x402/gateway`: **18 unit tests** (SQLite WAL ACID persistence, atomic rollback on duplicate hash, exact 7-decimal stroop bounds, anti-replay, envelope parameter binding, pinned vault enforcement, envelope contract whitelisting, smart contract account rejection, deterministic clock rate limiting, anti-spoofing proxy handling, domain-separated requester signature validation).
-- `@stellar-x402/client`: **14 unit tests** (x402 header & JSON parser, concurrency-safe budget reservations, in-flight reservation timeout quarantine with +15s clock skew safety, budget ceilings, autonomous key signing with domain separation).
+- `@stellar-x402/gateway`: **21 unit tests** (SQLite WAL ACID persistence, atomic rollback on duplicate hash, exact 7-decimal stroop bounds, anti-replay, envelope parameter binding, FeeBump envelope handling, FAILED tx status rejection, pinned vault enforcement, envelope contract whitelisting, smart contract account rejection, deterministic clock rate limiting, anti-spoofing proxy handling, cheap-to-expensive route substitution defense, domain-separated requester signature validation).
+- `@stellar-x402/client`: **14 unit tests** (x402 header & JSON parser, concurrency-safe budget reservations, in-flight reservation timeout quarantine with normalized epoch seconds and +15s clock skew safety, budget ceilings, autonomous key signing with domain separation).
 - `@stellar-x402/cli`: **1 test** (CLI smoke & command validation).
 - `examples/mcp-payment-demo`: **1 test** (Full autonomous agent negotiation simulation).
 
