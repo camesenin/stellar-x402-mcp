@@ -26,11 +26,11 @@ jobs:
 
       - name: Run Soroban Tests
         working-directory: packages/contracts
-        run: cargo test
+        run: cargo test --locked
 
       - name: Compile Soroban Wasm Target
         working-directory: packages/contracts
-        run: cargo build --target wasm32v1-none --release
+        run: cargo build --target wasm32v1-none --release --locked
 
   test-typescript:
     name: TypeScript Monorepo Build & Tests
