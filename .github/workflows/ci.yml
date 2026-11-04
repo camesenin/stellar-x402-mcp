@@ -79,15 +79,24 @@ jobs:
           PGUSER: testuser
           PGPASSWORD: testpassword
         run: |
-          # 1. Setup realistic legacy test fixtures with real data:
-          # - legacy column 'challenge_id' (before rename to id)
+          # 1. Clean Database Migration Test (Brand new deployment)
+          psql -X -v ON_ERROR_STOP=1 -f packages/gateway/migrations/001_initial.sql
+          # Drop table to prepare realistic legacy migration suite
+          psql -X -v ON_ERROR_STOP=1 -c "DROP TABLE IF EXISTS redeemed_transactions CASCADE; DROP TABLE IF EXISTS challenges CASCADE;"
+
+          # 2. Setup realistic legacy test fixtures with real multi-row data:
+          # - Legacy column 'challenge_id' (before rename to id)
           # - BIGINT epoch milliseconds for created_at and expires_at
-          # - missing 'resource' column
-          # - text amount (e.g. '0.05')
-          # - duplicate index to purge
-          # - protected partial index, protected text_pattern_ops index
-          # - protected standalone NULLS NOT DISTINCT index
-          # - protected unique CONSTRAINT NULLS NOT DISTINCT (exercising Case B)
+          # - Missing 'resource' column
+          # - Text amount (e.g. '0.05')
+          # - Row 1: Valid pending challenge with txHash
+          # - Row 2: Incomplete redeemed challenge (missing txHash -> isolated as RECONCILIATION_REQUIRED)
+          # - Row 3: Pending challenge without bound_tx_hash (hash IS NULL)
+          # - Row 4: Multiple pending challenges with hash IS NULL
+          # - Duplicate index to purge
+          # - Protected partial index, protected text_pattern_ops index
+          # - Protected standalone NULLS NOT DISTINCT index
+          # - Protected unique CONSTRAINT with NULLS NOT DISTINCT (valid PG16 syntax: UNIQUE NULLS NOT DISTINCT (col))
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
             CREATE TABLE challenges (
               challenge_id TEXT PRIMARY KEY,
@@ -103,7 +112,7 @@ jobs:
               is_redeemed INTEGER NOT NULL DEFAULT 0
             );
 
-            -- Insert representative legacy seed data to verify data preservation
+            -- Row 1: Valid legacy challenge
             INSERT INTO challenges (
               challenge_id, destination, amount, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
             ) VALUES (
@@ -120,6 +129,23 @@ jobs:
               0
             );
 
+            -- Row 2: Incomplete redeemed record to verify safe isolation without failing chk_redeemed_consistency
+            INSERT INTO challenges (
+              challenge_id, destination, amount, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_2',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              '0.10',
+              'XLM',
+              'memo_seed_2',
+              'testnet',
+              'PENDING',
+              1793815821820,
+              1793815521820,
+              NULL,
+              1
+            );
+
             -- 1. Index to be purged by Case D (standard duplicate btree text_ops on bound_tx_hash)
             CREATE INDEX idx_legacy_duplicate_bound ON challenges USING btree (bound_tx_hash);
 
@@ -132,51 +158,65 @@ jobs:
             -- 4. Protected standalone NULLS NOT DISTINCT index (MUST be preserved)
             CREATE UNIQUE INDEX idx_legacy_nulls_not_distinct ON challenges USING btree (bound_tx_hash) NULLS NOT DISTINCT;
 
-            -- 5. Protected unique CONSTRAINT with NULLS NOT DISTINCT (MUST be preserved by Case B)
-            ALTER TABLE challenges ADD CONSTRAINT uq_legacy_nulls_not_distinct UNIQUE (bound_tx_hash) NULLS NOT DISTINCT;
+            -- 5. Protected unique CONSTRAINT with NULLS NOT DISTINCT (valid PostgreSQL 16 syntax: UNIQUE NULLS NOT DISTINCT (col))
+            ALTER TABLE challenges ADD CONSTRAINT uq_legacy_nulls_not_distinct UNIQUE NULLS NOT DISTINCT (bound_tx_hash);
           EOF
 
-          # 2. First migration run
+          # 3. First evolutionary migration run
           psql -X -v ON_ERROR_STOP=1 -f packages/gateway/migrations/001_initial.sql
 
-          # 3. Comprehensive Schema & Data Integrity Assertions
+          # 4. Comprehensive Schema & Data Integrity Assertions
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
             DO $$
             DECLARE
-              rec RECORD;
+              rec1 RECORD;
+              rec2 RECORD;
             BEGIN
               -- A. Table & column evolution checks
               IF NOT EXISTS (
                 SELECT 1 FROM information_schema.columns 
-                WHERE table_name = 'challenges' AND column_name = 'id'
+                WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'id'
               ) THEN
                 RAISE EXCEPTION 'Assertion failed: challenge_id was not migrated to id';
               END IF;
 
+              IF EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'challenge_id'
+              ) THEN
+                RAISE EXCEPTION 'Assertion failed: legacy challenge_id column still exists';
+              END IF;
+
               IF NOT EXISTS (
                 SELECT 1 FROM information_schema.columns 
-                WHERE table_name = 'challenges' AND column_name = 'resource'
+                WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'resource'
               ) THEN
                 RAISE EXCEPTION 'Assertion failed: resource column missing';
               END IF;
 
               -- B. Data preservation & conversion check
-              SELECT * INTO rec FROM challenges WHERE id = 'ch_legacy_seed_1';
-              IF rec.id IS NULL THEN
+              SELECT * INTO rec1 FROM challenges WHERE id = 'ch_legacy_seed_1';
+              IF rec1.id IS NULL THEN
                 RAISE EXCEPTION 'Assertion failed: legacy seed data was lost';
               END IF;
-              IF rec.amount_stroops != 500000 THEN
-                RAISE EXCEPTION 'Assertion failed: amount 0.05 XLM not converted to 500,000 stroops (got %)', rec.amount_stroops;
+              IF rec1.amount_stroops IS DISTINCT FROM 500000 THEN
+                RAISE EXCEPTION 'Assertion failed: amount 0.05 XLM not converted to 500,000 stroops (got %)', rec1.amount_stroops;
               END IF;
-              IF rec.resource IS NULL OR rec.created_at IS NULL OR rec.expires_at IS NULL THEN
+              IF rec1.resource IS NULL OR rec1.created_at IS NULL OR rec1.expires_at IS NULL THEN
                 RAISE EXCEPTION 'Assertion failed: timestamps or resource not populated';
               END IF;
 
-              -- C. Purge & Preservation Assertions
+              -- C. Safe isolation check for incomplete redeemed challenge
+              SELECT * INTO rec2 FROM challenges WHERE id = 'ch_legacy_seed_2';
+              IF rec2.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
+                RAISE EXCEPTION 'Assertion failed: incomplete redeemed row not safely isolated into RECONCILIATION_REQUIRED (got %)', rec2.status;
+              END IF;
+
+              -- D. Purge & Preservation Assertions
               -- 1. idx_legacy_duplicate_bound MUST be purged
               IF EXISTS (
                 SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relname = 'idx_legacy_duplicate_bound' AND n.nspname = 'public'
+                WHERE c.relname = 'idx_legacy_duplicate_bound' AND n.nspname = current_schema()
               ) THEN
                 RAISE EXCEPTION 'Assertion failed: idx_legacy_duplicate_bound was not purged by Case D';
               END IF;
@@ -184,7 +224,7 @@ jobs:
               -- 2. idx_legacy_partial_bound MUST be preserved
               IF NOT EXISTS (
                 SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relname = 'idx_legacy_partial_bound' AND n.nspname = 'public'
+                WHERE c.relname = 'idx_legacy_partial_bound' AND n.nspname = current_schema()
               ) THEN
                 RAISE EXCEPTION 'Assertion failed: idx_legacy_partial_bound was unexpectedly dropped';
               END IF;
@@ -192,7 +232,7 @@ jobs:
               -- 3. idx_legacy_pattern_bound MUST be preserved
               IF NOT EXISTS (
                 SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relname = 'idx_legacy_pattern_bound' AND n.nspname = 'public'
+                WHERE c.relname = 'idx_legacy_pattern_bound' AND n.nspname = current_schema()
               ) THEN
                 RAISE EXCEPTION 'Assertion failed: idx_legacy_pattern_bound was unexpectedly dropped';
               END IF;
@@ -200,7 +240,7 @@ jobs:
               -- 4. idx_legacy_nulls_not_distinct MUST be preserved
               IF NOT EXISTS (
                 SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relname = 'idx_legacy_nulls_not_distinct' AND n.nspname = 'public'
+                WHERE c.relname = 'idx_legacy_nulls_not_distinct' AND n.nspname = current_schema()
               ) THEN
                 RAISE EXCEPTION 'Assertion failed: idx_legacy_nulls_not_distinct was unexpectedly dropped';
               END IF;
@@ -224,13 +264,19 @@ jobs:
             $$;
           EOF
 
-          # 4. Second migration run (Strict Idempotency Verification)
+          # 5. Second migration run (Strict Idempotency Verification)
           psql -X -v ON_ERROR_STOP=1 -f packages/gateway/migrations/001_initial.sql
 
-          # 5. Repeat Catalog & Invariant Assertions After 2nd Run
+          # 6. Repeat All Assertions After 2nd Run
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
             DO $$
+            DECLARE
+              rec1 RECORD;
             BEGIN
+              SELECT * INTO rec1 FROM challenges WHERE id = 'ch_legacy_seed_1';
+              IF rec1.id IS NULL OR rec1.amount_stroops IS DISTINCT FROM 500000 THEN
+                RAISE EXCEPTION 'Assertion failed: data degraded after 2nd run';
+              END IF;
               IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_challenges_bound_tx_hash' AND convalidated = true) THEN
                 RAISE EXCEPTION 'Assertion failed: idempotency broken, uq_challenges_bound_tx_hash missing after 2nd run';
               END IF;

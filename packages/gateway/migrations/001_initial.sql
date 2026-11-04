@@ -39,24 +39,27 @@ CREATE TABLE IF NOT EXISTS challenges (
 
 -- Evolutionary schema migration support for existing deployments
 -- 1. Identifier alignment: rename legacy 'challenge_id' to canonical 'id' if table used legacy PK name
-DO $
+DO $EVOLVE_ID$
 BEGIN
   IF EXISTS (
     SELECT 1 FROM information_schema.columns 
-    WHERE table_name = 'challenges' AND column_name = 'challenge_id'
+    WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'challenge_id'
   ) AND NOT EXISTS (
     SELECT 1 FROM information_schema.columns 
-    WHERE table_name = 'challenges' AND column_name = 'id'
+    WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'id'
   ) THEN
     ALTER TABLE challenges RENAME COLUMN challenge_id TO id;
   END IF;
 END;
-$;
+$EVOLVE_ID$;
 
 -- 2. Add any missing columns before enforcing constraints
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS id TEXT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS resource TEXT DEFAULT 'mcp://tools/unknown';
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS amount_stroops NUMERIC(40, 0);
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS contract_id TEXT;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS token_address TEXT;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS beneficiary TEXT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING';
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS bound_tx_hash TEXT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS paid_amount_stroops NUMERIC(40, 0);
@@ -72,37 +75,49 @@ ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_expires_at TIMES
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_generation BIGINT DEFAULT 0;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS version BIGINT DEFAULT 1;
 
--- 3. Populate amount_stroops from legacy amount if present
-DO $
+-- 3. Populate amount_stroops and reconcile legacy statuses
+DO $EVOLVE_DATA$
 BEGIN
+  -- Populate amount_stroops with exact scale without 64-bit intermediate clamp
   IF EXISTS (
     SELECT 1 FROM information_schema.columns 
-    WHERE table_name = 'challenges' AND column_name = 'amount'
+    WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'amount'
   ) THEN
     UPDATE challenges 
-    SET amount_stroops = (amount::NUMERIC * 10000000)::BIGINT 
-    WHERE amount_stroops IS NULL AND amount IS NOT NULL;
+    SET amount_stroops = ROUND(amount::NUMERIC * 10000000)::NUMERIC(40, 0)
+    WHERE amount_stroops IS NULL AND amount IS NOT NULL AND amount ~ '^[0-9]+(\.[0-9]+)?$';
   END IF;
 
-  -- Sync legacy is_redeemed boolean/int to status
+  -- Sync legacy is_redeemed boolean/int to status:
+  -- If full redemption cryptographic proof exists, transition to 'REDEEMED'
+  -- If redemption evidence is incomplete (missing hash, paid amount or timestamp), transition to 'RECONCILIATION_REQUIRED'
+  -- to isolate historical records without violating chk_redeemed_consistency!
   IF EXISTS (
     SELECT 1 FROM information_schema.columns 
-    WHERE table_name = 'challenges' AND column_name = 'is_redeemed'
+    WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'is_redeemed'
   ) THEN
     UPDATE challenges 
     SET status = 'REDEEMED' 
-    WHERE (status IS NULL OR status = 'PENDING') AND (is_redeemed::TEXT = '1' OR is_redeemed::TEXT = 'true');
+    WHERE (status IS NULL OR status = 'PENDING') 
+      AND (is_redeemed::TEXT = '1' OR is_redeemed::TEXT = 'true')
+      AND bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND redeemed_at IS NOT NULL;
+
+    UPDATE challenges 
+    SET status = 'RECONCILIATION_REQUIRED' 
+    WHERE (status IS NULL OR status = 'PENDING') 
+      AND (is_redeemed::TEXT = '1' OR is_redeemed::TEXT = 'true')
+      AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR redeemed_at IS NULL);
   END IF;
 END;
-$;
+$EVOLVE_DATA$;
 
 -- 4. Temporal conversions: convert legacy BIGINT millisecond/second timestamps to TIMESTAMPTZ
-DO $
+DO $EVOLVE_TIMESTAMPS$
 BEGIN
   -- created_at conversion
   IF EXISTS (
     SELECT 1 FROM information_schema.columns 
-    WHERE table_name = 'challenges' AND column_name = 'created_at' AND data_type LIKE '%int%'
+    WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'created_at' AND data_type LIKE '%int%'
   ) THEN
     ALTER TABLE challenges ALTER COLUMN created_at TYPE TIMESTAMPTZ USING 
       CASE 
@@ -114,7 +129,7 @@ BEGIN
   -- expires_at conversion
   IF EXISTS (
     SELECT 1 FROM information_schema.columns 
-    WHERE table_name = 'challenges' AND column_name = 'expires_at' AND data_type LIKE '%int%'
+    WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'expires_at' AND data_type LIKE '%int%'
   ) THEN
     ALTER TABLE challenges ALTER COLUMN expires_at TYPE TIMESTAMPTZ USING 
       CASE 
@@ -126,7 +141,7 @@ BEGIN
   -- redeemed_at conversion
   IF EXISTS (
     SELECT 1 FROM information_schema.columns 
-    WHERE table_name = 'challenges' AND column_name = 'redeemed_at' AND data_type LIKE '%int%'
+    WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'redeemed_at' AND data_type LIKE '%int%'
   ) THEN
     ALTER TABLE challenges ALTER COLUMN redeemed_at TYPE TIMESTAMPTZ USING 
       CASE 
@@ -135,11 +150,13 @@ BEGIN
       END;
   END IF;
 END;
-$;
+$EVOLVE_TIMESTAMPS$;
 
 -- 5. Set defaults and nullability on canonical columns
 UPDATE challenges SET resource = 'mcp://tools/default' WHERE resource IS NULL;
-UPDATE challenges SET amount_stroops = 100000 WHERE amount_stroops IS NULL;
+-- Reconcile or quarantine unmetered rows without fabricating currency
+UPDATE challenges SET status = 'INCONCLUSIVE_MANUAL_REVIEW' WHERE amount_stroops IS NULL;
+UPDATE challenges SET amount_stroops = 0 WHERE amount_stroops IS NULL;
 UPDATE challenges SET status = 'PENDING' WHERE status IS NULL;
 UPDATE challenges SET lease_generation = 0 WHERE lease_generation IS NULL;
 UPDATE challenges SET version = 1 WHERE version IS NULL;
