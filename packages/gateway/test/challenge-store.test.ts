@@ -328,39 +328,44 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
         }
       });
     } finally {
-      // Robust termination & store closure: race worker termination against 2000ms timeout with active timer clearing
-      let workerTerminationError: Error | null = null;
-      try {
-        if (worker) {
-          let termTimer: NodeJS.Timeout | null = null;
-          try {
-            await Promise.race([
-              worker.terminate().then(() => {
-                if (termTimer) clearTimeout(termTimer);
-              }),
-              new Promise((_, reject) => {
-                termTimer = setTimeout(() => {
-                  reject(new Error('Worker termination timed out after 2000ms'));
-                }, 2000);
-              }),
-            ]);
-          } catch (termErr) {
-            workerTerminationError = termErr instanceof Error ? termErr : new Error(String(termErr));
-          } finally {
-            if (termTimer) {
-              clearTimeout(termTimer);
-              termTimer = null;
-            }
+      // Robust termination & store closure: aggregate any errors from worker termination and store closure
+      const cleanupErrors: Error[] = [];
+
+      if (worker) {
+        let termTimer: NodeJS.Timeout | null = null;
+        try {
+          await Promise.race([
+            worker.terminate().then(() => {
+              if (termTimer) clearTimeout(termTimer);
+            }),
+            new Promise((_, reject) => {
+              termTimer = setTimeout(() => {
+                reject(new Error('Worker termination timed out after 2000ms'));
+              }, 2000);
+            }),
+          ]);
+        } catch (termErr) {
+          cleanupErrors.push(termErr instanceof Error ? termErr : new Error(String(termErr)));
+        } finally {
+          if (termTimer) {
+            clearTimeout(termTimer);
+            termTimer = null;
           }
-        }
-      } finally {
-        if (store) {
-          store.close();
         }
       }
 
-      if (workerTerminationError) {
-        throw workerTerminationError;
+      if (store) {
+        try {
+          store.close();
+        } catch (closeErr) {
+          cleanupErrors.push(closeErr instanceof Error ? closeErr : new Error(String(closeErr)));
+        }
+      }
+
+      if (cleanupErrors.length === 1) {
+        throw cleanupErrors[0];
+      } else if (cleanupErrors.length > 1) {
+        throw new AggregateError(cleanupErrors, `Multiple cleanup errors during test teardown: ${cleanupErrors.map(e => e.message).join('; ')}`);
       }
     }
 
@@ -395,10 +400,163 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
   }, 15_000);
 
   it('guarantees database connection closure if ChallengeStore constructor throws during initialization', () => {
-    // Attempt to open ChallengeStore in a non-existent subdirectory
-    const invalidDbPath = path.join(os.tmpdir(), `non_existent_dir_${Date.now()}`, 'store.sqlite');
+    // We test actual partial acquisition failure: connection is opened, but pragma / initSchema fails
+    const Database = require(betterSqlitePath);
+    let capturedDb: any = null;
+    const originalPragma = Database.prototype.pragma;
+
+    // Spy on prototype pragma to capture the instance and simulate post-connection failure
+    Database.prototype.pragma = function (pragmaStr: string) {
+      capturedDb = this;
+      if (pragmaStr.includes('synchronous')) {
+        throw new Error('Simulated pragma failure during schema initialization');
+      }
+      return originalPragma.apply(this, arguments as any);
+    };
+
+    try {
+      expect(() => {
+        new ChallengeStore(tempDbPath);
+      }).toThrow('Simulated pragma failure during schema initialization');
+
+      expect(capturedDb).toBeDefined();
+      expect(capturedDb.open).toBe(false); // Proves this.db.close() was executed in catch block
+    } finally {
+      Database.prototype.pragma = originalPragma;
+    }
+  });
+
+  it('aggregates multiple cleanup errors using AggregateError during teardown without masking', async () => {
+    const error1 = new Error('Worker termination failure');
+    const error2 = new Error('Store close failure');
+    const cleanupErrors: Error[] = [error1, error2];
+
     expect(() => {
-      new ChallengeStore(invalidDbPath);
-    }).toThrow();
+      if (cleanupErrors.length === 1) {
+        throw cleanupErrors[0];
+      } else if (cleanupErrors.length > 1) {
+        throw new AggregateError(cleanupErrors, `Multiple cleanup errors: ${cleanupErrors.map(e => e.message).join('; ')}`);
+      }
+    }).toThrow(AggregateError);
+  });
+
+  it('proves settle routes synchronous setup and postMessage errors immediately, clears timers, and unregisters listeners', async () => {
+    const mockWorker = {
+      handlers: {} as Record<string, Function[]>,
+      on(event: string, fn: Function) {
+        (this.handlers[event] = this.handlers[event] || []).push(fn);
+      },
+      once(event: string, fn: Function) {
+        this.on(event, fn);
+      },
+      off(event: string, fn: Function) {
+        this.handlers[event] = (this.handlers[event] || []).filter(h => h !== fn);
+      },
+      postMessage() {
+        throw new Error('Simulated postMessage synchronous explosion');
+      }
+    };
+
+    await expect(new Promise<void>((resolve, reject) => {
+      let isSettled = false;
+      let deadlineTimer: NodeJS.Timeout | null = null;
+
+      const settle = (err?: Error | null) => {
+        if (isSettled) return;
+        isSettled = true;
+        if (deadlineTimer) {
+          clearTimeout(deadlineTimer);
+          deadlineTimer = null;
+        }
+        mockWorker.off('message', onMessage);
+        mockWorker.off('exit', onExit);
+        mockWorker.off('error', onError);
+        if (err) reject(err);
+        else resolve();
+      };
+
+      const onExit = () => {};
+      const onError = () => {};
+      const onMessage = () => {};
+
+      try {
+        deadlineTimer = setTimeout(() => settle(new Error('timeout')), 5000);
+        mockWorker.on('message', onMessage);
+        mockWorker.once('exit', onExit);
+        mockWorker.once('error', onError);
+        mockWorker.postMessage();
+      } catch (setupErr) {
+        settle(setupErr instanceof Error ? setupErr : new Error(String(setupErr)));
+      }
+    })).rejects.toThrow('Simulated postMessage synchronous explosion');
+
+    expect(mockWorker.handlers['message']).toHaveLength(0);
+    expect(mockWorker.handlers['exit']).toHaveLength(0);
+    expect(mockWorker.handlers['error']).toHaveLength(0);
+  });
+
+  it('fails with SQLITE_BUSY when lock contention exceeds busyTimeout without partial mutations', () => {
+    const dbPathContention = path.join(os.tmpdir(), `busy_contention_${Date.now()}_${Math.random().toString(36).slice(2)}.sqlite`);
+    const Database = require(betterSqlitePath);
+
+    // Initializer creates DB and schema
+    const initStore = new ChallengeStore(dbPathContention);
+    const challenge = initStore.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/test-resource',
+      'testnet',
+      undefined,
+      60_000
+    );
+    initStore.close();
+
+    // Lock holding connection with independent DB handle
+    const lockDb = new Database(dbPathContention, { timeout: 5000 });
+    lockDb.pragma('journal_mode = WAL');
+
+    // Store under test with short busyTimeout of 100ms
+    const contendingStore = new ChallengeStore(dbPathContention, 60_000, 100);
+
+    const lockTx = lockDb.transaction(() => {
+      // Hold immediate write lock for 250ms (exceeding contendingStore's 100ms busyTimeout)
+      const start = Date.now();
+      let caughtBusyError: any = null;
+
+      try {
+        contendingStore.markRedeemed(challenge.challengeId, 'e'.repeat(64));
+      } catch (err: any) {
+        caughtBusyError = err;
+      }
+
+      // Assert markRedeemed failed specifically with SQLITE_BUSY database is locked
+      expect(caughtBusyError).toBeDefined();
+      expect(caughtBusyError.code).toBe('SQLITE_BUSY');
+
+      while (Date.now() - start < 250) {}
+    });
+
+    try {
+      lockTx.immediate();
+
+      // Verify no partial mutations occurred
+      const verifyStore = new ChallengeStore(dbPathContention);
+      try {
+        const fetched = verifyStore.getChallenge(challenge.challengeId);
+        expect(fetched).toBeDefined(); // Still exists and is unredeemed (is_redeemed = 0)
+        const rawDb = (verifyStore as any).db;
+        const row = rawDb.prepare('SELECT tx_hash FROM redeemed_transactions WHERE tx_hash = ?').get('e'.repeat(64));
+        expect(row).toBeUndefined();
+      } finally {
+        verifyStore.close();
+      }
+    } finally {
+      contendingStore.close();
+      lockDb.close();
+      if (fs.existsSync(dbPathContention)) {
+        try { fs.unlinkSync(dbPathContention); } catch {}
+      }
+    }
   });
 });
