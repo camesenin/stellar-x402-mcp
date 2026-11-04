@@ -261,9 +261,12 @@ CREATE TABLE IF NOT EXISTS migration_audit_log (
   sanitization_reason TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
--- Explicit schema evolution for brownfield deployments where migration_audit_log already existed without raw columns
+-- Explicit schema evolution for brownfield deployments where migration_audit_log already existed:
+-- Harmonize column types to NUMERIC(40,0) if pre-existing columns had narrower precision (e.g. NUMERIC(38,0))
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_amount_stroops NUMERIC(40, 0);
+ALTER TABLE IF EXISTS migration_audit_log ALTER COLUMN pre_amount_stroops TYPE NUMERIC(40, 0);
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_paid_amount_stroops NUMERIC(40, 0);
+ALTER TABLE IF EXISTS migration_audit_log ALTER COLUMN pre_paid_amount_stroops TYPE NUMERIC(40, 0);
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_amount_stroops_raw TEXT;
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_paid_amount_stroops_raw TEXT;
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_amount_text TEXT;
@@ -754,8 +757,12 @@ CREATE TABLE IF NOT EXISTS migration_audit_log (
   sanitization_reason TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
+-- Explicit schema evolution for brownfield deployments where migration_audit_log already existed:
+-- Harmonize column types to NUMERIC(40,0) if pre-existing columns had narrower precision (e.g. NUMERIC(38,0))
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_amount_stroops NUMERIC(40, 0);
+ALTER TABLE IF EXISTS migration_audit_log ALTER COLUMN pre_amount_stroops TYPE NUMERIC(40, 0);
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_paid_amount_stroops NUMERIC(40, 0);
+ALTER TABLE IF EXISTS migration_audit_log ALTER COLUMN pre_paid_amount_stroops TYPE NUMERIC(40, 0);
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_amount_stroops_raw TEXT;
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_paid_amount_stroops_raw TEXT;
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_amount_text TEXT;

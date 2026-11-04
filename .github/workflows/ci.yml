@@ -107,15 +107,15 @@ jobs:
           # - Protected partial unique index (WHERE (bound_tx_hash IS NOT NULL))
           # - Protected specialized text_pattern_ops index
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
-            -- Pre-existing brownfield migration_audit_log table lacking raw columns
-            -- Verifies ALTER TABLE schema evolution adds raw columns cleanly and preserves legacy audit entries!
+            -- Pre-existing brownfield migration_audit_log table with narrower precision NUMERIC(38,0) and lacking raw columns
+            -- Verifies ALTER TABLE schema evolution widens precision to NUMERIC(40,0), adds raw columns cleanly, and preserves legacy audit entries!
             CREATE TABLE migration_audit_log (
               id BIGSERIAL PRIMARY KEY,
               challenge_id TEXT NOT NULL,
               migration_step TEXT NOT NULL,
               pre_status TEXT,
-              pre_amount_stroops NUMERIC(40, 0),
-              pre_paid_amount_stroops NUMERIC(40, 0),
+              pre_amount_stroops NUMERIC(38, 0),
+              pre_paid_amount_stroops NUMERIC(38, 0),
               sanitization_reason TEXT NOT NULL,
               created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
             );
@@ -826,7 +826,7 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: INITIAL_PRE_MIGRATION_SNAPSHOT raw text values missing for ch_legacy_seed_15', step_name;
               END IF;
 
-              -- 1c. Verify pre-existing brownfield migration_audit_log record preserved and schema evolved
+              -- 1c. Verify pre-existing brownfield migration_audit_log record preserved and schema evolved (harmonized from NUMERIC(38,0) to NUMERIC(40,0))
               IF NOT EXISTS (
                 SELECT 1 FROM migration_audit_log
                 WHERE challenge_id = 'ch_pre_existing_legacy_audit'
@@ -834,6 +834,17 @@ jobs:
                   AND pre_amount_stroops = 1000
               ) THEN
                 RAISE EXCEPTION '[%] Assertion failed: pre-existing brownfield audit record lost during migration', step_name;
+              END IF;
+
+              -- Verify precision was widened to NUMERIC(40,0) in information_schema
+              IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'migration_audit_log' 
+                  AND column_name = 'pre_amount_stroops' 
+                  AND numeric_precision = 40 
+                  AND numeric_scale = 0
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: migration_audit_log pre_amount_stroops not widened to NUMERIC(40,0)', step_name;
               END IF;
 
               -- 1d. Verify ultra-wide 42-digit challenge Row 16: raw preservation in audit log, row existence, and final quarantine state
