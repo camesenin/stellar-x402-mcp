@@ -138,8 +138,12 @@ export class StellarPaymentVerifier {
       }
       return data?.result || null;
     } catch (err: any) {
-      if (err.name === 'AbortError' || /timeout|500|502|503|504|ECONNRESET/i.test(err.message)) {
-        throw new Error(`Soroban RPC getTransaction network timeout/transient failure: ${err.message}`);
+      const causeCode = (err?.cause as any)?.code || (err as any)?.code || '';
+      const combined = `${err.name} ${err.message} ${causeCode}`;
+      const isTransient = /AbortError|timeout|500|502|503|504|ECONNRESET|ECONNREFUSED|ENOTFOUND|fetch failed|transient/i.test(combined);
+
+      if (isTransient) {
+        throw new Error(`Soroban RPC getTransaction network timeout/transient failure: ${err.message} (code: ${causeCode})`);
       }
       return null;
     } finally {

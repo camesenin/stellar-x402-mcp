@@ -989,9 +989,6 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
 
       // Execute production verifyPayment and verifySorobanTransactionAndReceipt without mocking the method!
       const busyResult = await verifier.verifyPayment(cleanHash, challenge, store);
-      if (!busyResult.retriable) {
-        console.error('DEBUG busyResult:', JSON.stringify(busyResult, null, 2));
-      }
       expect(busyResult.valid).toBe(false);
       expect(busyResult.retriable).toBe(true);
       expect(busyResult.statusCode).toBe(503);
@@ -1065,6 +1062,45 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
       expect(graceResult.valid).toBe(true);
       expect(graceResult.payer).toBe(payerKp.publicKey());
       expect(store.isTxRedeemed(cleanHash)).toBe(true);
+    });
+
+    it('correctly classifies transient Soroban RPC failures (fetch failed, ECONNRESET, JSON-RPC -32603) as retriable 503 instead of false payment rejection', async () => {
+      const challenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/soroban-rpc-transient',
+        'testnet',
+        'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
+        60_000
+      );
+
+      // 1. Injected TypeError('fetch failed') with cause.code = 'ECONNRESET'
+      const connResetError = new TypeError('fetch failed');
+      (connResetError as any).cause = { code: 'ECONNRESET' };
+      vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(connResetError);
+
+      const connResetResult = await verifier.verifyPayment('tx_conn_reset', challenge, store);
+      expect(connResetResult.valid).toBe(false);
+      expect(connResetResult.retriable).toBe(true);
+      expect(connResetResult.statusCode).toBe(503);
+      expect(connResetResult.reason).toContain('Soroban RPC getTransaction network timeout/transient failure');
+
+      // 2. Injected JSON-RPC -32603 internal error response
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          error: { code: -32603, message: 'Internal error: node catching up' },
+        }),
+      } as any);
+
+      const rpcInternalResult = await verifier.verifyPayment('tx_rpc_internal', challenge, store);
+      expect(rpcInternalResult.valid).toBe(false);
+      expect(rpcInternalResult.retriable).toBe(true);
+      expect(rpcInternalResult.statusCode).toBe(503);
+      expect(rpcInternalResult.reason).toContain('Soroban JSON-RPC transient error (-32603)');
     });
   });
 });

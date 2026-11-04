@@ -209,8 +209,8 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
   });
 
   it('handles expired challenges correctly', async () => {
-    // Challenge with 10ms TTL
-    const store = new ChallengeStore(tempDbPath, 10);
+    // Challenge with 200ms TTL
+    const store = new ChallengeStore(tempDbPath, 200);
     const challenge = store.createChallenge(
       'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       '0.05',
@@ -218,14 +218,14 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
       '/test-resource',
       'testnet',
       undefined,
-      10
+      200
     );
 
     // Immediate check: still valid
     expect(store.getChallenge(challenge.challengeId)).toBeDefined();
 
     // Wait for TTL expiration
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 250));
 
     // After expiration: getChallenge returns undefined
     expect(store.getChallenge(challenge.challengeId)).toBeUndefined();
@@ -635,47 +635,59 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
     store.close();
   });
 
-  it('strictly validates grace boundary limits at expiresAt + 60_000ms vs expiresAt + 60_001ms and rejects NaN/excessive grace', () => {
+  it('strictly validates grace boundary limits at expiresAt + 60_000ms vs expiresAt + 60_001ms and rejects NaN/excessive grace with frozen fake timers', () => {
     const store = new ChallengeStore(tempDbPath, 60_000);
-    const now = Date.now();
-    const txHash = '1'.repeat(64);
+    const fixedNow = 1_700_000_000_000;
+    const realDateNow = Date.now;
 
-    // Challenge that expired 59,900ms ago (within 60s grace)
-    const cValidGrace = store.createChallenge(
-      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-      '0.05',
-      'XLM',
-      '/res-edge-1',
-      'testnet',
-      undefined,
-      -59_900
-    );
+    try {
+      // Freeze Date.now to exact millisecond precision
+      Date.now = () => fixedNow;
 
-    // Should succeed within 60_000ms grace
-    expect(() => {
-      store.markRedeemed(cValidGrace.challengeId, txHash, undefined, 60_000);
-    }).not.toThrow();
+      // 1. Exact boundary test: challenge created with expiresAt = fixedNow - 60_000ms
+      const cExactEdge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/res-edge-exact',
+        'testnet',
+        undefined,
+        -60_000 // expiresAt = fixedNow - 60_000
+      );
 
-    // Challenge that expired 60,100ms ago (past 60s grace)
-    const cExpiredPastGrace = store.createChallenge(
-      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-      '0.05',
-      'XLM',
-      '/res-edge-2',
-      'testnet',
-      undefined,
-      -60_100
-    );
+      // At exactly expiresAt + 60_000ms (fixedNow - 60_000 + 60_000 === fixedNow): redemption MUST succeed
+      expect(() => {
+        store.markRedeemed(cExactEdge.challengeId, '1'.repeat(64), undefined, 60_000);
+      }).not.toThrow();
 
-    // Even if caller requests 120,000ms grace or NaN, store caps at 60,000ms and rejects!
-    expect(() => {
-      store.markRedeemed(cExpiredPastGrace.challengeId, '2'.repeat(64), undefined, 120_000);
-    }).toThrow('expired');
+      // 2. Exact over-the-edge test: challenge created with expiresAt = fixedNow - 60_001ms
+      const cPastEdge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/res-edge-past',
+        'testnet',
+        undefined,
+        -60_001 // expiresAt = fixedNow - 60_001
+      );
 
-    expect(() => {
-      store.markRedeemed(cExpiredPastGrace.challengeId, '3'.repeat(64), undefined, NaN);
-    }).toThrow('expired');
+      // At expiresAt + 60_000ms < fixedNow (by 1ms): redemption MUST fail as expired
+      expect(() => {
+        store.markRedeemed(cPastEdge.challengeId, '2'.repeat(64), undefined, 60_000);
+      }).toThrow('expired');
 
-    store.close();
+      // 3. Reject NaN explicitly as invalid argument
+      expect(() => {
+        store.markRedeemed(cPastEdge.challengeId, '3'.repeat(64), undefined, NaN);
+      }).toThrow('NaN is not a valid grace period');
+
+      // 4. Excessive grace is strictly capped at 60_000 and still rejects past +60_001ms
+      expect(() => {
+        store.markRedeemed(cPastEdge.challengeId, '4'.repeat(64), undefined, 120_000);
+      }).toThrow('expired');
+    } finally {
+      Date.now = realDateNow;
+      store.close();
+    }
   });
 });

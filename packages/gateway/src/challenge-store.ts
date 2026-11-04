@@ -198,9 +198,13 @@ export class ChallengeStore {
     metadata?: { payer?: string; amount?: string; asset?: string; ledger?: number },
     allowGracePeriodMs: number = 0
   ): void {
+    if (typeof allowGracePeriodMs === 'number' && isNaN(allowGracePeriodMs)) {
+      throw new Error(`Invalid allowGracePeriodMs: NaN is not a valid grace period`);
+    }
+
     const cleanHash = txHash.toLowerCase();
     // Rigorous validation: parse and cap grace period at strict security boundary of 60_000ms
-    const numGrace = typeof allowGracePeriodMs === 'number' && !isNaN(allowGracePeriodMs) ? allowGracePeriodMs : 0;
+    const numGrace = typeof allowGracePeriodMs === 'number' ? allowGracePeriodMs : 0;
     const effectiveGraceMs = Math.min(Math.max(0, numGrace), 60_000);
 
     // Explicit IMMEDIATE transaction: acquires reserved write lock immediately preventing concurrent writers
