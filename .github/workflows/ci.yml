@@ -107,9 +107,9 @@ jobs:
           # - Protected partial unique index (WHERE (bound_tx_hash IS NOT NULL))
           # - Protected specialized text_pattern_ops index
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
-            -- Pre-existing brownfield migration_audit_log table: incomplete schema testing
-            -- Case A: Table exists with ONLY pre_amount_stroops NUMERIC(38,2) (pre_paid_amount_stroops column does NOT exist at all!)
-            -- Verifies that ALTER TABLE ADD COLUMN runs before UPDATE, preventing undefined_column error 42703!
+            -- Pre-existing brownfield migration_audit_log table: incomplete schema testing & coexistence of dual scenarios
+            -- Scenario 1: Pre-existing table initially exists with ONLY pre_amount_stroops NUMERIC(38,2) (pre_paid_amount_stroops column missing!)
+            -- Demonstrates that DDL ADD COLUMN runs before DML UPDATE, preventing undefined_column error 42703!
             CREATE TABLE migration_audit_log (
               id BIGSERIAL PRIMARY KEY,
               challenge_id TEXT NOT NULL,
@@ -122,7 +122,14 @@ jobs:
             INSERT INTO migration_audit_log (
               challenge_id, migration_step, pre_status, pre_amount_stroops, sanitization_reason
             ) VALUES (
-              'ch_pre_existing_legacy_audit', 'BROWNFIELD_PRE_MIGRATION', 'PENDING', 1000.75, 'PRE_EXISTING_BROWNFIELD_RECORD'
+              'ch_pre_existing_legacy_audit_1', 'BROWNFIELD_PRE_MIGRATION_1', 'PENDING', 1000.75, 'PRE_EXISTING_BROWNFIELD_RECORD_1'
+            );
+            -- Scenario 2: Brownfield evolution with pre_paid_amount_stroops added with scale before migration
+            ALTER TABLE migration_audit_log ADD COLUMN pre_paid_amount_stroops NUMERIC(38, 2);
+            INSERT INTO migration_audit_log (
+              challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, sanitization_reason
+            ) VALUES (
+              'ch_pre_existing_legacy_audit_2', 'BROWNFIELD_PRE_MIGRATION_2', 'REDEEMED', 2000.50, 500.25, 'PRE_EXISTING_BROWNFIELD_RECORD_2'
             );
 
             CREATE TABLE challenges (
@@ -142,8 +149,15 @@ jobs:
               is_redeemed INTEGER NOT NULL DEFAULT 0,
               CONSTRAINT chk_legacy_composite CHECK (status IN ('PENDING', 'REDEEMED', 'INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE')),
               -- Legacy monetary check constraint: exercises early drop of monetary checks before data conversion!
-              -- Without early drop, converting Row 15 amount='0.05' to amount_stroops=500000 while paid_amount_stroops=1 would fail this check!
-              CONSTRAINT chk_legacy_monetary_paid_ge_amount CHECK (paid_amount_stroops IS NULL OR amount_stroops = 0 OR paid_amount_stroops >= amount_stroops),
+              -- Evaluates whether paid >= amount or amount = 0, or legacy underpaid rows 10 & 12 which pre-existed in brownfield.
+              -- Tests that EARLY_STRUCTURAL_PURGE drops this constraint before EVOLVE_DATA,
+              -- allowing Row 15 (amount converted from '0.05' to 500,000 with paid=1) to evolve without transaction abort!
+              CONSTRAINT chk_legacy_monetary_paid_ge_amount CHECK (
+                paid_amount_stroops IS NULL 
+                OR amount_stroops = 0 
+                OR paid_amount_stroops >= amount_stroops
+                OR challenge_id IN ('ch_legacy_seed_10', 'ch_legacy_seed_12')
+              ),
               -- Incompatible composite UNIQUE constraint with NULLS NOT DISTINCT on (status, bound_tx_hash):
               -- Validly admits (PENDING, NULL) and (REDEEMED, NULL) during initial population!
               -- Tests that EARLY_STRUCTURAL_PURGE drops this incompatible constraint BEFORE EVOLVE_DATA,
@@ -826,16 +840,26 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: INITIAL_PRE_MIGRATION_SNAPSHOT raw text values missing for ch_legacy_seed_15', step_name;
               END IF;
 
-              -- 1c. Verify pre-existing brownfield migration_audit_log record preserved and schema evolved (harmonized from NUMERIC(38,2) to NUMERIC(40,0))
-              -- Asserts that raw columns captured exact fractional values BEFORE altering types, and missing pre_paid_amount_stroops was created cleanly
+              -- 1c. Verify pre-existing brownfield migration_audit_log records preserved and schema evolved (harmonized from NUMERIC(38,2) to NUMERIC(40,0))
+              -- Asserts that raw columns captured exact fractional values BEFORE altering types across both cases (record 1 with missing pre_paid, record 2 with both populated)
               IF NOT EXISTS (
                 SELECT 1 FROM migration_audit_log
-                WHERE challenge_id = 'ch_pre_existing_legacy_audit'
-                  AND migration_step = 'BROWNFIELD_PRE_MIGRATION'
+                WHERE challenge_id = 'ch_pre_existing_legacy_audit_1'
+                  AND migration_step = 'BROWNFIELD_PRE_MIGRATION_1'
                   AND pre_amount_stroops_raw = '1000.75'
                   AND pre_paid_amount_stroops_raw IS NULL
               ) THEN
-                RAISE EXCEPTION '[%] Assertion failed: pre-existing brownfield audit record raw values not preserved before type alteration', step_name;
+                RAISE EXCEPTION '[%] Assertion failed: pre-existing brownfield audit record 1 raw values not preserved before type alteration', step_name;
+              END IF;
+
+              IF NOT EXISTS (
+                SELECT 1 FROM migration_audit_log
+                WHERE challenge_id = 'ch_pre_existing_legacy_audit_2'
+                  AND migration_step = 'BROWNFIELD_PRE_MIGRATION_2'
+                  AND pre_amount_stroops_raw = '2000.50'
+                  AND pre_paid_amount_stroops_raw = '500.25'
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: pre-existing brownfield audit record 2 raw values not preserved before type alteration', step_name;
               END IF;
 
               -- Verify precision was widened to NUMERIC(40,0) for both pre_amount_stroops and pre_paid_amount_stroops in information_schema
