@@ -66,7 +66,7 @@ cargo test --manifest-path packages/contracts/Cargo.toml
 
 ## 3. Directed Acyclic Graph (DAG) of Dependencies
 
-The backlog features **11 standalone tasks** with zero prerequisites, and **5 dependent tasks** with direct technical requirements:
+The backlog features **10 standalone tasks** with zero prerequisites, and **6 dependent tasks** with direct technical requirements:
 
 ```
 [Issue 1: CLI Format (100)] -------- (Standalone, 0 deps)
@@ -77,7 +77,7 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 [Issue 5: Settle Tests (150)] ------ (Standalone, 0 deps) --------> [Issue 12: Beneficiary C.. (200)]
 [Issue 7: Nanoid/CorrId (100)] ----- (Standalone, 0 deps)
 [Issue 9: LangGraph Ex (150)] ------ (Standalone, 0 deps)
-[Issue 10: Standalone CI (150)] ---- (Standalone, 0 deps)
+[Issue 8: SAC Resolution (200)] ----> [Issue 10: Standalone CI (150)]
 [Issue 11: Rate Limiter (150)] ----- (Standalone, 0 deps)
 [Issue 15: Prometheus (150)] ------- (Standalone, 0 deps)
 [Issue 16: Fast-Check Fuzz (100)] -- (Standalone, 0 deps)
