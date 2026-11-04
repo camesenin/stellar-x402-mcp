@@ -329,8 +329,9 @@ export class BudgetManager {
       // If contract receipt was queried and does NOT exist, and current ledger time > maxTime,
       // the payment is definitively unexecuted regardless of RPC transaction history pruning!
       if (onChainReceiptExists === false) {
-        if (latestLedgerCloseTime !== undefined && latestLedgerCloseTime <= maxTimeSec) {
-          return; // Network has not yet closed maxTime ledger; still pending
+        // Fail-closed: Must strictly prove latestLedgerCloseTime > maxTimeSec. If latestLedgerCloseTime is undefined, maintain quarantine!
+        if (latestLedgerCloseTime === undefined || latestLedgerCloseTime <= maxTimeSec) {
+          return; // Network has not verified ledger advancement past maxTime; maintain quarantine
         }
         // Receipt absent and ledger passed maxTime -> definitively never landed, safe to free!
       } else {
