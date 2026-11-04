@@ -107,6 +107,24 @@ jobs:
           # - Protected partial unique index (WHERE (bound_tx_hash IS NOT NULL))
           # - Protected specialized text_pattern_ops index
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
+            -- Pre-existing brownfield migration_audit_log table lacking raw columns
+            -- Verifies ALTER TABLE schema evolution adds raw columns cleanly and preserves legacy audit entries!
+            CREATE TABLE migration_audit_log (
+              id BIGSERIAL PRIMARY KEY,
+              challenge_id TEXT NOT NULL,
+              migration_step TEXT NOT NULL,
+              pre_status TEXT,
+              pre_amount_stroops NUMERIC(40, 0),
+              pre_paid_amount_stroops NUMERIC(40, 0),
+              sanitization_reason TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+            );
+            INSERT INTO migration_audit_log (
+              challenge_id, migration_step, pre_status, pre_amount_stroops, sanitization_reason
+            ) VALUES (
+              'ch_pre_existing_legacy_audit', 'BROWNFIELD_PRE_MIGRATION', 'PENDING', 1000, 'PRE_EXISTING_BROWNFIELD_RECORD'
+            );
+
             CREATE TABLE challenges (
               challenge_id TEXT PRIMARY KEY,
               destination TEXT NOT NULL,
@@ -426,6 +444,26 @@ jobs:
               1
             );
 
+            -- Row 16: ULTRA-WIDE NUMERIC / FRACTIONAL TEST: amount_stroops is a 42-digit integer exceeding NUMERIC(40,0)
+            -- Verifies that raw string capturing succeeds unconditionally without numeric overflow abort,
+            -- and safe numeric cast produces NULL in numeric column while preserving exact 42-digit raw text!
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_16',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              '100000000000000000000000000000000000000000',
+              0,
+              'XLM',
+              'memo_seed_16',
+              'testnet',
+              'PENDING',
+              1793815821820,
+              1793815521820,
+              'tx_ultra_wide_hash_16',
+              0
+            );
+
             -- 1. Duplicate btree index on bound_tx_hash to be purged
             CREATE INDEX idx_legacy_duplicate_bound ON challenges USING btree (bound_tx_hash);
 
@@ -651,10 +689,10 @@ jobs:
               END IF;
 
               -- H7. Forensic Audit Log Verification: assert exact per-challenge evidence preservation
-              -- 1. Individual snapshot verification: verify EXACTLY one snapshot exists for every challenge seed (1 through 15)
+              -- 1. Individual snapshot verification: verify EXACTLY one snapshot exists for every challenge seed (1 through 16)
               FOR r IN (
                 SELECT 'ch_legacy_seed_' || s::text AS ch_id
-                FROM generate_series(1, 15) s
+                FROM generate_series(1, 16) s
               ) LOOP
                 SELECT count(*) INTO v_audit_count 
                 FROM migration_audit_log 
@@ -674,6 +712,27 @@ jobs:
                   AND pre_paid_amount_stroops_raw = '1'
               ) THEN
                 RAISE EXCEPTION '[%] Assertion failed: INITIAL_PRE_MIGRATION_SNAPSHOT raw text values missing for ch_legacy_seed_15', step_name;
+              END IF;
+
+              -- 1c. Verify pre-existing brownfield migration_audit_log record preserved and schema evolved
+              IF NOT EXISTS (
+                SELECT 1 FROM migration_audit_log
+                WHERE challenge_id = 'ch_pre_existing_legacy_audit'
+                  AND migration_step = 'BROWNFIELD_PRE_MIGRATION'
+                  AND pre_amount_stroops = 1000
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: pre-existing brownfield audit record lost during migration', step_name;
+              END IF;
+
+              -- 1d. Verify ultra-wide 42-digit challenge Row 16 raw preservation in snapshot without numeric overflow
+              IF NOT EXISTS (
+                SELECT 1 FROM migration_audit_log 
+                WHERE challenge_id = 'ch_legacy_seed_16' 
+                  AND migration_step = 'INITIAL_PRE_MIGRATION_SNAPSHOT'
+                  AND pre_amount_text = '100000000000000000000000000000000000000000'
+                  AND pre_amount_stroops_raw = '0'
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: INITIAL_PRE_MIGRATION_SNAPSHOT raw text values missing for ch_legacy_seed_16', step_name;
               END IF;
 
               -- 2. Exact evidence for underpaid operational row (ch_legacy_seed_10)
