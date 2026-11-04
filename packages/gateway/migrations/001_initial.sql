@@ -222,7 +222,7 @@ ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS version BIGINT DEFAULT
 -- 3. Populate amount_stroops and reconcile legacy statuses
 DO $EVOLVE_DATA$
 BEGIN
-  -- Populate amount_stroops with exact scale and safe short-circuit evaluation:
+  -- A. Populate amount_stroops with exact scale and safe short-circuit evaluation:
   -- Validates string structure, integer magnitude (<= 30 digits before decimal), and positive value
   -- before any cast to NUMERIC to guarantee that corrupt or out-of-range strings never cause transaction aborts.
   IF EXISTS (
@@ -248,14 +248,28 @@ BEGIN
       );
   END IF;
 
-  -- Sanitize paid_amount_stroops across all rows:
+  -- B. Sanitize paid_amount_stroops across all rows:
   -- If paid_amount_stroops is NaN, non-positive, or corrupt, normalize it to NULL.
   UPDATE challenges
   SET paid_amount_stroops = NULL
   WHERE paid_amount_stroops IS NOT NULL 
     AND (paid_amount_stroops = 'NaN'::numeric OR paid_amount_stroops <= 0);
 
-  -- Normalize unmetered, non-positive, or NaN legacy amounts:
+  -- C. Handle legacy amounts exceeding i128::MAX (170141183460469231731687303715884105727):
+  -- 1. If paid_amount_stroops > i128::MAX, normalize to NULL and transition to RECONCILIATION_REQUIRED
+  UPDATE challenges
+  SET paid_amount_stroops = NULL, status = 'RECONCILIATION_REQUIRED'
+  WHERE paid_amount_stroops IS NOT NULL 
+    AND paid_amount_stroops > 170141183460469231731687303715884105727;
+
+  -- 2. If amount_stroops > i128::MAX, safely isolate into INCONCLUSIVE_MANUAL_REVIEW with amount_stroops = NULL
+  -- preserving evidence without aborting migration or violating chk_challenge_z_i128_max!
+  UPDATE challenges
+  SET status = 'INCONCLUSIVE_MANUAL_REVIEW', amount_stroops = NULL
+  WHERE amount_stroops IS NOT NULL 
+    AND amount_stroops > 170141183460469231731687303715884105727;
+
+  -- D. Normalize unmetered, non-positive, or NaN legacy amounts:
   -- In canonical schema, amount_stroops must be NULL for quarantined rows (INCONCLUSIVE_MANUAL_REVIEW or PERMANENT_QUARANTINE),
   -- and strictly > 0 and != 'NaN' for operational rows.
   -- 1. Rows already in ANY quarantine state (INCONCLUSIVE_MANUAL_REVIEW or PERMANENT_QUARANTINE):
@@ -277,7 +291,18 @@ BEGIN
   SET status = 'INCONCLUSIVE_MANUAL_REVIEW'
   WHERE amount_stroops IS NULL AND (status IS NULL OR status NOT IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'));
 
-  -- Sync legacy is_redeemed boolean/int to status:
+  -- E. Handle legacy underpaid rows (paid_amount_stroops < amount_stroops):
+  -- In canonical schema, chk_challenge_paid_amount requires paid_amount_stroops >= amount_stroops.
+  -- If a legacy row has a positive payment that is less than requested amount:
+  -- Transition row to 'RECONCILIATION_REQUIRED' and normalize paid_amount_stroops to NULL
+  -- so the underpayment is audited rather than aborting migration!
+  UPDATE challenges
+  SET status = 'RECONCILIATION_REQUIRED', paid_amount_stroops = NULL
+  WHERE amount_stroops IS NOT NULL 
+    AND paid_amount_stroops IS NOT NULL 
+    AND paid_amount_stroops < amount_stroops;
+
+  -- F. Sync legacy is_redeemed boolean/int to status:
   IF EXISTS (
     SELECT 1 FROM information_schema.columns 
     WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'is_redeemed'
@@ -286,20 +311,21 @@ BEGIN
     SET status = 'REDEEMED' 
     WHERE (status IS NULL OR status = 'PENDING') 
       AND (is_redeemed::TEXT = '1' OR is_redeemed::TEXT = 'true')
-      AND bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND paid_amount_stroops != 'NaN'::numeric AND redeemed_at IS NOT NULL;
+      AND bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND paid_amount_stroops != 'NaN'::numeric 
+      AND paid_amount_stroops >= amount_stroops AND redeemed_at IS NOT NULL;
 
     UPDATE challenges 
-    SET status = 'RECONCILIATION_REQUIRED' 
+    SET status = 'RECONCILIATION_REQUIRED', paid_amount_stroops = CASE WHEN paid_amount_stroops < amount_stroops THEN NULL ELSE paid_amount_stroops END
     WHERE (status IS NULL OR status = 'PENDING') 
       AND (is_redeemed::TEXT = '1' OR is_redeemed::TEXT = 'true')
-      AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR paid_amount_stroops = 'NaN'::numeric OR redeemed_at IS NULL);
+      AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR paid_amount_stroops = 'NaN'::numeric OR paid_amount_stroops < amount_stroops OR redeemed_at IS NULL);
   END IF;
 
-  -- Reconcile any existing rows that were ALREADY marked 'REDEEMED' but lack proof or had NaN paid_amount:
+  -- G. Reconcile any existing rows that were ALREADY marked 'REDEEMED' but lack proof, had NaN paid_amount, or were underpaid:
   UPDATE challenges
-  SET status = 'RECONCILIATION_REQUIRED'
+  SET status = 'RECONCILIATION_REQUIRED', paid_amount_stroops = CASE WHEN amount_stroops IS NOT NULL AND paid_amount_stroops < amount_stroops THEN NULL ELSE paid_amount_stroops END
   WHERE status = 'REDEEMED'
-    AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR paid_amount_stroops = 'NaN'::numeric OR redeemed_at IS NULL);
+    AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR paid_amount_stroops = 'NaN'::numeric OR (amount_stroops IS NOT NULL AND paid_amount_stroops < amount_stroops) OR redeemed_at IS NULL);
 END;
 $EVOLVE_DATA$;
 

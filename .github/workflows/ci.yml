@@ -298,6 +298,46 @@ jobs:
               1
             );
 
+            -- Row 10: UNDERPAID ROW TEST: amount_stroops = 100, paid_amount_stroops = 50 (valid positive numbers in NUMERIC(40,0))
+            -- Underpayment must be quarantined to RECONCILIATION_REQUIRED with paid_amount normalized to NULL rather than aborting chk_challenge_paid_amount!
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, paid_amount_stroops, redeemed_at, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_10',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              '0.0000100',
+              100,
+              'XLM',
+              'memo_seed_10',
+              'testnet',
+              'REDEEMED',
+              1793815821820,
+              1793815521820,
+              'tx_underpaid_hash_10',
+              50,
+              1793815621820,
+              1
+            );
+
+            -- Row 11: I128 OVERFLOW TEST: amount_stroops = 170141183460469231731687303715884105728 (i128::MAX + 1)
+            -- Valid NUMERIC(40,0) representation that exceeds Soroban boundary -> must isolate to INCONCLUSIVE_MANUAL_REVIEW with amount_stroops=NULL!
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_11',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              NULL,
+              170141183460469231731687303715884105728,
+              'XLM',
+              'memo_seed_11',
+              'testnet',
+              'PENDING',
+              1793815821820,
+              1793815521820,
+              'tx_overflow_i128_hash_11',
+              0
+            );
+
             -- 1. Duplicate btree index on bound_tx_hash to be purged
             CREATE INDEX idx_legacy_duplicate_bound ON challenges USING btree (bound_tx_hash);
 
@@ -343,6 +383,8 @@ jobs:
               rec7 RECORD;
               rec8 RECORD;
               rec9 RECORD;
+              rec10 RECORD;
+              rec11 RECORD;
               v_is_nullable TEXT;
               v_indnullsnotdistinct BOOLEAN;
               v_pred TEXT;
@@ -451,6 +493,27 @@ jobs:
               END IF;
               IF rec9.paid_amount_stroops IS NOT NULL THEN
                 RAISE EXCEPTION '[%] Assertion failed: NaN paid_amount was not sanitized to NULL (got %)', step_name, rec9.paid_amount_stroops;
+              END IF;
+
+              -- H2. Pre-check sanitization test: rec10 was underpaid (requested 100 stroops, paid 50 stroops)
+              SELECT * INTO rec10 FROM challenges WHERE id = 'ch_legacy_seed_10';
+              IF rec10.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
+                RAISE EXCEPTION '[%] Assertion failed: underpaid row rec10 not quarantined to RECONCILIATION_REQUIRED (got %)', step_name, rec10.status;
+              END IF;
+              IF rec10.paid_amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: underpaid row paid_amount_stroops must be normalized to NULL (got %)', step_name, rec10.paid_amount_stroops;
+              END IF;
+              IF rec10.amount_stroops IS DISTINCT FROM 100 THEN
+                RAISE EXCEPTION '[%] Assertion failed: underpaid row requested amount lost (got %)', step_name, rec10.amount_stroops;
+              END IF;
+
+              -- H3. i128::MAX overflow test: rec11 had amount_stroops = 170141183460469231731687303715884105728 (exceeding i128)
+              SELECT * INTO rec11 FROM challenges WHERE id = 'ch_legacy_seed_11';
+              IF rec11.status IS DISTINCT FROM 'INCONCLUSIVE_MANUAL_REVIEW' THEN
+                RAISE EXCEPTION '[%] Assertion failed: i128 overflow row rec11 not quarantined to INCONCLUSIVE_MANUAL_REVIEW (got %)', step_name, rec11.status;
+              END IF;
+              IF rec11.amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: i128 overflow row amount_stroops must be normalized to NULL (got %)', step_name, rec11.amount_stroops;
               END IF;
 
               -- I. Purge & Structural Preservation Assertions
