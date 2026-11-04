@@ -227,6 +227,8 @@ CREATE TABLE IF NOT EXISTS migration_audit_log (
   pre_status TEXT,
   pre_amount_stroops NUMERIC(40, 0),
   pre_paid_amount_stroops NUMERIC(40, 0),
+  pre_amount_text TEXT,
+  pre_bound_tx_hash TEXT,
   sanitization_reason TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
@@ -235,6 +237,35 @@ CREATE INDEX IF NOT EXISTS idx_migration_audit_challenge ON migration_audit_log(
 -- 3. Populate amount_stroops and reconcile legacy statuses
 DO $EVOLVE_DATA$
 BEGIN
+  -- SNAPSHOT STEP: Capture initial pre-sanitization state before any column conversion or update
+  -- Stores initial values in migration_audit_log with migration_step = 'INITIAL_PRE_MIGRATION_SNAPSHOT'
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'amount'
+  ) THEN
+    INSERT INTO migration_audit_log (
+      challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason
+    )
+    SELECT 
+      id, 'INITIAL_PRE_MIGRATION_SNAPSHOT', status, amount_stroops, paid_amount_stroops, amount::TEXT, bound_tx_hash, 'CAPTURE_INITIAL_OBSERVED_STATE'
+    FROM challenges
+    WHERE NOT EXISTS (
+      SELECT 1 FROM migration_audit_log mal 
+      WHERE mal.challenge_id = challenges.id AND mal.migration_step = 'INITIAL_PRE_MIGRATION_SNAPSHOT'
+    );
+  ELSE
+    INSERT INTO migration_audit_log (
+      challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason
+    )
+    SELECT 
+      id, 'INITIAL_PRE_MIGRATION_SNAPSHOT', status, amount_stroops, paid_amount_stroops, NULL, bound_tx_hash, 'CAPTURE_INITIAL_OBSERVED_STATE'
+    FROM challenges
+    WHERE NOT EXISTS (
+      SELECT 1 FROM migration_audit_log mal 
+      WHERE mal.challenge_id = challenges.id AND mal.migration_step = 'INITIAL_PRE_MIGRATION_SNAPSHOT'
+    );
+  END IF;
+
   -- A. Populate amount_stroops with exact scale and safe short-circuit evaluation:
   -- Validates string structure, integer magnitude (<= 30 digits before decimal), and positive value
   -- before any cast to NUMERIC to guarantee that corrupt or out-of-range strings never cause transaction aborts.
@@ -262,15 +293,15 @@ BEGIN
   END IF;
 
   -- B. Evidence Preservation & Sanitization of paid_amount_stroops across all rows:
-  -- If paid_amount_stroops is NaN, non-positive, or corrupt, record evidence and normalize to NULL.
+  -- If paid_amount_stroops is NaN, non-positive, or corrupt, record specific evidence and normalize to NULL.
   -- STRICT INVARIANT: Status is NEVER changed here, preserving PERMANENT_QUARANTINE and INCONCLUSIVE_MANUAL_REVIEW!
-  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, sanitization_reason)
-  SELECT COALESCE(id, challenge_id), 'SANITIZE_PAID_AMOUNT', status, amount_stroops, paid_amount_stroops, 'INVALID_NON_POSITIVE_OR_NAN_PAID_AMOUNT'
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
+  SELECT id, 'SANITIZE_PAID_AMOUNT', status, amount_stroops, paid_amount_stroops, NULL, bound_tx_hash, 'INVALID_NON_POSITIVE_OR_NAN_PAID_AMOUNT'
   FROM challenges
   WHERE paid_amount_stroops IS NOT NULL AND (paid_amount_stroops = 'NaN'::numeric OR paid_amount_stroops <= 0)
     AND NOT EXISTS (
       SELECT 1 FROM migration_audit_log mal 
-      WHERE mal.challenge_id = COALESCE(challenges.id, challenges.challenge_id) AND mal.migration_step = 'SANITIZE_PAID_AMOUNT'
+      WHERE mal.challenge_id = challenges.id AND mal.migration_step = 'SANITIZE_PAID_AMOUNT'
     );
 
   UPDATE challenges
@@ -283,13 +314,13 @@ BEGIN
   -- Record evidence. Normalize paid_amount_stroops to NULL.
   -- STRICT INVARIANT: If status IN ('PERMANENT_QUARANTINE', 'INCONCLUSIVE_MANUAL_REVIEW'), PRESERVE status!
   -- Only operational rows transition to RECONCILIATION_REQUIRED.
-  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, sanitization_reason)
-  SELECT COALESCE(id, challenge_id), 'OVERFLOW_PAID_AMOUNT_I128', status, amount_stroops, paid_amount_stroops, 'PAID_AMOUNT_EXCEEDS_I128_MAX'
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
+  SELECT id, 'OVERFLOW_PAID_AMOUNT_I128', status, amount_stroops, paid_amount_stroops, NULL, bound_tx_hash, 'PAID_AMOUNT_EXCEEDS_I128_MAX'
   FROM challenges
   WHERE paid_amount_stroops IS NOT NULL AND paid_amount_stroops != 'NaN'::numeric AND paid_amount_stroops > 170141183460469231731687303715884105727
     AND NOT EXISTS (
       SELECT 1 FROM migration_audit_log mal 
-      WHERE mal.challenge_id = COALESCE(challenges.id, challenges.challenge_id) AND mal.migration_step = 'OVERFLOW_PAID_AMOUNT_I128'
+      WHERE mal.challenge_id = challenges.id AND mal.migration_step = 'OVERFLOW_PAID_AMOUNT_I128'
     );
 
   UPDATE challenges
@@ -306,13 +337,13 @@ BEGIN
   -- Record evidence. Normalize amount_stroops to NULL.
   -- STRICT INVARIANT: If status = 'PERMANENT_QUARANTINE', status is PRESERVED!
   -- Operational rows transition to INCONCLUSIVE_MANUAL_REVIEW.
-  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, sanitization_reason)
-  SELECT COALESCE(id, challenge_id), 'OVERFLOW_AMOUNT_I128', status, amount_stroops, paid_amount_stroops, 'REQUESTED_AMOUNT_EXCEEDS_I128_MAX'
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
+  SELECT id, 'OVERFLOW_AMOUNT_I128', status, amount_stroops, paid_amount_stroops, NULL, bound_tx_hash, 'REQUESTED_AMOUNT_EXCEEDS_I128_MAX'
   FROM challenges
   WHERE amount_stroops IS NOT NULL AND amount_stroops != 'NaN'::numeric AND amount_stroops > 170141183460469231731687303715884105727
     AND NOT EXISTS (
       SELECT 1 FROM migration_audit_log mal 
-      WHERE mal.challenge_id = COALESCE(challenges.id, challenges.challenge_id) AND mal.migration_step = 'OVERFLOW_AMOUNT_I128'
+      WHERE mal.challenge_id = challenges.id AND mal.migration_step = 'OVERFLOW_AMOUNT_I128'
     );
 
   UPDATE challenges
@@ -329,7 +360,18 @@ BEGIN
   -- In canonical schema, amount_stroops must be NULL for quarantined rows (INCONCLUSIVE_MANUAL_REVIEW or PERMANENT_QUARANTINE),
   -- and strictly > 0 and != 'NaN' for operational rows.
   -- 1. Rows already in ANY quarantine state (INCONCLUSIVE_MANUAL_REVIEW or PERMANENT_QUARANTINE):
-  -- Strictly normalize non-positive or NaN amount_stroops to NULL, preserving their respective quarantine status!
+  -- Record evidence before normalizing non-positive or NaN amount_stroops to NULL, preserving their respective quarantine status!
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
+  SELECT id, 'QUARANTINE_AMOUNT_NORMALIZATION', status, amount_stroops, paid_amount_stroops, NULL, bound_tx_hash, 'QUARANTINE_AMOUNT_NORMALIZED_TO_NULL'
+  FROM challenges
+  WHERE status IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE')
+    AND amount_stroops IS NOT NULL 
+    AND (amount_stroops <= 0 OR amount_stroops = 'NaN'::numeric)
+    AND NOT EXISTS (
+      SELECT 1 FROM migration_audit_log mal 
+      WHERE mal.challenge_id = challenges.id AND mal.migration_step = 'QUARANTINE_AMOUNT_NORMALIZATION'
+    );
+
   UPDATE challenges
   SET amount_stroops = NULL
   WHERE status IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE')
@@ -337,12 +379,31 @@ BEGIN
     AND (amount_stroops <= 0 OR amount_stroops = 'NaN'::numeric);
 
   -- 2. Operational rows with amount_stroops <= 0, NaN, or unconvertible:
-  -- Safely isolate into INCONCLUSIVE_MANUAL_REVIEW with amount_stroops = NULL
+  -- Record evidence. Safely isolate into INCONCLUSIVE_MANUAL_REVIEW with amount_stroops = NULL
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
+  SELECT id, 'OPERATIONAL_AMOUNT_INVALID', status, amount_stroops, paid_amount_stroops, NULL, bound_tx_hash, 'OPERATIONAL_NON_POSITIVE_AMOUNT_ISOLATED'
+  FROM challenges
+  WHERE (amount_stroops IS NOT NULL AND (amount_stroops <= 0 OR amount_stroops = 'NaN'::numeric))
+    AND status NOT IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE')
+    AND NOT EXISTS (
+      SELECT 1 FROM migration_audit_log mal 
+      WHERE mal.challenge_id = challenges.id AND mal.migration_step = 'OPERATIONAL_AMOUNT_INVALID'
+    );
+
   UPDATE challenges
   SET status = 'INCONCLUSIVE_MANUAL_REVIEW', amount_stroops = NULL
   WHERE (amount_stroops IS NOT NULL AND (amount_stroops <= 0 OR amount_stroops = 'NaN'::numeric));
 
   -- 3. Rows with amount_stroops IS NULL: isolate to INCONCLUSIVE_MANUAL_REVIEW if not already permanently quarantined
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
+  SELECT id, 'UNMETERED_AMOUNT_NULL', status, amount_stroops, paid_amount_stroops, NULL, bound_tx_hash, 'UNMETERED_ROW_ISOLATED_TO_INCONCLUSIVE'
+  FROM challenges
+  WHERE amount_stroops IS NULL AND (status IS NULL OR status NOT IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'))
+    AND NOT EXISTS (
+      SELECT 1 FROM migration_audit_log mal 
+      WHERE mal.challenge_id = challenges.id AND mal.migration_step = 'UNMETERED_AMOUNT_NULL'
+    );
+
   UPDATE challenges 
   SET status = 'INCONCLUSIVE_MANUAL_REVIEW'
   WHERE amount_stroops IS NULL AND (status IS NULL OR status NOT IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'));
@@ -352,13 +413,13 @@ BEGIN
   -- Record evidence in migration_audit_log.
   -- STRICT INVARIANT: If row is in PERMANENT_QUARANTINE or INCONCLUSIVE_MANUAL_REVIEW, PRESERVE its status!
   -- Only operational rows transition to RECONCILIATION_REQUIRED.
-  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, sanitization_reason)
-  SELECT COALESCE(id, challenge_id), 'UNDERPAID_CHALLENGE', status, amount_stroops, paid_amount_stroops, 'PAID_AMOUNT_LESS_THAN_REQUESTED_AMOUNT'
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
+  SELECT id, 'UNDERPAID_CHALLENGE', status, amount_stroops, paid_amount_stroops, NULL, bound_tx_hash, 'PAID_AMOUNT_LESS_THAN_REQUESTED_AMOUNT'
   FROM challenges
   WHERE amount_stroops IS NOT NULL AND paid_amount_stroops IS NOT NULL AND paid_amount_stroops < amount_stroops
     AND NOT EXISTS (
       SELECT 1 FROM migration_audit_log mal 
-      WHERE mal.challenge_id = COALESCE(challenges.id, challenges.challenge_id) AND mal.migration_step = 'UNDERPAID_CHALLENGE'
+      WHERE mal.challenge_id = challenges.id AND mal.migration_step = 'UNDERPAID_CHALLENGE'
     );
 
   UPDATE challenges
@@ -383,6 +444,17 @@ BEGIN
       AND bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND paid_amount_stroops != 'NaN'::numeric 
       AND paid_amount_stroops >= amount_stroops AND redeemed_at IS NOT NULL;
 
+    INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
+    SELECT id, 'RECONCILE_INCOMPLETE_REDEEMED', status, amount_stroops, paid_amount_stroops, NULL, bound_tx_hash, 'LEGACY_IS_REDEEMED_LACKS_PROOF'
+    FROM challenges
+    WHERE (status IS NULL OR status = 'PENDING') 
+      AND (is_redeemed::TEXT = '1' OR is_redeemed::TEXT = 'true')
+      AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR paid_amount_stroops = 'NaN'::numeric OR paid_amount_stroops < amount_stroops OR redeemed_at IS NULL)
+      AND NOT EXISTS (
+        SELECT 1 FROM migration_audit_log mal 
+        WHERE mal.challenge_id = challenges.id AND mal.migration_step = 'RECONCILE_INCOMPLETE_REDEEMED'
+      );
+
     UPDATE challenges 
     SET status = 'RECONCILIATION_REQUIRED', paid_amount_stroops = CASE WHEN paid_amount_stroops < amount_stroops THEN NULL ELSE paid_amount_stroops END
     WHERE (status IS NULL OR status = 'PENDING') 
@@ -391,6 +463,16 @@ BEGIN
   END IF;
 
   -- G. Reconcile any existing rows that were ALREADY marked 'REDEEMED' but lack proof, had NaN paid_amount, or were underpaid:
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
+  SELECT id, 'RECONCILE_UNPROVEN_REDEEMED', status, amount_stroops, paid_amount_stroops, NULL, bound_tx_hash, 'REDEEMED_ROW_LACKS_PROOF_OR_PAYMENT'
+  FROM challenges
+  WHERE status = 'REDEEMED'
+    AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR paid_amount_stroops = 'NaN'::numeric OR (amount_stroops IS NOT NULL AND paid_amount_stroops < amount_stroops) OR redeemed_at IS NULL)
+    AND NOT EXISTS (
+      SELECT 1 FROM migration_audit_log mal 
+      WHERE mal.challenge_id = challenges.id AND mal.migration_step = 'RECONCILE_UNPROVEN_REDEEMED'
+    );
+
   UPDATE challenges
   SET status = 'RECONCILIATION_REQUIRED', paid_amount_stroops = CASE WHEN amount_stroops IS NOT NULL AND paid_amount_stroops < amount_stroops THEN NULL ELSE paid_amount_stroops END
   WHERE status = 'REDEEMED'
@@ -554,6 +636,8 @@ CREATE TABLE IF NOT EXISTS migration_audit_log (
   pre_status TEXT,
   pre_amount_stroops NUMERIC(40, 0),
   pre_paid_amount_stroops NUMERIC(40, 0),
+  pre_amount_text TEXT,
+  pre_bound_tx_hash TEXT,
   sanitization_reason TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );

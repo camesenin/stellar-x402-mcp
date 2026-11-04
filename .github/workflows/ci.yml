@@ -610,10 +610,82 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: rec14 paid_amount_stroops must be NULL (got %)', step_name, rec14.paid_amount_stroops;
               END IF;
 
-              -- H7. Audit log verification: assert migration_audit_log captured evidence for sanitized rows
-              SELECT count(*) INTO v_audit_count FROM migration_audit_log WHERE challenge_id IN ('ch_legacy_seed_10', 'ch_legacy_seed_11', 'ch_legacy_seed_12', 'ch_legacy_seed_13', 'ch_legacy_seed_14');
-              IF v_audit_count < 5 THEN
-                RAISE EXCEPTION '[%] Assertion failed: migration_audit_log missing evidence records (expected at least 5, got %)', step_name, v_audit_count;
+              -- H7. Forensic Audit Log Verification: assert exact per-challenge evidence preservation
+              -- 1. Initial snapshot captured for all 14 seed rows
+              SELECT count(*) INTO v_audit_count FROM migration_audit_log WHERE migration_step = 'INITIAL_PRE_MIGRATION_SNAPSHOT';
+              IF v_audit_count < 14 THEN
+                RAISE EXCEPTION '[%] Assertion failed: INITIAL_PRE_MIGRATION_SNAPSHOT missing rows (expected 14, got %)', step_name, v_audit_count;
+              END IF;
+
+              -- 2. Exact evidence for underpaid operational row (ch_legacy_seed_10)
+              IF NOT EXISTS (
+                SELECT 1 FROM migration_audit_log 
+                WHERE challenge_id = 'ch_legacy_seed_10' 
+                  AND migration_step = 'UNDERPAID_CHALLENGE' 
+                  AND pre_amount_stroops = 100 
+                  AND pre_paid_amount_stroops = 50 
+                  AND sanitization_reason = 'PAID_AMOUNT_LESS_THAN_REQUESTED_AMOUNT'
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: migration_audit_log missing exact evidence for ch_legacy_seed_10', step_name;
+              END IF;
+
+              -- 3. Exact evidence for i128 requested amount overflow (ch_legacy_seed_11)
+              IF NOT EXISTS (
+                SELECT 1 FROM migration_audit_log 
+                WHERE challenge_id = 'ch_legacy_seed_11' 
+                  AND migration_step = 'OVERFLOW_AMOUNT_I128' 
+                  AND pre_amount_stroops = 170141183460469231731687303715884105728 
+                  AND sanitization_reason = 'REQUESTED_AMOUNT_EXCEEDS_I128_MAX'
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: migration_audit_log missing exact evidence for ch_legacy_seed_11', step_name;
+              END IF;
+
+              -- 4. Exact evidence for underpaid permanent quarantine row (ch_legacy_seed_12)
+              IF NOT EXISTS (
+                SELECT 1 FROM migration_audit_log 
+                WHERE challenge_id = 'ch_legacy_seed_12' 
+                  AND migration_step = 'UNDERPAID_CHALLENGE' 
+                  AND pre_status = 'PERMANENT_QUARANTINE'
+                  AND pre_amount_stroops = 100 
+                  AND pre_paid_amount_stroops = 50 
+                  AND sanitization_reason = 'PAID_AMOUNT_LESS_THAN_REQUESTED_AMOUNT'
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: migration_audit_log missing exact evidence for ch_legacy_seed_12', step_name;
+              END IF;
+
+              -- 5. Exact evidence for i128 overflow in permanent quarantine (ch_legacy_seed_13)
+              IF NOT EXISTS (
+                SELECT 1 FROM migration_audit_log 
+                WHERE challenge_id = 'ch_legacy_seed_13' 
+                  AND migration_step = 'OVERFLOW_AMOUNT_I128' 
+                  AND pre_status = 'PERMANENT_QUARANTINE'
+                  AND pre_amount_stroops = 170141183460469231731687303715884105728 
+                  AND sanitization_reason = 'REQUESTED_AMOUNT_EXCEEDS_I128_MAX'
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: migration_audit_log missing exact evidence for ch_legacy_seed_13', step_name;
+              END IF;
+
+              -- 6. Exact evidence for paid amount i128 overflow (ch_legacy_seed_14)
+              IF NOT EXISTS (
+                SELECT 1 FROM migration_audit_log 
+                WHERE challenge_id = 'ch_legacy_seed_14' 
+                  AND migration_step = 'OVERFLOW_PAID_AMOUNT_I128' 
+                  AND pre_paid_amount_stroops = 170141183460469231731687303715884105728 
+                  AND sanitization_reason = 'PAID_AMOUNT_EXCEEDS_I128_MAX'
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: migration_audit_log missing exact evidence for ch_legacy_seed_14', step_name;
+              END IF;
+
+              -- 7. Idempotency assertion: assert no duplicate logs exist per (challenge_id, migration_step)
+              SELECT count(*) INTO v_audit_count 
+              FROM (
+                SELECT challenge_id, migration_step, count(*) 
+                FROM migration_audit_log 
+                GROUP BY challenge_id, migration_step 
+                HAVING count(*) > 1
+              ) duplicates;
+              IF v_audit_count > 0 THEN
+                RAISE EXCEPTION '[%] Assertion failed: duplicate migration_audit_log records detected after migration run', step_name;
               END IF;
 
               -- I. Purge & Structural Preservation Assertions
