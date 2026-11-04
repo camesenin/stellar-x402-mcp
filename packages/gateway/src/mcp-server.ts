@@ -76,12 +76,20 @@ export class StellarPaidMcpServer {
 
       // Check if payment was provided
       if (txHash && challengeId) {
-        const challenge = this.store.getChallenge(challengeId);
+        let challenge = this.store.getChallenge(challengeId);
+        let isGracePeriodRecovery = false;
+
         if (!challenge) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'Invalid or expired x402 challenge ID. Request fresh challenge without payment.'
-          );
+          const unexpiredOrGraceChallenge = this.store.getChallengeAllowExpired(challengeId);
+          if (unexpiredOrGraceChallenge && Date.now() <= unexpiredOrGraceChallenge.expiresAt + 60_000) {
+            challenge = unexpiredOrGraceChallenge;
+            isGracePeriodRecovery = true;
+          } else {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              'Invalid or expired x402 challenge ID. Request fresh challenge without payment.'
+            );
+          }
         }
 
         // Strict resource binding: prevent cross-tool challenge reuse (e.g. paying for cheap tool and invoking expensive tool)
@@ -117,8 +125,28 @@ export class StellarPaidMcpServer {
           ? { message: domainMessage, signatureBase64: payerSignature }
           : undefined;
 
-        const verification = await this.verifier.verifyPayment(txHash, challenge, this.store, requesterAuth);
+        const verification = await this.verifier.verifyPayment(
+          txHash,
+          challenge,
+          this.store,
+          requesterAuth,
+          isGracePeriodRecovery ? 60_000 : 0
+        );
         if (!verification.valid) {
+          if (verification.retriable) {
+            const err = new McpError(
+              ErrorCode.InternalError,
+              `x402 Payment verification temporarily unavailable: ${verification.reason}`
+            );
+            (err as any).data = {
+              retriable: true,
+              statusCode: 503,
+              retryAfterSec: 2,
+              txHash,
+              challengeId,
+            };
+            throw err;
+          }
           throw new McpError(
             ErrorCode.InvalidRequest,
             `x402 Payment verification failed: ${verification.reason}`

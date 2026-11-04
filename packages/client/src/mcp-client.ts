@@ -82,15 +82,30 @@ export class StellarPaidMcpClient {
         throw paymentErr;
       }
 
-      // Re-invoke with payment proof
-      return await this.mcpClient.callTool({
-        name,
-        arguments: {
-          ...args,
-          _x402_tx_hash: receipt.txHash,
-          _x402_challenge_id: challenge.challengeId,
-        },
-      });
+      // Re-invoke with payment proof (with retriable 503 recovery without double payment)
+      let mcpRetryAttempts = 0;
+      while (true) {
+        try {
+          return await this.mcpClient.callTool({
+            name,
+            arguments: {
+              ...args,
+              _x402_tx_hash: receipt.txHash,
+              _x402_challenge_id: challenge.challengeId,
+            },
+          });
+        } catch (callErr: any) {
+          const isRetriable503 = callErr?.data?.retriable === true ||
+            (callErr instanceof Error && callErr.message.includes('temporarily unavailable'));
+          if (isRetriable503 && mcpRetryAttempts < 3) {
+            mcpRetryAttempts++;
+            const retryWaitSec = callErr?.data?.retryAfterSec ?? 1;
+            await new Promise(resolve => setTimeout(resolve, retryWaitSec * 1000));
+            continue;
+          }
+          throw callErr;
+        }
+      }
     }
   }
 

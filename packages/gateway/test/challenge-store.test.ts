@@ -9,6 +9,58 @@ import { ChallengeStore } from '../src/challenge-store.js';
 const require = createRequire(import.meta.url);
 const betterSqlitePath = require.resolve('better-sqlite3');
 
+// Reusable robust teardown helper shared between contention test and fault-injection tests
+export async function executeStoreAndWorkerTeardown(
+  worker: { terminate: () => Promise<number | void> } | null,
+  store: { close: () => void } | null,
+  primaryError: Error | null = null
+): Promise<void> {
+  const cleanupErrors: Error[] = [];
+  if (primaryError) {
+    cleanupErrors.push(primaryError);
+  }
+
+  if (worker) {
+    let termTimer: NodeJS.Timeout | null = null;
+    try {
+      await Promise.race([
+        worker.terminate().then(() => {
+          if (termTimer) clearTimeout(termTimer);
+        }),
+        new Promise((_, reject) => {
+          termTimer = setTimeout(() => {
+            reject(new Error('Worker termination timed out after 2000ms'));
+          }, 2000);
+        }),
+      ]);
+    } catch (termErr) {
+      cleanupErrors.push(termErr instanceof Error ? termErr : new Error(String(termErr)));
+    } finally {
+      if (termTimer) {
+        clearTimeout(termTimer);
+        termTimer = null;
+      }
+    }
+  }
+
+  if (store) {
+    try {
+      store.close();
+    } catch (closeErr) {
+      cleanupErrors.push(closeErr instanceof Error ? closeErr : new Error(String(closeErr)));
+    }
+  }
+
+  if (cleanupErrors.length === 1) {
+    throw cleanupErrors[0];
+  } else if (cleanupErrors.length > 1) {
+    throw new AggregateError(
+      cleanupErrors,
+      `Multiple errors during execution and teardown: ${cleanupErrors.map(e => e.message).join('; ')}`
+    );
+  }
+}
+
 describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
   let tempDbPath: string;
 
@@ -161,6 +213,7 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
 
     let mainThreadWaitTime = 0;
     let mainThreadError: unknown = null;
+    let testExecutionError: Error | null = null;
     let challengeId = '';
     let preCheckExpired = true;
     let postWaitExpired = false;
@@ -333,46 +386,10 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
           settle(setupErr instanceof Error ? setupErr : new Error(String(setupErr)));
         }
       });
+    } catch (testBodyErr) {
+      testExecutionError = testBodyErr instanceof Error ? testBodyErr : new Error(String(testBodyErr));
     } finally {
-      // Robust termination & store closure: aggregate any errors from worker termination and store closure
-      const cleanupErrors: Error[] = [];
-
-      if (worker) {
-        let termTimer: NodeJS.Timeout | null = null;
-        try {
-          await Promise.race([
-            worker.terminate().then(() => {
-              if (termTimer) clearTimeout(termTimer);
-            }),
-            new Promise((_, reject) => {
-              termTimer = setTimeout(() => {
-                reject(new Error('Worker termination timed out after 2000ms'));
-              }, 2000);
-            }),
-          ]);
-        } catch (termErr) {
-          cleanupErrors.push(termErr instanceof Error ? termErr : new Error(String(termErr)));
-        } finally {
-          if (termTimer) {
-            clearTimeout(termTimer);
-            termTimer = null;
-          }
-        }
-      }
-
-      if (store) {
-        try {
-          store.close();
-        } catch (closeErr) {
-          cleanupErrors.push(closeErr instanceof Error ? closeErr : new Error(String(closeErr)));
-        }
-      }
-
-      if (cleanupErrors.length === 1) {
-        throw cleanupErrors[0];
-      } else if (cleanupErrors.length > 1) {
-        throw new AggregateError(cleanupErrors, `Multiple cleanup errors during test teardown: ${cleanupErrors.map(e => e.message).join('; ')}`);
-      }
+      await executeStoreAndWorkerTeardown(worker, store, testExecutionError);
     }
 
     // Assertions verifying genuine race & postconditions:
@@ -457,61 +474,18 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
     let caughtFinalError: any = null;
 
     try {
-      try {
-        throw originalTestError;
-      } finally {
-        // Real teardown block as implemented in contention test:
-        const cleanupErrors: Error[] = [];
-
-        if (fakeWorker) {
-          let termTimer: NodeJS.Timeout | null = null;
-          try {
-            await Promise.race([
-              fakeWorker.terminate().then(() => {
-                if (termTimer) clearTimeout(termTimer);
-              }),
-              new Promise((_, reject) => {
-                termTimer = setTimeout(() => {
-                  reject(new Error('Worker termination timed out after 2000ms'));
-                }, 2000);
-              }),
-            ]);
-          } catch (termErr) {
-            cleanupErrors.push(termErr instanceof Error ? termErr : new Error(String(termErr)));
-          } finally {
-            if (termTimer) {
-              clearTimeout(termTimer);
-              termTimer = null;
-            }
-          }
-        }
-
-        if (fakeStore) {
-          try {
-            fakeStore.close();
-          } catch (closeErr) {
-            cleanupErrors.push(closeErr instanceof Error ? closeErr : new Error(String(closeErr)));
-          }
-        }
-
-        if (cleanupErrors.length === 1) {
-          throw cleanupErrors[0];
-        } else if (cleanupErrors.length > 1) {
-          throw new AggregateError(
-            cleanupErrors,
-            `Multiple cleanup errors during test teardown: ${cleanupErrors.map(e => e.message).join('; ')}`
-          );
-        }
-      }
+      await executeStoreAndWorkerTeardown(fakeWorker, fakeStore, originalTestError);
     } catch (err) {
       caughtFinalError = err;
     }
 
     expect(caughtFinalError).toBeInstanceOf(AggregateError);
     const agg = caughtFinalError as AggregateError;
-    expect(agg.errors).toHaveLength(2);
-    expect(agg.errors[0]).toBe(terminateFailure);
-    expect(agg.errors[1]).toBe(closeFailure);
+    // Exactly 3 errors preserved: original test error + terminate error + close error!
+    expect(agg.errors).toHaveLength(3);
+    expect(agg.errors[0]).toBe(originalTestError);
+    expect(agg.errors[1]).toBe(terminateFailure);
+    expect(agg.errors[2]).toBe(closeFailure);
   });
 
   it('proves settle routes synchronous listener registration errors immediately, cancels timers, and detaches listeners without waiting for deadline', async () => {
@@ -536,7 +510,8 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
       postMessage() {}
     };
 
-    const registrationError = await new Promise<Error>((resolve) => {
+    // Demonstrates genuine promise REJECTION via .rejects
+    await expect(new Promise<void>((resolve, reject) => {
       let isSettled = false;
       let deadlineTimer: NodeJS.Timeout | null = null;
 
@@ -551,7 +526,8 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
         mockWorker.off('message', onMessage);
         mockWorker.off('exit', onExit);
         mockWorker.off('error', onError);
-        resolve(err as Error);
+        if (err) reject(err);
+        else resolve();
       };
 
       const onExit = () => {};
@@ -562,7 +538,7 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
         deadlineTimer = setTimeout(() => {
           timerFired = true;
           settle(new Error('timeout'));
-        }, 100);
+        }, 50);
 
         mockWorker.on('message', onMessage);
         mockWorker.once('exit', onExit);
@@ -571,14 +547,13 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
       } catch (setupErr) {
         settle(setupErr instanceof Error ? setupErr : new Error(String(setupErr)));
       }
-    });
+    })).rejects.toThrow('Simulated synchronous throw on exit registration');
 
-    // Proves immediate rejection without waiting for deadline timer
-    expect(registrationError.message).toBe('Simulated synchronous throw on exit registration');
-    // Proves timer was explicitly cancelled and never fired
+    // Wait 100ms past the 50ms deadline to prove timer callback remained cancelled and never fired
+    await new Promise(resolve => setTimeout(resolve, 100));
+
     expect(timerCleared).toBe(true);
     expect(timerFired).toBe(false);
-    // Proves partial registration (message) was cleanly detached
     expect(mockWorker.handlers['message']).toHaveLength(0);
   });
 

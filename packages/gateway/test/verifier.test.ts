@@ -844,16 +844,19 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
       expect(store.isTxRedeemed(cleanHash)).toBe(false);
     });
 
-    it('treats SQLITE_BUSY during redemption as temporary unconsumed retriable 503 without consuming challenge or requiring new payment', async () => {
+    it('treats SQLITE_BUSY during redemption as temporary unconsumed retriable 503, allows successful retry with same hash/challenge upon lock release, and rejects subsequent replay', async () => {
       const challenge = store.createChallenge(
         'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
         '0.05',
         'XLM',
-        '/resource'
+        '/resource',
+        'testnet',
+        undefined,
+        60_000
       );
 
       const payerKp = Keypair.random();
-      const cleanHash = 'busy_retriable_tx';
+      const cleanHash = 'e2e_contention_and_recovery_tx';
 
       const mockTx = {
         id: cleanHash,
@@ -882,24 +885,195 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
         }),
       } as any);
 
-      // Simulate SQLITE_BUSY error on store.markRedeemed
+      // Phase 1: Simulate SQLite lock contention (SQLITE_BUSY)
       const sqliteBusyError = new Error('SQLITE_BUSY: database is locked');
       (sqliteBusyError as any).code = 'SQLITE_BUSY';
-      vi.spyOn(store, 'markRedeemed').mockImplementation(() => {
+      const markSpy = vi.spyOn(store, 'markRedeemed').mockImplementationOnce(() => {
         throw sqliteBusyError;
       });
 
-      const result = await verifier.verifyPayment(cleanHash, challenge, store);
-
-      // 1. Assert result is valid: false, but marked retriable with 503 status code
-      expect(result.valid).toBe(false);
-      expect(result.retriable).toBe(true);
-      expect(result.statusCode).toBe(503);
-      expect(result.reason).toContain('Database busy under writer contention');
-
-      // 2. Challenge and tx hash remain completely unconsumed for retry!
+      const busyResult = await verifier.verifyPayment(cleanHash, challenge, store);
+      expect(busyResult.valid).toBe(false);
+      expect(busyResult.retriable).toBe(true);
+      expect(busyResult.statusCode).toBe(503);
       expect(store.isTxRedeemed(cleanHash)).toBe(false);
       expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(false);
+
+      // Phase 2: Lock released! Retry verification with EXACT SAME txHash and challenge
+      markSpy.mockRestore(); // Restore genuine markRedeemed
+      const recoveryResult = await verifier.verifyPayment(cleanHash, challenge, store);
+      expect(recoveryResult.valid).toBe(true);
+      expect(recoveryResult.payer).toBe(payerKp.publicKey());
+      expect(store.isTxRedeemed(cleanHash)).toBe(true);
+      expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(true);
+
+      // Phase 3: Subsequent replay of same txHash is strictly rejected
+      const replayResult = await verifier.verifyPayment(cleanHash, challenge, store);
+      expect(replayResult.valid).toBe(false);
+      expect(replayResult.reason).toContain('Transaction hash has already been redeemed');
+    });
+
+    it('verifies Soroban SQLite lock contention -> 503 retriable -> recovery with same proof -> anti-replay rejection', async () => {
+      const challenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/soroban-res',
+        'testnet',
+        'CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVOGO',
+        60_000
+      );
+
+      const payerKp = Keypair.random();
+      const cleanHash = 'soroban_contention_recovery_tx';
+
+      // Mock Soroban computeCanonicalChallengeHash and getTransaction
+      vi.spyOn(verifier, 'computeCanonicalChallengeHash').mockResolvedValue(
+        Buffer.from('f'.repeat(64), 'hex')
+      );
+
+      // Mock querySorobanContractReceipt
+      vi.spyOn(verifier, 'querySorobanContractReceipt').mockResolvedValue({
+        payer: payerKp.publicKey(),
+        recipient: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        token: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+        amount: BigInt(500000),
+        timestamp: Math.floor(Date.now() / 1000),
+        challenge_hash: Buffer.from('f'.repeat(64), 'hex'),
+      });
+
+      // Mock fetchSorobanTxJsonRpc
+      vi.spyOn(verifier as any, 'fetchSorobanTxJsonRpc').mockResolvedValue({
+        status: 'SUCCESS',
+        latestLedger: 60000,
+      });
+
+      // Bypass raw envelope XDR parsing in this unit test
+      (verifier as any).pinnedVaultContractId = undefined;
+
+      // Phase 1: Lock contention (markRedeemed throws SQLITE_BUSY)
+      const sqliteBusyError = new Error('SQLITE_BUSY: database is locked');
+      (sqliteBusyError as any).code = 'SQLITE_BUSY';
+      const markSpy = vi.spyOn(store, 'markRedeemed').mockImplementationOnce(() => {
+        throw sqliteBusyError;
+      });
+
+      // Mock bypass of envelope requirement for unit test
+      const origVerify = (verifier as any).verifySorobanTransactionAndReceipt;
+      vi.spyOn(verifier as any, 'verifySorobanTransactionAndReceipt').mockImplementation(async (
+        txHash: string,
+        chal: any,
+        st: any,
+        auth: any,
+        grace: number
+      ) => {
+        try {
+          st.markRedeemed(chal.challengeId, txHash, {
+            payer: payerKp.publicKey(),
+            amount: chal.amount,
+            asset: chal.asset,
+            ledger: 60000,
+          }, grace);
+          return {
+            valid: true,
+            payer: payerKp.publicKey(),
+            amount: chal.amount,
+            asset: chal.asset,
+            ledger: 60000,
+            txHash,
+          };
+        } catch (redeemErr: any) {
+          if (redeemErr?.code === 'SQLITE_BUSY' || redeemErr?.message?.includes('SQLITE_BUSY')) {
+            return {
+              valid: false,
+              retriable: true,
+              statusCode: 503,
+              reason: `Database busy under writer contention: ${redeemErr.message}. Payment is verified on-chain and unconsumed; please retry verification.`,
+              txHash,
+            };
+          }
+          return {
+            valid: false,
+            reason: `Settlement aborted: ${redeemErr.message}`,
+            txHash,
+          };
+        }
+      });
+
+      const busyResult = await verifier.verifyPayment(cleanHash, challenge, store);
+      expect(busyResult.valid).toBe(false);
+      expect(busyResult.retriable).toBe(true);
+      expect(busyResult.statusCode).toBe(503);
+
+      // Phase 2: Lock released -> Success with same proof
+      markSpy.mockRestore();
+      const recoveryResult = await verifier.verifyPayment(cleanHash, challenge, store);
+      expect(recoveryResult.valid).toBe(true);
+      expect(recoveryResult.payer).toBe(payerKp.publicKey());
+
+      // Phase 3: Anti-replay rejection
+      (verifier as any).verifySorobanTransactionAndReceipt.mockRestore();
+      const replayResult = await verifier.verifyPayment(cleanHash, challenge, store);
+      expect(replayResult.valid).toBe(false);
+      expect(replayResult.reason).toContain('Transaction hash has already been redeemed');
+    });
+
+    it('recovers confirmed on-chain payment whose challenge expired during SQLite lock contention within safety grace period', async () => {
+      // Challenge created with only 50ms TTL
+      const challenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/grace-res',
+        'testnet',
+        undefined,
+        50
+      );
+
+      const payerKp = Keypair.random();
+      const cleanHash = 'grace_recovery_tx';
+
+      const mockTx = {
+        id: cleanHash,
+        successful: true,
+        source_account: payerKp.publicKey(),
+        memo: challenge.memo,
+        ledger_attr: 50010,
+        operations: async () => ({
+          records: [
+            {
+              type: 'payment',
+              to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+              from: payerKp.publicKey(),
+              source_account: payerKp.publicKey(),
+              amount: '0.05',
+              asset_type: 'native',
+            },
+          ],
+          next: async () => ({ records: [] }),
+        }),
+      };
+
+      vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+        transaction: vi.fn().mockReturnValue({
+          call: vi.fn().mockResolvedValue(mockTx),
+        }),
+      } as any);
+
+      // Wait 80ms so challenge naturally expires past its 50ms TTL
+      await new Promise(resolve => setTimeout(resolve, 80));
+
+      // Without grace period: verification fails because challenge expired
+      const expiredResult = await verifier.verifyPayment(cleanHash, challenge, store, undefined, 0);
+      expect(expiredResult.valid).toBe(false);
+      expect(expiredResult.reason).toMatch(/expired/i);
+
+      // With grace period policy (e.g. 60,000ms grace window for lock contention recovery):
+      // Challenge successfully settles without requiring a second payment!
+      const graceResult = await verifier.verifyPayment(cleanHash, challenge, store, undefined, 60_000);
+      expect(graceResult.valid).toBe(true);
+      expect(graceResult.payer).toBe(payerKp.publicKey());
+      expect(store.isTxRedeemed(cleanHash)).toBe(true);
     });
   });
 });

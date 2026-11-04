@@ -51,7 +51,7 @@ export function createX402Fetch(config: ClientConfig) {
       throw paymentErr;
     }
 
-    // 6. Retry request with payment proof headers
+    // 6. Retry request with payment proof headers (with retriable 503 recovery)
     const newHeaders = new Headers(init?.headers);
     newHeaders.set('X-Stellar-TxHash', receipt.txHash);
     newHeaders.set('X-Challenge-Id', challenge.challengeId);
@@ -65,6 +65,18 @@ export function createX402Fetch(config: ClientConfig) {
       headers: newHeaders,
     };
 
-    return await fetch(input, retryInit);
+    let retryResponse = await fetch(input, retryInit);
+
+    // If server returned 503 (e.g. database busy under contention), retry verification with exponential backoff without double payment
+    let retryAttempts = 0;
+    while (retryResponse.status === 503 && retryAttempts < 3) {
+      retryAttempts++;
+      const retryAfterHeader = retryResponse.headers.get('Retry-After');
+      const waitMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 500 * Math.pow(2, retryAttempts);
+      await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 2000)));
+      retryResponse = await fetch(input, retryInit);
+    }
+
+    return retryResponse;
   };
 }

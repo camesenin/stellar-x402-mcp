@@ -132,6 +132,14 @@ export class ChallengeStore {
   }
 
   public getChallenge(challengeId: string): X402Challenge | undefined {
+    return this.getChallengeInternal(challengeId, true);
+  }
+
+  public getChallengeAllowExpired(challengeId: string): X402Challenge | undefined {
+    return this.getChallengeInternal(challengeId, false);
+  }
+
+  private getChallengeInternal(challengeId: string, enforceTtl: boolean): X402Challenge | undefined {
     const stmt = this.db.prepare(`
       SELECT 
         challenge_id as challengeId,
@@ -151,7 +159,7 @@ export class ChallengeStore {
     const row = stmt.get(challengeId) as X402Challenge | undefined;
     if (!row) return undefined;
 
-    if (Date.now() > row.expiresAt) {
+    if (enforceTtl && Date.now() > row.expiresAt) {
       return undefined;
     }
 
@@ -187,7 +195,8 @@ export class ChallengeStore {
   public markRedeemed(
     challengeId: string,
     txHash: string,
-    metadata?: { payer?: string; amount?: string; asset?: string; ledger?: number }
+    metadata?: { payer?: string; amount?: string; asset?: string; ledger?: number },
+    allowGracePeriodMs: number = 0
   ): void {
     const cleanHash = txHash.toLowerCase();
 
@@ -196,16 +205,16 @@ export class ChallengeStore {
       // FRESH timestamp sampled strictly INSIDE the locked write transaction
       const currentRedemptionTime = Date.now();
 
-      // 1. Enforce that challenge exists, is currently unredeemed, and currentRedemptionTime <= expires_at
-      // Uniform boundary semantics across gateway: challenge is valid while currentRedemptionTime <= expires_at
+      // 1. Enforce that challenge exists, is currently unredeemed, and currentRedemptionTime <= expires_at + gracePeriod
+      // Uniform boundary semantics across gateway: challenge is valid while currentRedemptionTime <= expires_at + gracePeriod
       const updateChallenge = this.db.prepare(`
         UPDATE challenges
         SET is_redeemed = 1
         WHERE challenge_id = ?
           AND is_redeemed = 0
-          AND expires_at >= ?
+          AND (expires_at + ?) >= ?
       `);
-      const updateResult = updateChallenge.run(challengeId, currentRedemptionTime);
+      const updateResult = updateChallenge.run(challengeId, allowGracePeriodMs, currentRedemptionTime);
       if (updateResult.changes === 0) {
         throw new Error(
           `Atomic redemption failed: Challenge '${challengeId}' not found, already redeemed, or expired.`

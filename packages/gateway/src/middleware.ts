@@ -128,13 +128,23 @@ export function createX402Middleware(
 
     // 3. If txHash and challengeId are present, attempt verification
     if (txHash && challengeId) {
-      const challenge = store.getChallenge(challengeId);
+      // First try standard unexpired challenge; fallback to allowGracePeriod for confirmed payments during contention
+      let challenge = store.getChallenge(challengeId);
+      let isGracePeriodRecovery = false;
+
       if (!challenge) {
-        res.status(402).json({
-          error: 'Invalid or expired challenge ID',
-          remedy: 'Please request the resource again to obtain a fresh challenge.',
-        });
-        return;
+        // Check if challenge exists unredeemed in grace recovery window (up to 60s for lock contention recovery)
+        const unexpiredOrGraceChallenge = store.getChallengeAllowExpired(challengeId);
+        if (unexpiredOrGraceChallenge && Date.now() <= unexpiredOrGraceChallenge.expiresAt + 60_000) {
+          challenge = unexpiredOrGraceChallenge;
+          isGracePeriodRecovery = true;
+        } else {
+          res.status(402).json({
+            error: 'Invalid or expired challenge ID',
+            remedy: 'Please request the resource again to obtain a fresh challenge.',
+          });
+          return;
+        }
       }
 
       // Verify challenge resource binding to prevent cheap-to-expensive resource substitution
@@ -173,7 +183,13 @@ export function createX402Middleware(
         ? { message: domainMessage, signatureBase64: payerSignature }
         : undefined;
 
-      const result = await verifier.verifyPayment(txHash, challenge, store, requesterAuth);
+      const result = await verifier.verifyPayment(
+        txHash,
+        challenge,
+        store,
+        requesterAuth,
+        isGracePeriodRecovery ? 60_000 : 0
+      );
       if (!result.valid) {
         if (result.retriable && result.statusCode === 503) {
           res.setHeader('Retry-After', '2');

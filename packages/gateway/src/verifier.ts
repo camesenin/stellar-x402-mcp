@@ -136,7 +136,8 @@ export class StellarPaymentVerifier {
     txHash: string,
     challenge: X402Challenge,
     store: ChallengeStore,
-    requesterAuth?: { payerPublicKey?: string; signatureBase64: string; message: string }
+    requesterAuth?: { payerPublicKey?: string; signatureBase64: string; message: string },
+    allowGracePeriodMs: number = 0
   ): Promise<VerificationResult> {
     const cleanHash = txHash.trim().toLowerCase();
 
@@ -177,8 +178,8 @@ export class StellarPaymentVerifier {
       };
     }
 
-    // Strict Challenge Expiration Defense: reject if challenge is already expired before querying ledger
-    if (Date.now() > challenge.expiresAt) {
+    // Strict Challenge Expiration Defense: reject if challenge is already expired before querying ledger (respecting allowGracePeriodMs)
+    if (Date.now() > challenge.expiresAt + allowGracePeriodMs) {
       return {
         valid: false,
         reason: `Challenge '${challenge.challengeId}' has expired (expired at ${challenge.expiresAt}, current time ${Date.now()})`,
@@ -200,11 +201,11 @@ export class StellarPaymentVerifier {
 
     // 2. Branch A: Soroban Contract Verification
     if (challenge.contractId && this.sorobanServer) {
-      return this.verifySorobanTransactionAndReceipt(cleanHash, challenge, store, requesterAuth);
+      return this.verifySorobanTransactionAndReceipt(cleanHash, challenge, store, requesterAuth, allowGracePeriodMs);
     }
 
     // 3. Branch B: Classic Horizon Payment Verification
-    return this.verifyHorizonPayment(cleanHash, challenge, store, requesterAuth);
+    return this.verifyHorizonPayment(cleanHash, challenge, store, requesterAuth, allowGracePeriodMs);
   }
 
   /**
@@ -214,7 +215,8 @@ export class StellarPaymentVerifier {
     txHash: string,
     challenge: X402Challenge,
     store: ChallengeStore,
-    requesterAuth?: { payerPublicKey?: string; signatureBase64: string; message: string }
+    requesterAuth?: { payerPublicKey?: string; signatureBase64: string; message: string },
+    allowGracePeriodMs: number = 0
   ): Promise<VerificationResult> {
     const targetVault = this.pinnedVaultContractId || challenge.contractId;
     if (!this.sorobanServer || !targetVault) {
@@ -473,7 +475,7 @@ export class StellarPaymentVerifier {
           amount: challenge.amount,
           asset: challenge.asset,
           ledger: rawTx.ledger || rawTx.latestLedger,
-        });
+        }, allowGracePeriodMs);
       } catch (redeemErr: unknown) {
         const isBusy = (redeemErr as any)?.code === 'SQLITE_BUSY' ||
           (redeemErr instanceof Error && (redeemErr.message.includes('SQLITE_BUSY') || redeemErr.message.includes('database is locked')));
@@ -640,7 +642,8 @@ export class StellarPaymentVerifier {
     cleanHash: string,
     challenge: X402Challenge,
     store: ChallengeStore,
-    requesterAuth?: { payerPublicKey?: string; signatureBase64: string; message: string }
+    requesterAuth?: { payerPublicKey?: string; signatureBase64: string; message: string },
+    allowGracePeriodMs: number = 0
   ): Promise<VerificationResult> {
     try {
       const tx = await this.horizonServer.transactions().transaction(cleanHash).call();
@@ -785,7 +788,7 @@ export class StellarPaymentVerifier {
           amount: formattedPaid,
           asset: matchedAsset || challenge.asset,
           ledger: tx.ledger_attr,
-        });
+        }, allowGracePeriodMs);
       } catch (redeemErr: unknown) {
         const isBusy = (redeemErr as any)?.code === 'SQLITE_BUSY' ||
           (redeemErr instanceof Error && (redeemErr.message.includes('SQLITE_BUSY') || redeemErr.message.includes('database is locked')));
