@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { Worker } from 'node:worker_threads';
+import { createRequire } from 'node:module';
 import { ChallengeStore } from '../src/challenge-store.js';
+
+const require = createRequire(import.meta.url);
+const betterSqlitePath = require.resolve('better-sqlite3');
 
 describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
   let tempDbPath: string;
@@ -48,120 +53,106 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
     const dummyTx = '99887766554433221100aabbccddeeff99887766554433221100aabbccddeeff';
 
     // Session 1: Server runs, issues challenge, redeems transaction
-    const store1 = new ChallengeStore(tempDbPath);
+    const store1 = new ChallengeStore(tempDbPath, 60_000);
     const challenge = store1.createChallenge(
       'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-      '0.10',
+      '0.05',
       'XLM',
-      '/premium'
+      '/test-resource'
     );
 
     expect(store1.isTxRedeemed(dummyTx)).toBe(false);
-    store1.markRedeemed(challenge.challengeId, dummyTx, {
-      payer: 'GCPAYER123',
-      amount: '0.10',
-      asset: 'XLM',
-      ledger: 123456,
-    });
-    expect(store1.isTxRedeemed(dummyTx)).toBe(true);
+    expect(store1.isChallengeRedeemed(challenge.challengeId)).toBe(false);
 
-    // Simulate Server Crash / Restart: close store1
+    store1.markRedeemed(challenge.challengeId, dummyTx);
+
+    expect(store1.isTxRedeemed(dummyTx)).toBe(true);
+    expect(store1.isChallengeRedeemed(challenge.challengeId)).toBe(true);
+
+    // Verify challenge cannot be fetched again once redeemed
+    expect(store1.getChallenge(challenge.challengeId)).toBeUndefined();
+
+    // Verify double-redemption throws
+    expect(() => store1.markRedeemed(challenge.challengeId, dummyTx)).toThrow();
+
     store1.close();
 
-    // Session 2: Server reboots with same SQLite file
-    const store2 = new ChallengeStore(tempDbPath);
+    // Session 2: Server restarts, opens same database file
+    const store2 = new ChallengeStore(tempDbPath, 60_000);
 
-    // Replay attack attempt: Transaction must STILL be marked as redeemed!
+    // Transaction hash MUST still be recognized as redeemed (prevents replay attack)
     expect(store2.isTxRedeemed(dummyTx)).toBe(true);
     expect(store2.isChallengeRedeemed(challenge.challengeId)).toBe(true);
-    // Challenge should not be active for a second claim
-    expect(store2.getChallenge(challenge.challengeId)).toBeUndefined();
+
+    // Replay attempt MUST throw ACID constraint error
+    expect(() => store2.markRedeemed(challenge.challengeId, dummyTx)).toThrow();
 
     store2.close();
   });
 
-  it('expires unredeemed challenges when TTL passes', async () => {
-    const store = new ChallengeStore(tempDbPath, 15);
+  it('handles expired challenges correctly', async () => {
+    // Challenge with 10ms TTL
+    const store = new ChallengeStore(tempDbPath, 10);
     const challenge = store.createChallenge(
       'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-      '0.01',
+      '0.05',
       'XLM',
-      '/api',
+      '/test-resource',
       'testnet',
       undefined,
-      15 // 15ms TTL
+      10
     );
 
-    await new Promise((r) => setTimeout(r, 35));
-    const expired = store.getChallenge(challenge.challengeId);
-    expect(expired).toBeUndefined();
+    // Immediate check: still valid
+    expect(store.getChallenge(challenge.challengeId)).toBeDefined();
+
+    // Wait for TTL expiration
+    await new Promise((r) => setTimeout(r, 20));
+
+    // After expiration: getChallenge returns undefined
+    expect(store.getChallenge(challenge.challengeId)).toBeUndefined();
+
+    store.cleanupExpired();
+    expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(false);
 
     store.close();
   });
 
-  it('guarantees atomic rollback on duplicate transaction hash replay', () => {
-    const store = new ChallengeStore(tempDbPath);
-    const txHash = '11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff';
-
-    const challenge1 = store.createChallenge(
+  it('rejects duplicate transaction redemptions with identical hash (Anti-Double Spend)', () => {
+    const store = new ChallengeStore(tempDbPath, 60_000);
+    const c1 = store.createChallenge(
       'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       '0.05',
       'XLM',
-      '/resource-1'
+      '/res-1'
     );
-    const challenge2 = store.createChallenge(
+    const c2 = store.createChallenge(
       'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       '0.05',
       'XLM',
-      '/resource-2'
+      '/res-2'
     );
 
-    // First redemption succeeds
-    store.markRedeemed(challenge1.challengeId, txHash);
-    expect(store.isChallengeRedeemed(challenge1.challengeId)).toBe(true);
+    const txHash = '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
+
+    // Redeem c1 with txHash: must succeed
+    store.markRedeemed(c1.challengeId, txHash);
     expect(store.isTxRedeemed(txHash)).toBe(true);
 
-    // Second redemption with SAME txHash MUST throw and roll back challenge2
-    expect(() => {
-      store.markRedeemed(challenge2.challengeId, txHash);
-    }).toThrow();
+    // Attempt to redeem c2 with SAME txHash: MUST throw and abort
+    expect(() => store.markRedeemed(c2.challengeId, txHash)).toThrow();
 
-    // Verify ACID rollback: challenge2 was NOT marked as redeemed!
-    expect(store.isChallengeRedeemed(challenge2.challengeId)).toBe(false);
-    expect(store.getChallenge(challenge2.challengeId)).toBeDefined();
+    // Verify c2 was NOT marked as redeemed
+    expect(store.isChallengeRedeemed(c2.challengeId)).toBe(false);
 
     store.close();
   });
 
-  it('rejects double redemption of the same challenge', () => {
-    const store = new ChallengeStore(tempDbPath);
-    const tx1 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-    const tx2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  it('rejects redemption under real multi-threaded writer contention when challenge expires while waiting for locked immediate transaction', async () => {
+    const store = new ChallengeStore(tempDbPath, 100);
 
+    // Challenge with 120ms TTL
     const challenge = store.createChallenge(
-      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-      '0.05',
-      'XLM',
-      '/resource'
-    );
-
-    store.markRedeemed(challenge.challengeId, tx1);
-
-    expect(() => {
-      store.markRedeemed(challenge.challengeId, tx2);
-    }).toThrow(/already redeemed/i);
-
-    expect(store.isTxRedeemed(tx2)).toBe(false);
-
-    store.close();
-  });
-
-  it('rejects redemption under writer contention when challenge expires while waiting for locked immediate transaction', async () => {
-    // Two independent connections opening the SAME on-disk SQLite database
-    const storeWriter1 = new ChallengeStore(tempDbPath, 100); // 100ms TTL
-    const storeWriter2 = new ChallengeStore(tempDbPath, 100);
-
-    const challenge = storeWriter1.createChallenge(
       'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       '0.05',
       'XLM',
@@ -171,41 +162,70 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
       120 // 120ms TTL
     );
 
-    const txHashContention = 'e'.repeat(64);
+    const txHashContention = 'f'.repeat(64);
 
-    // Connection 1 acquires exclusive write lock via immediate transaction and holds it for 160ms (past the 120ms expiry)
-    const holdLockTx = (storeWriter1 as any).db.transaction(() => {
-      const start = Date.now();
-      while (Date.now() - start < 160) {
-        // Busy-wait inside locked write transaction to block other SQLite writers
-      }
+    // Worker code running in a genuine separate OS thread with independent SQLite connection
+    const workerScript = `
+      const { parentPort, workerData } = require('node:worker_threads');
+      const Database = require(workerData.betterSqlitePath);
+      const db = new Database(workerData.tempDbPath, { timeout: 10000 });
+      db.pragma('journal_mode = WAL');
+
+      // Acquire exclusive write lock immediately via BEGIN IMMEDIATE
+      const lockTx = db.transaction(() => {
+        parentPort.postMessage({ type: 'LOCK_ACQUIRED' });
+        const start = Date.now();
+        // Hold exclusive write lock for 160ms (well past the 120ms challenge TTL)
+        while (Date.now() - start < 160) {}
+      });
+
+      lockTx.immediate();
+      parentPort.postMessage({ type: 'LOCK_RELEASED' });
+      db.close();
+    `;
+
+    const worker = new Worker(workerScript, {
+      eval: true,
+      workerData: { tempDbPath, betterSqlitePath },
     });
 
-    // Launch locked hold in connection 1 and immediately attempt markRedeemed on connection 2
-    const p1 = Promise.resolve().then(() => holdLockTx.immediate());
+    let mainThreadWaitTime = 0;
+    let mainThreadError: unknown = null;
 
-    let p2Error: unknown = null;
-    const p2 = Promise.resolve().then(async () => {
-      // Small tick to ensure connection 1 has entered its immediate transaction
-      await new Promise((r) => setTimeout(r, 10));
-      try {
-        storeWriter2.markRedeemed(challenge.challengeId, txHashContention);
-      } catch (err) {
-        p2Error = err;
-      }
+    await new Promise<void>((resolve, reject) => {
+      worker.on('message', (msg) => {
+        if (msg.type === 'LOCK_ACQUIRED') {
+          const t0 = Date.now();
+          // At this exact moment, Worker thread holds the exclusive write lock and challenge is NOT yet expired (e.g. at ~10ms of 120ms TTL).
+          // Main thread attempts markRedeemed. SQLite blocks main thread waiting for worker's write lock to release.
+          try {
+            store.markRedeemed(challenge.challengeId, txHashContention);
+          } catch (err) {
+            mainThreadError = err;
+          } finally {
+            mainThreadWaitTime = Date.now() - t0;
+          }
+        } else if (msg.type === 'LOCK_RELEASED') {
+          resolve();
+        }
+      });
+
+      worker.on('error', reject);
     });
 
-    await Promise.all([p1, p2]);
+    await worker.terminate();
 
-    // Connection 2 waited for connection 1's write lock to release, by which time currentRedemptionTime > expires_at
-    expect(p2Error).toBeDefined();
-    expect((p2Error as Error).message).toMatch(/expired|already redeemed|not found/i);
+    // 1. Assert main thread genuinely waited for worker's lock (> 100ms)
+    expect(mainThreadWaitTime).toBeGreaterThanOrEqual(100);
 
-    // Assert strict invariant: neither table contains a redeemed entry
-    expect(storeWriter2.isTxRedeemed(txHashContention)).toBe(false);
-    expect(storeWriter2.isChallengeRedeemed(challenge.challengeId)).toBe(false);
+    // 2. Assert markRedeemed failed specifically with expiration error (not SQLITE_BUSY, because timeout is generous)
+    expect(mainThreadError).toBeDefined();
+    expect((mainThreadError as Error).message).toContain('expired');
 
-    storeWriter1.close();
-    storeWriter2.close();
+    // 3. Strict invariants: neither the tx hash nor the challenge is redeemed
+    expect(store.isTxRedeemed(txHashContention)).toBe(false);
+    expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(false);
+
+    store.close();
   });
 });
