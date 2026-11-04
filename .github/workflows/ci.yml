@@ -84,6 +84,55 @@ jobs:
           # Clean up tables to prepare realistic legacy migration suite
           psql -X -v ON_ERROR_STOP=1 -c "DROP TABLE IF EXISTS redeemed_transactions CASCADE; DROP TABLE IF EXISTS challenges CASCADE; DROP TABLE IF EXISTS migration_audit_log CASCADE;"
 
+          # 1b. DEDICATED ISOLATED INCOMPLETE BROWNFIELD TEST: Table exists with missing pre_paid_amount_stroops column
+          # Rigorously isolates the Council counterexample in its own clean database run.
+          # Proves that migration evolves table without 42703 (undefined_column) when pre_paid_amount_stroops is completely absent!
+          psql -X -v ON_ERROR_STOP=1 << 'EOF'
+            CREATE TABLE migration_audit_log (
+              id BIGSERIAL PRIMARY KEY,
+              challenge_id TEXT NOT NULL,
+              migration_step TEXT NOT NULL,
+              pre_status TEXT,
+              pre_amount_stroops NUMERIC(38, 2),
+              sanitization_reason TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+            );
+            INSERT INTO migration_audit_log (
+              challenge_id, migration_step, pre_status, pre_amount_stroops, sanitization_reason
+            ) VALUES (
+              'ch_isolated_missing_col_audit', 'ISOLATED_MISSING_COL_STEP', 'PENDING', 777.50, 'LEGACY_MISSING_COL_RECORD'
+            );
+          EOF
+
+          # Run migration on isolated missing column table
+          psql -X -v ON_ERROR_STOP=1 -f packages/gateway/migrations/001_initial.sql
+
+          # Verify isolated missing column table was successfully evolved without error
+          psql -X -v ON_ERROR_STOP=1 << 'EOF'
+            DO $$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1 FROM migration_audit_log
+                WHERE challenge_id = 'ch_isolated_missing_col_audit'
+                  AND pre_amount_stroops_raw = '777.50'
+                  AND pre_paid_amount_stroops_raw IS NULL
+              ) THEN
+                RAISE EXCEPTION 'Assertion failed: ch_isolated_missing_col_audit raw values not preserved';
+              END IF;
+              IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'migration_audit_log' AND column_name = 'pre_paid_amount_stroops'
+                  AND numeric_precision = 40 AND numeric_scale = 0
+              ) THEN
+                RAISE EXCEPTION 'Assertion failed: pre_paid_amount_stroops column not created on isolated missing column test';
+              END IF;
+            END;
+            $$;
+          EOF
+
+          # Clean up tables to prepare realistic legacy migration suite
+          psql -X -v ON_ERROR_STOP=1 -c "DROP TABLE IF EXISTS redeemed_transactions CASCADE; DROP TABLE IF EXISTS challenges CASCADE; DROP TABLE IF EXISTS migration_audit_log CASCADE;"
+
           # 2. Setup realistic legacy test fixtures with real multi-row data across all edge cases:
           # - Legacy column 'challenge_id' (before rename to id)
           # - Legacy composite CHECK constraint covering status AND amount_stroops
@@ -107,29 +156,22 @@ jobs:
           # - Protected partial unique index (WHERE (bound_tx_hash IS NOT NULL))
           # - Protected specialized text_pattern_ops index
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
-            -- Pre-existing brownfield migration_audit_log table: incomplete schema testing & coexistence of dual scenarios
-            -- Scenario 1: Pre-existing table initially exists with ONLY pre_amount_stroops NUMERIC(38,2) (pre_paid_amount_stroops column missing!)
-            -- Demonstrates that DDL ADD COLUMN runs before DML UPDATE, preventing undefined_column error 42703!
+            -- Pre-existing brownfield migration_audit_log table: fractional scale evolution testing
+            -- Demonstrates that verbatim raw text is captured BEFORE altering types to NUMERIC(40,0) without rounding!
             CREATE TABLE migration_audit_log (
               id BIGSERIAL PRIMARY KEY,
               challenge_id TEXT NOT NULL,
               migration_step TEXT NOT NULL,
               pre_status TEXT,
               pre_amount_stroops NUMERIC(38, 2),
+              pre_paid_amount_stroops NUMERIC(38, 2),
               sanitization_reason TEXT NOT NULL,
               created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
             );
             INSERT INTO migration_audit_log (
-              challenge_id, migration_step, pre_status, pre_amount_stroops, sanitization_reason
-            ) VALUES (
-              'ch_pre_existing_legacy_audit_1', 'BROWNFIELD_PRE_MIGRATION_1', 'PENDING', 1000.75, 'PRE_EXISTING_BROWNFIELD_RECORD_1'
-            );
-            -- Scenario 2: Brownfield evolution with pre_paid_amount_stroops added with scale before migration
-            ALTER TABLE migration_audit_log ADD COLUMN pre_paid_amount_stroops NUMERIC(38, 2);
-            INSERT INTO migration_audit_log (
               challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, sanitization_reason
             ) VALUES (
-              'ch_pre_existing_legacy_audit_2', 'BROWNFIELD_PRE_MIGRATION_2', 'REDEEMED', 2000.50, 500.25, 'PRE_EXISTING_BROWNFIELD_RECORD_2'
+              'ch_pre_existing_legacy_audit', 'BROWNFIELD_PRE_MIGRATION', 'PENDING', 1000.75, 500.25, 'PRE_EXISTING_BROWNFIELD_RECORD'
             );
 
             CREATE TABLE challenges (
@@ -840,26 +882,16 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: INITIAL_PRE_MIGRATION_SNAPSHOT raw text values missing for ch_legacy_seed_15', step_name;
               END IF;
 
-              -- 1c. Verify pre-existing brownfield migration_audit_log records preserved and schema evolved (harmonized from NUMERIC(38,2) to NUMERIC(40,0))
-              -- Asserts that raw columns captured exact fractional values BEFORE altering types across both cases (record 1 with missing pre_paid, record 2 with both populated)
+              -- 1c. Verify pre-existing brownfield migration_audit_log record preserved and schema evolved (harmonized from NUMERIC(38,2) to NUMERIC(40,0))
+              -- Asserts that raw columns captured exact fractional values BEFORE altering types, and both columns were widened to NUMERIC(40,0)
               IF NOT EXISTS (
                 SELECT 1 FROM migration_audit_log
-                WHERE challenge_id = 'ch_pre_existing_legacy_audit_1'
-                  AND migration_step = 'BROWNFIELD_PRE_MIGRATION_1'
+                WHERE challenge_id = 'ch_pre_existing_legacy_audit'
+                  AND migration_step = 'BROWNFIELD_PRE_MIGRATION'
                   AND pre_amount_stroops_raw = '1000.75'
-                  AND pre_paid_amount_stroops_raw IS NULL
-              ) THEN
-                RAISE EXCEPTION '[%] Assertion failed: pre-existing brownfield audit record 1 raw values not preserved before type alteration', step_name;
-              END IF;
-
-              IF NOT EXISTS (
-                SELECT 1 FROM migration_audit_log
-                WHERE challenge_id = 'ch_pre_existing_legacy_audit_2'
-                  AND migration_step = 'BROWNFIELD_PRE_MIGRATION_2'
-                  AND pre_amount_stroops_raw = '2000.50'
                   AND pre_paid_amount_stroops_raw = '500.25'
               ) THEN
-                RAISE EXCEPTION '[%] Assertion failed: pre-existing brownfield audit record 2 raw values not preserved before type alteration', step_name;
+                RAISE EXCEPTION '[%] Assertion failed: pre-existing brownfield audit record raw values not preserved before type alteration', step_name;
               END IF;
 
               -- Verify precision was widened to NUMERIC(40,0) for both pre_amount_stroops and pre_paid_amount_stroops in information_schema

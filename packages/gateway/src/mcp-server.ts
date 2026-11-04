@@ -79,6 +79,23 @@ export class StellarPaidMcpServer {
           );
         }
 
+        // Strict resource binding: prevent cross-tool challenge reuse (e.g. paying for cheap tool and invoking expensive tool)
+        const expectedResource = mcp://;
+        if (challenge.resource !== expectedResource) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            x402 Challenge resource mismatch: challenge was issued for '', but invoked for ''. Cross-tool challenge reuse is strictly prohibited.
+          );
+        }
+
+        // Strict pricing binding: verify challenge amount and asset match currently requested tool pricing
+        if (challenge.amount !== tool.pricing.amount || challenge.asset !== tool.pricing.asset) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            x402 Challenge pricing mismatch: challenge amount/asset ( ) does not match required tool pricing ( ).
+          );
+        }
+
         const verification = await this.verifier.verifyPayment(txHash, challenge, this.store);
         if (!verification.valid) {
           throw new McpError(
