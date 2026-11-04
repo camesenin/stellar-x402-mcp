@@ -225,7 +225,7 @@ export class BudgetManager {
     const res = this.reservations.get(reservationId);
     if (!res) return;
 
-    if (txHash) res.txHash = txHash;
+    if (txHash && !res.txHash) res.txHash = txHash;
     if (destination) res.destination = destination;
     res.broadcastAtSec = broadcastAtSec ?? res.broadcastAtSec ?? Math.floor(this.clock() / 1000);
 
@@ -356,12 +356,9 @@ export class BudgetManager {
 
     if (status === 'SUCCESS') {
       // Re-use finalize logic to ensure strict deduplication by txHash and atomic bookkeeping
-      if (res.txHash && res.destination) {
-        this.finalize(reservationId, res.destination, res.txHash, stroopsToXlmNumber(res.amountStroops));
-      } else {
-        this.totalSettledStroops += res.amountStroops;
-        this.reservations.delete(reservationId);
-      }
+      const targetHash = res.txHash || reservationId;
+      const targetDest = res.destination || 'UNKNOWN';
+      this.finalize(reservationId, targetDest, targetHash, stroopsToXlmNumber(res.amountStroops));
       return;
     }
 

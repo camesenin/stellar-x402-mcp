@@ -270,71 +270,57 @@ export class StellarPayer {
     // Cryptographic identity and bounds extracted locally prior to broadcast:
     const localTxHash = (prepared as any).hash().toString('hex');
     const signedMaxTimeSec = (prepared as any).timeBounds?.maxTime ? Number((prepared as any).timeBounds.maxTime) : Math.floor(Date.now() / 1000) + 60;
-
-    // Submit transaction to Soroban RPC
-    let sendRes: any;
-    try {
-      sendRes = await this.sorobanServer.sendTransaction(prepared);
-    } catch (netErr: any) {
-      const broadcastErr: any = new Error('Soroban transport error');
-      broadcastErr.txHash = localTxHash;
-      broadcastErr.maxTime = signedMaxTimeSec;
-      throw broadcastErr;
-    }
-
-    if (sendRes.status === 'ERROR') {
-      const subErr: any = new Error(
-        'Soroban transaction submission failed'
-      );
-      subErr.txHash = localTxHash;
-      subErr.maxTime = signedMaxTimeSec;
-      throw subErr;
-    }
-
-    if (sendRes.hash && sendRes.hash.toLowerCase() !== localTxHash.toLowerCase()) {
-      const mismatchErr: any = new Error('RPC returned mismatched transaction hash');
-      mismatchErr.txHash = localTxHash;
-      mismatchErr.maxTime = signedMaxTimeSec;
-      throw mismatchErr;
-    }
-    const txHash = localTxHash;
-
-    // Poll for ledger inclusion safely using standard JSON-RPC 2.0 (protocol-version agnostic)
-    let status: string = sendRes.status;
     let ledger: number | undefined;
-    const maxPollAttempts = 30;
 
-    for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
-      await new Promise((r) => setTimeout(r, 1000));
+    // Submit transaction to Soroban RPC with comprehensive post-broadcast error enrichment
+    try {
+      const sendRes = await this.sorobanServer.sendTransaction(prepared);
 
-      try {
-        const rawTx = await fetchSorobanTxJsonRpc(this.sorobanRpcUrl, txHash);
-        if (rawTx) {
-          status = rawTx.status;
-          ledger = rawTx.ledger || rawTx.latestLedger;
-          if (status === 'SUCCESS') {
-            break;
-          }
-          if (status === 'FAILED') {
-            const failErr: any = new Error('Soroban settlement transaction failed on-chain');
-            failErr.txHash = txHash;
-            failErr.maxTime = signedMaxTimeSec;
-            throw failErr;
-          }
-        }
-      } catch (pollErr: any) {
-        if (pollErr.message?.includes('failed on-chain')) throw pollErr;
+      if (sendRes?.status === 'ERROR') {
+        throw new Error('Soroban transaction submission failed');
       }
-    }
 
-    if (status !== 'SUCCESS') {
-      const timeoutErr: any = new Error('Soroban transaction timed out waiting for inclusion');
-      timeoutErr.txHash = txHash;
-      timeoutErr.maxTime = signedMaxTimeSec;
-      throw timeoutErr;
+      const returnedHash = typeof sendRes?.hash === 'string' ? sendRes.hash : undefined;
+      if (returnedHash && returnedHash.toLowerCase() !== localTxHash.toLowerCase()) {
+        throw new Error('RPC returned mismatched transaction hash');
+      }
+      const txHash = localTxHash;
+
+      // Poll for ledger inclusion safely using standard JSON-RPC 2.0 (protocol-version agnostic)
+      let status: string = sendRes?.status;
+      let ledger: number | undefined;
+      const maxPollAttempts = 30;
+
+      for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
+        await new Promise((r) => setTimeout(r, 1000));
+
+        try {
+          const rawTx = await fetchSorobanTxJsonRpc(this.sorobanRpcUrl, txHash);
+          if (rawTx) {
+            status = rawTx.status;
+            ledger = rawTx.ledger || rawTx.latestLedger;
+            if (status === 'SUCCESS') {
+              break;
+            }
+            if (status === 'FAILED') {
+              throw new Error('Soroban settlement transaction failed on-chain');
+            }
+          }
+        } catch (pollErr: any) {
+          if (pollErr.message?.includes('failed on-chain')) throw pollErr;
+        }
+      }
+
+      if (status !== 'SUCCESS') {
+        throw new Error('Soroban transaction timed out waiting for inclusion');
+      }
+    } catch (postBroadcastErr: any) {
+      if (!postBroadcastErr.txHash) postBroadcastErr.txHash = localTxHash;
+      if (!postBroadcastErr.maxTime) postBroadcastErr.maxTime = signedMaxTimeSec;
+      throw postBroadcastErr;
     }
     return {
-      txHash,
+      txHash: localTxHash,
       challengeId: challenge.challengeId,
       destination: challenge.destination,
       amount: challenge.amount,
@@ -390,18 +376,14 @@ export class StellarPayer {
     let result: any;
     try {
       result = await this.horizonServer.submitTransaction(transaction);
+      const returnedHash = typeof result?.hash === 'string' ? result.hash : undefined;
+      if (returnedHash && returnedHash.toLowerCase() !== localTxHash.toLowerCase()) {
+        throw new Error('Horizon returned mismatched transaction hash');
+      }
     } catch (submitErr: any) {
-      const wrappedErr: any = new Error('Classic payment submission error');
-      wrappedErr.txHash = localTxHash;
-      wrappedErr.maxTime = signedMaxTimeSec;
-      throw wrappedErr;
-    }
-
-    if (result.hash && result.hash.toLowerCase() !== localTxHash.toLowerCase()) {
-      const mismatchErr: any = new Error('Horizon returned mismatched transaction hash');
-      mismatchErr.txHash = localTxHash;
-      mismatchErr.maxTime = signedMaxTimeSec;
-      throw mismatchErr;
+      if (!submitErr.txHash) submitErr.txHash = localTxHash;
+      if (!submitErr.maxTime) submitErr.maxTime = signedMaxTimeSec;
+      throw submitErr;
     }
 
     return {

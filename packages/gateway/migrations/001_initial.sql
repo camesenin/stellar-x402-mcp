@@ -35,6 +35,13 @@ CREATE TABLE IF NOT EXISTS challenges (
 );
 
 -- Evolutionary schema migration support for existing deployments
+ALTER TABLE IF EXISTS challenges ALTER COLUMN destination SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN amount_stroops SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN asset SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN resource SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN network SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN created_at SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN expires_at SET NOT NULL;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS created_ledger BIGINT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS min_valid_ledger BIGINT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS max_valid_ledger BIGINT;
@@ -91,6 +98,9 @@ BEGIN
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_version') THEN
     ALTER TABLE challenges ADD CONSTRAINT chk_challenge_version CHECK (version >= 1);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'uq_challenges_bound_tx_hash') THEN
+    ALTER TABLE challenges ADD CONSTRAINT uq_challenges_bound_tx_hash UNIQUE (bound_tx_hash);
   END IF;
 END $do$;
 

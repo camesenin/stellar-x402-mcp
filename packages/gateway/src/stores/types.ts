@@ -63,6 +63,8 @@ export interface IChallengeStore {
       amount?: string;
       asset?: string;
       ledger?: number;
+      expectedVersion?: number;
+      expectedStatus?: ChallengeStatus;
       leaseGeneration?: number;
       leaseOwner?: string;
     }
