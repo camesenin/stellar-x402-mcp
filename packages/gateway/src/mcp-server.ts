@@ -50,6 +50,10 @@ export class StellarPaidMcpServer {
               type: 'string',
               description: 'Active challenge ID being settled',
             },
+            _x402_payer_signature: {
+              type: 'string',
+              description: 'Cryptographic signature from payer keypair binding challengeId and txHash for anti front-running',
+            },
           },
           required: ((tool.inputSchema.required as string[]) || []),
         },
@@ -68,6 +72,7 @@ export class StellarPaidMcpServer {
       const args = (request.params.arguments || {}) as Record<string, unknown>;
       const txHash = (args._x402_tx_hash as string)?.trim();
       const challengeId = (args._x402_challenge_id as string)?.trim();
+      const payerSignature = (args._x402_payer_signature as string)?.trim();
 
       // Check if payment was provided
       if (txHash && challengeId) {
@@ -96,7 +101,23 @@ export class StellarPaidMcpServer {
           );
         }
 
-        const verification = await this.verifier.verifyPayment(txHash, challenge, this.store);
+        // Requester binding defense (anti front-running)
+        if (this.config.requireRequesterAuth && !payerSignature) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            'Requester Signature Required: This gateway requires _x402_payer_signature binding challengeId and txHash.'
+          );
+        }
+
+        const gatewayResource = `mcp://${request.params.name}`;
+        const cleanHash = txHash.trim().toLowerCase();
+        const domainMessage = `stellar-x402:v1:${this.verifier.getNetworkPassphrase()}:${gatewayResource}:${challengeId}:${cleanHash}:${challenge.expiresAt}`;
+
+        const requesterAuth = payerSignature
+          ? { message: domainMessage, signatureBase64: payerSignature }
+          : undefined;
+
+        const verification = await this.verifier.verifyPayment(txHash, challenge, this.store, requesterAuth);
         if (!verification.valid) {
           throw new McpError(
             ErrorCode.InvalidRequest,
@@ -108,6 +129,7 @@ export class StellarPaidMcpServer {
         const cleanArgs = { ...args };
         delete cleanArgs._x402_tx_hash;
         delete cleanArgs._x402_challenge_id;
+        delete cleanArgs._x402_payer_signature;
 
         const result = await tool.handler(cleanArgs, verification);
         return {

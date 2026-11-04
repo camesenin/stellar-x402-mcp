@@ -180,7 +180,7 @@ export class StellarPaymentVerifier {
     }
 
     // 3. Branch B: Classic Horizon Payment Verification
-    return this.verifyHorizonPayment(cleanHash, challenge, store);
+    return this.verifyHorizonPayment(cleanHash, challenge, store, requesterAuth);
   }
 
   /**
@@ -593,7 +593,8 @@ export class StellarPaymentVerifier {
   private async verifyHorizonPayment(
     cleanHash: string,
     challenge: X402Challenge,
-    store: ChallengeStore
+    store: ChallengeStore,
+    requesterAuth?: { payerPublicKey?: string; signatureBase64: string; message: string }
   ): Promise<VerificationResult> {
     try {
       const tx = await this.horizonServer.transactions().transaction(cleanHash).call();
@@ -679,6 +680,39 @@ export class StellarPaymentVerifier {
           reason: `Payment requirements not met. Found ${formattedPaid} ${matchedAsset || challenge.asset}, required >= ${challenge.amount} ${challenge.asset} to ${challenge.destination}`,
           txHash: cleanHash,
         };
+      }
+
+      // Requester Binding Defense: If signature proof is present, ensure caller owns payer keypair
+      if (requesterAuth) {
+        if (!payerAddress.startsWith('G')) {
+          return {
+            valid: false,
+            reason: `Direct cryptographic signature verification requires standard ed25519 agent keypair (G...); received ${payerAddress}`,
+            txHash: cleanHash,
+          };
+        }
+
+        try {
+          const { Keypair } = await import('@stellar/stellar-sdk');
+          const payerKp = Keypair.fromPublicKey(payerAddress);
+          const isValidSig = payerKp.verify(
+            Buffer.from(requesterAuth.message, 'utf-8'),
+            Buffer.from(requesterAuth.signatureBase64, 'base64')
+          );
+          if (!isValidSig) {
+            return {
+              valid: false,
+              reason: 'Requester authentication failed: Domain-separated signature does not match on-chain payer keypair',
+              txHash: cleanHash,
+            };
+          }
+        } catch (sigErr) {
+          return {
+            valid: false,
+            reason: `Requester signature validation error: ${sigErr}`,
+            txHash: cleanHash,
+          };
+        }
       }
 
       // Mark as redeemed in SQLite
