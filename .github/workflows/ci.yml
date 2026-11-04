@@ -82,7 +82,7 @@ jobs:
           # 1. Clean Database Migration Test (Brand new deployment)
           psql -X -v ON_ERROR_STOP=1 -f packages/gateway/migrations/001_initial.sql
           # Clean up tables to prepare realistic legacy migration suite
-          psql -X -v ON_ERROR_STOP=1 -c "DROP TABLE IF EXISTS redeemed_transactions CASCADE; DROP TABLE IF EXISTS challenges CASCADE;"
+          psql -X -v ON_ERROR_STOP=1 -c "DROP TABLE IF EXISTS redeemed_transactions CASCADE; DROP TABLE IF EXISTS challenges CASCADE; DROP TABLE IF EXISTS migration_audit_log CASCADE;"
 
           # 2. Setup realistic legacy test fixtures with real multi-row data across all edge cases:
           # - Legacy column 'challenge_id' (before rename to id)
@@ -129,7 +129,7 @@ jobs:
               challenge_id TEXT PRIMARY KEY,
               destination TEXT NOT NULL,
               amount TEXT,
-              amount_stroops NUMERIC(40, 0) NOT NULL,
+              amount_stroops NUMERIC NOT NULL,
               asset TEXT NOT NULL,
               memo TEXT NOT NULL,
               network TEXT NOT NULL,
@@ -137,7 +137,7 @@ jobs:
               expires_at BIGINT NOT NULL,
               created_at BIGINT NOT NULL,
               bound_tx_hash TEXT,
-              paid_amount_stroops NUMERIC(40, 0),
+              paid_amount_stroops NUMERIC,
               redeemed_at BIGINT,
               is_redeemed INTEGER NOT NULL DEFAULT 0,
               CONSTRAINT chk_legacy_composite CHECK (status IN ('PENDING', 'REDEEMED', 'INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE')),
@@ -444,16 +444,17 @@ jobs:
               1
             );
 
-            -- Row 16: ULTRA-WIDE NUMERIC / FRACTIONAL TEST: amount_stroops is a 42-digit integer exceeding NUMERIC(40,0)
+            -- Row 16: ULTRA-WIDE NUMERIC TEST: amount_stroops and paid_amount_stroops are 42-digit integers exceeding NUMERIC(40,0) and i128::MAX
             -- Verifies that raw string capturing succeeds unconditionally without numeric overflow abort,
-            -- and safe numeric cast produces NULL in numeric column while preserving exact 42-digit raw text!
+            -- safe numeric cast produces NULL in audit log numeric column while preserving exact 42-digit raw text,
+            -- and row is safely quarantined without numeric overflow abort!
             INSERT INTO challenges (
-              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, paid_amount_stroops, redeemed_at, is_redeemed
             ) VALUES (
               'ch_legacy_seed_16',
               'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
-              '100000000000000000000000000000000000000000',
-              0,
+              NULL,
+              100000000000000000000000000000000000000000,
               'XLM',
               'memo_seed_16',
               'testnet',
@@ -461,7 +462,31 @@ jobs:
               1793815821820,
               1793815521820,
               'tx_ultra_wide_hash_16',
-              0
+              100000000000000000000000000000000000000000,
+              1793815621820,
+              1
+            );
+
+            -- Row 17: FRACTIONAL STROOPS SANITIZATION TEST: operational row with fractional stroops in both columns (e.g. 1.4 stroops)
+            -- Demonstrates Council requirement: fractional stroops are never silently rounded by ALTER TABLE TYPE NUMERIC(40,0);
+            -- they are detected, evidenced in migration_audit_log, and quarantined to RECONCILIATION_REQUIRED with exact raw text preserved!
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, paid_amount_stroops, redeemed_at, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_17',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              NULL,
+              1.4,
+              'XLM',
+              'memo_seed_17',
+              'testnet',
+              'REDEEMED',
+              1793815821820,
+              1793815521820,
+              'tx_fractional_hash_17',
+              1.4,
+              1793815621820,
+              1
             );
 
             -- 1. Duplicate btree index on bound_tx_hash to be purged
@@ -515,6 +540,8 @@ jobs:
               rec13 RECORD;
               rec14 RECORD;
               rec15 RECORD;
+              rec16 RECORD;
+              rec17 RECORD;
               v_audit_count BIGINT;
               v_is_nullable TEXT;
               v_indnullsnotdistinct BOOLEAN;
@@ -692,7 +719,7 @@ jobs:
               -- 1. Individual snapshot verification: verify EXACTLY one snapshot exists for every challenge seed (1 through 16)
               FOR r IN (
                 SELECT 'ch_legacy_seed_' || s::text AS ch_id
-                FROM generate_series(1, 16) s
+                FROM generate_series(1, 17) s
               ) LOOP
                 SELECT count(*) INTO v_audit_count 
                 FROM migration_audit_log 
@@ -724,15 +751,39 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: pre-existing brownfield audit record lost during migration', step_name;
               END IF;
 
-              -- 1d. Verify ultra-wide 42-digit challenge Row 16 raw preservation in snapshot without numeric overflow
+              -- 1d. Verify ultra-wide 42-digit challenge Row 16 raw preservation in snapshot and audit log
+              -- Must verify that pre_amount_stroops_raw and pre_paid_amount_stroops_raw capture the exact 42-digit string,
+              -- and that numeric columns in migration_audit_log are safely NULL to avoid NUMERIC(40,0) field overflow!
               IF NOT EXISTS (
                 SELECT 1 FROM migration_audit_log 
                 WHERE challenge_id = 'ch_legacy_seed_16' 
                   AND migration_step = 'INITIAL_PRE_MIGRATION_SNAPSHOT'
-                  AND pre_amount_text = '100000000000000000000000000000000000000000'
-                  AND pre_amount_stroops_raw = '0'
+                  AND pre_amount_stroops_raw = '100000000000000000000000000000000000000000'
+                  AND pre_paid_amount_stroops_raw = '100000000000000000000000000000000000000000'
+                  AND pre_amount_stroops IS NULL
+                  AND pre_paid_amount_stroops IS NULL
               ) THEN
-                RAISE EXCEPTION '[%] Assertion failed: INITIAL_PRE_MIGRATION_SNAPSHOT raw text values missing for ch_legacy_seed_16', step_name;
+                RAISE EXCEPTION '[%] Assertion failed: INITIAL_PRE_MIGRATION_SNAPSHOT ultra-wide 42-digit assertions failed for ch_legacy_seed_16', step_name;
+              END IF;
+
+              -- 1e. Verify fractional stroops quarantine and exact raw evidence for Row 17
+              IF NOT EXISTS (
+                SELECT 1 FROM migration_audit_log
+                WHERE challenge_id = 'ch_legacy_seed_17' 
+                  AND migration_step = 'FRACTIONAL_STROOPS_QUARANTINE'
+                  AND pre_amount_stroops_raw = '1.4'
+                  AND pre_paid_amount_stroops_raw = '1.4'
+                  AND sanitization_reason = 'FRACTIONAL_STROOPS_DETECTED'
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: FRACTIONAL_STROOPS_QUARANTINE audit log entry missing for ch_legacy_seed_17', step_name;
+              END IF;
+
+              SELECT * INTO rec17 FROM challenges WHERE id = 'ch_legacy_seed_17';
+              IF rec17.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_17 not quarantined to RECONCILIATION_REQUIRED (got %)', step_name, rec17.status;
+              END IF;
+              IF rec17.amount_stroops IS NOT NULL OR rec17.paid_amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_17 fractional stroops were not normalized to NULL (got amount=%, paid=%)', step_name, rec17.amount_stroops, rec17.paid_amount_stroops;
               END IF;
 
               -- 2. Exact evidence for underpaid operational row (ch_legacy_seed_10)

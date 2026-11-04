@@ -354,6 +354,45 @@ BEGIN
   WHERE paid_amount_stroops IS NOT NULL 
     AND (paid_amount_stroops = 'NaN'::numeric OR paid_amount_stroops <= 0);
 
+  -- B2. Fractional Stroops Quarantine: detect non-integer fractional amounts in amount_stroops or paid_amount_stroops
+  -- Stroops in Stellar are strictly discrete integer units. If an unconstrained brownfield column contains fractional stroops (e.g. 1.4),
+  -- converting directly with ALTER COLUMN TYPE NUMERIC(40,0) would silently round monetary balances!
+  -- Instead, detect non-integer values (value != trunc(value)), capture exact raw evidence, and quarantine to RECONCILIATION_REQUIRED.
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
+  SELECT id, 'FRACTIONAL_STROOPS_QUARANTINE', status,
+    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'FRACTIONAL_STROOPS_DETECTED'
+  FROM challenges
+  WHERE (
+    (amount_stroops IS NOT NULL AND amount_stroops != 'NaN'::numeric AND amount_stroops != trunc(amount_stroops))
+    OR
+    (paid_amount_stroops IS NOT NULL AND paid_amount_stroops != 'NaN'::numeric AND paid_amount_stroops != trunc(paid_amount_stroops))
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM migration_audit_log mal 
+    WHERE mal.challenge_id = challenges.id AND mal.migration_step = 'FRACTIONAL_STROOPS_QUARANTINE'
+  );
+
+  UPDATE challenges
+  SET amount_stroops = CASE 
+        WHEN amount_stroops IS NOT NULL AND amount_stroops != 'NaN'::numeric AND amount_stroops != trunc(amount_stroops) THEN NULL 
+        ELSE amount_stroops 
+      END,
+      paid_amount_stroops = CASE 
+        WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops != 'NaN'::numeric AND paid_amount_stroops != trunc(paid_amount_stroops) THEN NULL 
+        ELSE paid_amount_stroops 
+      END,
+      status = CASE 
+        WHEN status IN ('PERMANENT_QUARANTINE', 'INCONCLUSIVE_MANUAL_REVIEW') THEN status 
+        ELSE 'RECONCILIATION_REQUIRED' 
+      END
+  WHERE (
+    (amount_stroops IS NOT NULL AND amount_stroops != 'NaN'::numeric AND amount_stroops != trunc(amount_stroops))
+    OR
+    (paid_amount_stroops IS NOT NULL AND paid_amount_stroops != 'NaN'::numeric AND paid_amount_stroops != trunc(paid_amount_stroops))
+  );
+
   -- C. Handle legacy amounts exceeding i128::MAX (170141183460469231731687303715884105727):
   -- 1. If paid_amount_stroops > i128::MAX:
   -- Record evidence. Normalize paid_amount_stroops to NULL.
