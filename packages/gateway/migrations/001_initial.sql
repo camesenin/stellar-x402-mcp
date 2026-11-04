@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS challenges (
   redeemed_ledger BIGINT CHECK (redeemed_ledger IS NULL OR redeemed_ledger >= 0),
   min_valid_ledger BIGINT CHECK (min_valid_ledger IS NULL OR min_valid_ledger >= 0),
   max_valid_ledger BIGINT CHECK (max_valid_ledger IS NULL OR (max_valid_ledger >= 0 AND (min_valid_ledger IS NULL OR max_valid_ledger >= min_valid_ledger))),
+  envelope_xdr TEXT,
   lease_owner TEXT,
   lease_expires_at TIMESTAMPTZ,
   lease_generation BIGINT NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
