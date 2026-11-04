@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS challenges (
   beneficiary TEXT,
   status TEXT NOT NULL DEFAULT 'PENDING',
   created_at TIMESTAMPTZ NOT NULL,
+  created_ledger BIGINT,
   expires_at TIMESTAMPTZ NOT NULL,
   bound_tx_hash TEXT UNIQUE,
   redeemed_at TIMESTAMPTZ,

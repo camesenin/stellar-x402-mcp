@@ -3,10 +3,26 @@ import { X402Challenge, VerificationResult } from '../types.js';
 export type ChallengeStatus =
   | 'PENDING'
   | 'RECONCILIATION_REQUIRED'
+  | 'INCONCLUSIVE_MANUAL_REVIEW'
   | 'CONFIRMED'
   | 'REDEEMED'
   | 'CANCELLED'
   | 'PERMANENT_QUARANTINE';
+
+export interface StoredChallengeRecord extends X402Challenge {
+  status: ChallengeStatus;
+  boundTxHash?: string;
+  minValidLedger?: number;
+  maxValidLedger?: number;
+  leaseOwner?: string;
+  leaseExpiresAt?: Date;
+  leaseGeneration: number;
+  version: number;
+  redeemedAt?: Date;
+  redeemedLedger?: number;
+  payer?: string;
+  paidAmountStroops?: string;
+}
 
 export interface IChallengeStore {
   createChallenge(
@@ -18,6 +34,7 @@ export interface IChallengeStore {
       network?: 'testnet' | 'public' | 'custom';
       contractId?: string;
       tokenAddress?: string;
+      beneficiary?: string;
       memo?: string;
       ttlSeconds?: number;
     }
@@ -42,12 +59,18 @@ export interface IChallengeStore {
 
   isTxRedeemed(txHash: string): Promise<boolean>;
 
-  getPendingChallenges(limit?: number): Promise<X402Challenge[]>;
+  getPendingChallenges(limit?: number): Promise<StoredChallengeRecord[]>;
 
   updateChallengeStatus(
     challengeId: string,
     status: ChallengeStatus,
-    reason?: string
+    options?: {
+      expectedStatus?: ChallengeStatus;
+      expectedVersion?: number;
+      leaseGeneration?: number;
+      leaseOwner?: string;
+      reason?: string;
+    }
   ): Promise<boolean>;
 
   acquireLease(
