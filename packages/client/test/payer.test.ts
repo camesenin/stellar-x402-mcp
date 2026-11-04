@@ -276,15 +276,28 @@ describe('StellarPayer & Autonomous Soroban Execution', () => {
         expect(err.maxTime).toBeGreaterThan(0);
       }
 
-      // Adversarial scenario 1B: Horizon submitTransaction returns empty object or successful: false
-      vi.spyOn((payer as any).horizonServer, 'submitTransaction').mockResolvedValueOnce({ successful: false });
+      // Adversarial scenario 1B: Horizon submitTransaction returns partial object { ledger: 1 } without hash
+      vi.spyOn((payer as any).horizonServer, 'submitTransaction').mockResolvedValueOnce({ ledger: 1, successful: true });
 
       try {
         await payer.settleClassicChallenge(challenge);
-        expect.unreachable('Should have thrown on failed Horizon response');
+        expect.unreachable('Should have thrown on missing transaction hash');
       } catch (err: any) {
         expect(err).toBeInstanceOf(Error);
-        expect(err.message).toContain('failed on-chain');
+        expect(err.message).toContain('missing confirmed transaction hash');
+        expect(err.txHash).toBeDefined();
+        expect(err.maxTime).toBeGreaterThan(0);
+      }
+
+      // Adversarial scenario 1C: Horizon submitTransaction returns hash and ledger but successful: 'false' or false
+      vi.spyOn((payer as any).horizonServer, 'submitTransaction').mockResolvedValueOnce({ hash: 'dummy_hash', ledger: 1, successful: false });
+
+      try {
+        await payer.settleClassicChallenge(challenge);
+        expect.unreachable('Should have thrown on successful: false');
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(Error);
+        expect(err.message).toContain('missing explicit successful: true confirmation');
         expect(err.txHash).toBeDefined();
         expect(err.maxTime).toBeGreaterThan(0);
       }

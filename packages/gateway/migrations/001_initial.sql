@@ -66,15 +66,28 @@ ALTER TABLE IF EXISTS challenges ALTER COLUMN paid_amount_stroops TYPE NUMERIC(4
 
 -- Evolutionary check constraints enforcement for existing installations
 DO $do$
+DO $do$
+DECLARE
+  r RECORD;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_amount') THEN
     ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (amount_stroops > 0);
   END IF;
-  -- Replace any legacy status check constraint that might reject extended state enum
-  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_status') THEN
-    ALTER TABLE challenges DROP CONSTRAINT chk_challenge_status;
-  END IF;
+
+  -- 1. Drop any legacy or auto-named status check constraints (e.g. challenges_status_check, chk_challenge_status)
+  FOR r IN (
+    SELECT conname FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND contype = 'c' AND (conname LIKE '%status%' OR conname = 'chk_challenge_status')
+  ) LOOP
+    EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
+  END LOOP;
   ALTER TABLE challenges ADD CONSTRAINT chk_challenge_status CHECK (status IN ('PENDING', 'RECONCILIATION_REQUIRED', 'INCONCLUSIVE_MANUAL_REVIEW', 'CONFIRMED', 'REDEEMED', 'CANCELLED', 'PERMANENT_QUARANTINE'));
+
+  -- 2. Drop any legacy auto-named UNIQUE constraints on bound_tx_hash (e.g. challenges_bound_tx_hash_key)
+  FOR r IN (
+    SELECT conname FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND contype = 'u' AND conname != 'uq_challenges_bound_tx_hash' AND conname LIKE '%bound_tx_hash%'
+  ) LOOP
+    EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
+  END LOOP;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_redeemed_consistency') THEN
     ALTER TABLE challenges ADD CONSTRAINT chk_redeemed_consistency CHECK ((status != 'REDEEMED') OR (bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND redeemed_at IS NOT NULL));
   END IF;

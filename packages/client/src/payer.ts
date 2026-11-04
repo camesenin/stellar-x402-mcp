@@ -293,31 +293,28 @@ export class StellarPayer {
       for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
         await new Promise((r) => setTimeout(r, 1000));
 
-        try {
-          const rawTx = await fetchSorobanTxJsonRpc(this.sorobanRpcUrl, txHash);
-          if (rawTx) {
-            status = rawTx.status;
-            if (status === 'SUCCESS') {
-              const incLedger = typeof rawTx.ledger === 'number' && Number.isSafeInteger(rawTx.ledger) && rawTx.ledger > 0
-                ? rawTx.ledger
-                : (typeof rawTx.latestLedger === 'number' && Number.isSafeInteger(rawTx.latestLedger) && rawTx.latestLedger > 0 ? rawTx.latestLedger : undefined);
-              if (!incLedger) {
-                throw new Error('Soroban settlement confirmed but missing inclusion ledger');
-              }
-              resolvedLedger = incLedger;
-              break;
+        const rawTx = await fetchSorobanTxJsonRpc(this.sorobanRpcUrl, txHash);
+        if (rawTx) {
+          status = rawTx.status;
+          if (status === 'SUCCESS') {
+            if (typeof rawTx.ledger !== 'number' || !Number.isSafeInteger(rawTx.ledger) || rawTx.ledger <= 0) {
+              throw new Error('Soroban settlement transaction confirmed but missing valid inclusion ledger sequence');
             }
-            if (status === 'FAILED') {
-              throw new Error('Soroban settlement transaction failed on-chain');
-            }
+            resolvedLedger = rawTx.ledger;
+            break;
           }
-        } catch (pollErr: any) {
-          if (pollErr.message?.includes('failed on-chain')) throw pollErr;
+          if (status === 'FAILED') {
+            throw new Error('Soroban settlement transaction failed on-chain');
+          }
         }
       }
 
       if (status !== 'SUCCESS') {
         throw new Error('Soroban transaction timed out waiting for inclusion');
+      }
+
+      if (typeof resolvedLedger !== 'number' || resolvedLedger <= 0) {
+        throw new Error('Soroban settlement finished with incomplete inclusion proof');
       }
 
       return {
@@ -403,9 +400,9 @@ export class StellarPayer {
         throw new Error('Horizon transaction submission returned invalid or empty response');
       }
 
-      // Horizon submitTransaction must explicitly confirm success and return the mined transaction hash
-      if (result.successful !== true && result.successful !== undefined && result.successful === false) {
-        throw new Error('Horizon transaction failed on-chain');
+      // Horizon submitTransaction must explicitly confirm success as boolean true
+      if (result.successful !== true) {
+        throw new Error('Horizon transaction submission missing explicit successful: true confirmation');
       }
 
       const returnedHash = typeof result.hash === 'string' && result.hash.trim().length > 0 ? result.hash.trim() : undefined;
