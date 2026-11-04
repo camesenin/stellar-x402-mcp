@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS challenges (
   version BIGINT NOT NULL DEFAULT 1 CHECK (version >= 1),
   CONSTRAINT chk_challenge_expiry CHECK (expires_at >= created_at),
   CONSTRAINT chk_challenge_amount CHECK (
-    (amount_stroops IS NOT NULL AND amount_stroops > 0) OR
+    (amount_stroops IS NOT NULL AND amount_stroops != 'NaN'::numeric AND amount_stroops > 0) OR
     (amount_stroops IS NULL AND status IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'))
   ),
   CONSTRAINT chk_redeemed_consistency CHECK (
@@ -108,36 +108,48 @@ ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS version BIGINT DEFAULT
 -- 3. Populate amount_stroops and reconcile legacy statuses
 DO $EVOLVE_DATA$
 BEGIN
-  -- Populate amount_stroops with exact scale without 64-bit intermediate clamp.
-  -- Safe cast: handles numeric or textual amounts that match Stellar decimal format (up to 7 decimal places).
-  -- If amount_stroops is unpopulated (NULL or legacy default 0) and amount is a valid positive number, convert it:
+  -- Populate amount_stroops with exact scale and safe short-circuit evaluation:
+  -- Validates string structure, integer magnitude (<= 30 digits before decimal), and positive value
+  -- before any cast to NUMERIC to guarantee that corrupt or out-of-range strings never cause transaction aborts.
   IF EXISTS (
     SELECT 1 FROM information_schema.columns 
     WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'amount'
   ) THEN
-    -- Convert valid positive numeric representations
     UPDATE challenges 
-    SET amount_stroops = (amount::NUMERIC * 10000000)::NUMERIC(40, 0)
-    WHERE (amount_stroops IS NULL OR amount_stroops <= 0) AND amount IS NOT NULL 
-      AND (amount::TEXT ~ '^[0-9]+(\.[0-9]{1,7})?$')
-      AND (amount::NUMERIC > 0);
+    SET amount_stroops = (
+      CASE 
+        WHEN amount::TEXT ~ '^[0-9]{1,30}(\.[0-9]{1,7})?$' AND amount::TEXT != '0' AND amount::TEXT !~ '^0+(\.0+)?$'
+        THEN (amount::NUMERIC * 10000000)::NUMERIC(40, 0)
+        ELSE NULL
+      END
+    )
+    WHERE (amount_stroops IS NULL OR amount_stroops <= 0 OR amount_stroops = 'NaN'::numeric) 
+      AND amount IS NOT NULL 
+      AND (
+        CASE 
+          WHEN amount::TEXT ~ '^[0-9]{1,30}(\.[0-9]{1,7})?$' AND amount::TEXT != '0' AND amount::TEXT !~ '^0+(\.0+)?$'
+          THEN true
+          ELSE false
+        END
+      );
   END IF;
 
-  -- Normalize unmetered or non-positive legacy amounts:
+  -- Normalize unmetered, non-positive, or NaN legacy amounts:
   -- In canonical schema, amount_stroops must be NULL for quarantined rows (INCONCLUSIVE_MANUAL_REVIEW or PERMANENT_QUARANTINE),
-  -- and strictly > 0 for operational rows.
-  -- 1. Rows already in ANY quarantine state (INCONCLUSIVE_MANUAL_REVIEW or PERMANENT_QUARANTINE) with non-positive amount:
-  -- Strictly normalize amount_stroops to NULL, preserving their respective quarantine status!
+  -- and strictly > 0 and != 'NaN' for operational rows.
+  -- 1. Rows already in ANY quarantine state (INCONCLUSIVE_MANUAL_REVIEW or PERMANENT_QUARANTINE):
+  -- Strictly normalize non-positive or NaN amount_stroops to NULL, preserving their respective quarantine status!
   UPDATE challenges
   SET amount_stroops = NULL
   WHERE status IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE')
-    AND amount_stroops IS NOT NULL AND amount_stroops <= 0;
+    AND amount_stroops IS NOT NULL 
+    AND (amount_stroops <= 0 OR amount_stroops = 'NaN'::numeric);
 
-  -- 2. Operational rows with amount_stroops <= 0 or invalid (where amount could not be converted):
+  -- 2. Operational rows with amount_stroops <= 0, NaN, or unconvertible:
   -- Safely isolate into INCONCLUSIVE_MANUAL_REVIEW with amount_stroops = NULL
   UPDATE challenges
   SET status = 'INCONCLUSIVE_MANUAL_REVIEW', amount_stroops = NULL
-  WHERE (amount_stroops IS NOT NULL AND amount_stroops <= 0);
+  WHERE (amount_stroops IS NOT NULL AND (amount_stroops <= 0 OR amount_stroops = 'NaN'::numeric));
 
   -- 3. Rows with amount_stroops IS NULL: isolate to INCONCLUSIVE_MANUAL_REVIEW if not already permanently quarantined
   UPDATE challenges 
@@ -336,9 +348,10 @@ BEGIN
   END IF;
 
   -- 3. Case D: Drop standalone duplicate or incompatible indexes covering bound_tx_hash:
-  -- Drops redundant btree single-column standard indexes AND drops any standalone unique index with indnullsnotdistinct = true
-  -- (which would reject multiple pending challenges with hash IS NULL), while strictly PRESERVING partial indexes,
-  -- specialized opclasses (text_pattern_ops), and multi-column/INCLUDE indexes.
+  -- A. Drop ANY standalone unique index covering bound_tx_hash that enforces indnullsnotdistinct = true
+  --    (regardless of ASC/DESC, opclass, or INCLUDE attributes), because it would reject multiple pending challenges with hash IS NULL!
+  -- B. Drop redundant standalone btree single-column standard indexes matching the canonical index definition,
+  --    while strictly PRESERVING partial indexes (indpred IS NOT NULL) and specialized pattern opclasses (text_pattern_ops).
   FOR r IN (
     SELECT idx.relname AS index_name
     FROM pg_index i
@@ -349,21 +362,25 @@ BEGIN
     JOIN pg_namespace opcnsp ON opcnsp.oid = opc.opcnamespace
     LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
     WHERE tbl.oid = 'challenges'::regclass
-      AND i.indnkeyatts = 1
-      AND i.indnatts = 1 -- Strictly exactly 1 column total: PRESERVES any INCLUDE columns!
+      AND con.oid IS NULL -- Standalone index (not backing a constraint)
       AND i.indkey[0] = bound_attnum
-      AND i.indpred IS NULL -- Preserves partial indexes!
-      AND am.amname = 'btree'
-      AND opc.opcname = 'text_ops' AND opcnsp.nspname = 'pg_catalog' -- Canonical pg_catalog.text_ops: PRESERVES text_pattern_ops!
-      AND i.indcollation[0] = (
-        SELECT ci.indcollation[0] FROM pg_index ci
-        JOIN pg_constraint cc ON cc.conindid = ci.indexrelid
-        WHERE cc.conrelid = 'challenges'::regclass AND cc.conname = 'uq_challenges_bound_tx_hash'
+      AND (
+        -- Condition A: Incompatible standalone unique index with indnullsnotdistinct = true covering bound_tx_hash as primary key
+        (i.indisunique = true AND i.indnullsnotdistinct = true)
+        OR
+        -- Condition B: Redundant identical btree text_ops index matching canonical definition
+        (
+          i.indnkeyatts = 1 AND i.indnatts = 1 AND i.indpred IS NULL
+          AND am.amname = 'btree' AND opc.opcname = 'text_ops' AND opcnsp.nspname = 'pg_catalog'
+          AND i.indcollation[0] = (
+            SELECT ci.indcollation[0] FROM pg_index ci
+            JOIN pg_constraint cc ON cc.conindid = ci.indexrelid
+            WHERE cc.conrelid = 'challenges'::regclass AND cc.conname = 'uq_challenges_bound_tx_hash'
+          )
+          AND i.indoption[0] = 0
+          AND i.indnullsnotdistinct = false
+        )
       )
-      AND i.indoption[0] = 0 -- Default ASC/NULLS LAST
-      AND con.oid IS NULL -- Not backing a constraint
-      -- Matches redundant standard duplicate index OR incompatible standalone unique index with indnullsnotdistinct = true
-      AND (i.indnullsnotdistinct = false OR (i.indisunique = true AND i.indnullsnotdistinct = true))
   ) LOOP
     EXECUTE format('DROP INDEX IF EXISTS %I', r.index_name);
   END LOOP;
@@ -372,7 +389,7 @@ BEGIN
   -- Drop existing named check if definition or validity differs, then add canonical validated check
   ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_amount;
   ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (
-    (amount_stroops IS NOT NULL AND amount_stroops > 0) OR
+    (amount_stroops IS NOT NULL AND amount_stroops != 'NaN'::numeric AND amount_stroops > 0) OR
     (amount_stroops IS NULL AND status IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'))
   );
 
@@ -393,7 +410,10 @@ BEGIN
   ALTER TABLE challenges ADD CONSTRAINT chk_challenge_expiry CHECK (expires_at >= created_at);
 
   ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_paid_amount;
-  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_paid_amount CHECK (paid_amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops);
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_paid_amount CHECK (
+    paid_amount_stroops IS NULL OR 
+    (paid_amount_stroops != 'NaN'::numeric AND (amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops))
+  );
 
   ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_redeemed_ledger;
   ALTER TABLE challenges ADD CONSTRAINT chk_challenge_redeemed_ledger CHECK (redeemed_ledger IS NULL OR redeemed_ledger >= 0);

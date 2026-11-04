@@ -94,10 +94,12 @@ jobs:
           # - Row 3: Challenge previously marked status='REDEEMED' with missing evidence -> isolates into RECONCILIATION_REQUIRED
           # - Row 4: Unmetered/unknown amount (amount IS NULL) with amount_stroops=0 -> normalizes to amount_stroops=NULL and isolates into INCONCLUSIVE_MANUAL_REVIEW
           # - Row 5: Challenge already in PERMANENT_QUARANTINE with amount_stroops=0 -> normalizes to amount_stroops=NULL and strictly PRESERVES PERMANENT_QUARANTINE
-          # - Row 6: Challenge already in INCONCLUSIVE_MANUAL_REVIEW with amount_stroops=0 -> normalizes to amount_stroops=NULL and strictly PRESERVES INCONCLUSIVE_MANUAL_REVIEW
+          # - Row 6: Challenge already in INCONCLUSIVE_MANUAL_REVIEW with amount_stroops='NaN' -> normalizes to amount_stroops=NULL and strictly PRESERVES INCONCLUSIVE_MANUAL_REVIEW
+          # - Row 7: Legacy challenge with corrupt non-numeric amount text 'malformed_500' -> safe short-circuit isolates to INCONCLUSIVE_MANUAL_REVIEW without aborting
+          # - Row 8: Legacy challenge with 34-digit integer overflow text -> safe short-circuit isolates to INCONCLUSIVE_MANUAL_REVIEW without aborting
           # - Legacy constraint with NULLS NOT DISTINCT (uq_challenges_bound_tx_hash) -> exercises Case C transition to standard unique!
           # - Duplicate btree index on bound_tx_hash to be purged
-          # - Incompatible standalone unique index with NULLS NOT DISTINCT to be purged by Case D
+          # - Incompatible standalone unique index with NULLS NOT DISTINCT AND DESC order -> must be purged by Case D!
           # - Protected partial index (WHERE status = 'PENDING')
           # - Protected specialized text_pattern_ops index
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
@@ -114,7 +116,7 @@ jobs:
               created_at BIGINT NOT NULL,
               bound_tx_hash TEXT,
               is_redeemed INTEGER NOT NULL DEFAULT 0,
-              CONSTRAINT chk_legacy_composite CHECK (status IN ('PENDING', 'REDEEMED', 'INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE') AND amount_stroops >= 0),
+              CONSTRAINT chk_legacy_composite CHECK (status IN ('PENDING', 'REDEEMED', 'INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE')),
               -- Legacy non-standard constraint with NULLS NOT DISTINCT exercising Case C transition:
               CONSTRAINT uq_challenges_bound_tx_hash UNIQUE NULLS NOT DISTINCT (bound_tx_hash)
             );
@@ -209,14 +211,14 @@ jobs:
               0
             );
 
-            -- Row 6: Challenge already in INCONCLUSIVE_MANUAL_REVIEW with amount_stroops=0 -> status must be PRESERVED and amount_stroops normalized to NULL
+            -- Row 6: Challenge already in INCONCLUSIVE_MANUAL_REVIEW with amount_stroops='NaN' -> status must be PRESERVED and amount_stroops normalized to NULL
             INSERT INTO challenges (
               challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
             ) VALUES (
               'ch_legacy_seed_6',
               'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
               NULL,
-              0,
+              'NaN'::numeric,
               'XLM',
               'memo_seed_6',
               'testnet',
@@ -227,11 +229,47 @@ jobs:
               0
             );
 
+            -- Row 7: Corrupt textual amount -> tests short-circuit protection against cast errors
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_7',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              'malformed_amount_string_500',
+              0,
+              'XLM',
+              'memo_seed_7',
+              'testnet',
+              'PENDING',
+              1793815821820,
+              1793815521820,
+              'tx_quarantined_hash_7',
+              0
+            );
+
+            -- Row 8: 34-digit integer overflow textual amount -> tests short-circuit protection against overflow
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_8',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              '9999999999999999999999999999999999',
+              0,
+              'XLM',
+              'memo_seed_8',
+              'testnet',
+              'PENDING',
+              1793815821820,
+              1793815521820,
+              'tx_quarantined_hash_8',
+              0
+            );
+
             -- 1. Index to be purged by Case D (standard duplicate btree text_ops on bound_tx_hash)
             CREATE INDEX idx_legacy_duplicate_bound ON challenges USING btree (bound_tx_hash);
 
-            -- 2. Incompatible standalone unique index with NULLS NOT DISTINCT to be purged by Case D
-            CREATE UNIQUE INDEX idx_legacy_incompatible_nulls_not_distinct ON challenges USING btree (bound_tx_hash) NULLS NOT DISTINCT;
+            -- 2. Incompatible standalone unique index with NULLS NOT DISTINCT AND DESC order -> must be purged by Case D!
+            CREATE UNIQUE INDEX idx_legacy_incompatible_nulls_not_distinct_desc ON challenges (bound_tx_hash DESC) NULLS NOT DISTINCT;
 
             -- 3. Protected partial index (MUST be preserved)
             CREATE INDEX idx_legacy_partial_bound ON challenges USING btree (bound_tx_hash) WHERE (status = 'PENDING');
@@ -253,6 +291,8 @@ jobs:
               rec4 RECORD;
               rec5 RECORD;
               rec6 RECORD;
+              rec7 RECORD;
+              rec8 RECORD;
               v_is_nullable TEXT;
               v_indnullsnotdistinct BOOLEAN;
               v_pred TEXT;
@@ -339,7 +379,18 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: quarantined row must have amount_stroops NULL (got %)', step_name, rec6.amount_stroops;
               END IF;
 
-              -- G. Purge & Structural Preservation Assertions
+              -- G. Safe handling of corrupt and overflow strings
+              SELECT * INTO rec7 FROM challenges WHERE id = 'ch_legacy_seed_7';
+              IF rec7.status IS DISTINCT FROM 'INCONCLUSIVE_MANUAL_REVIEW' OR rec7.amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: corrupt string row not isolated (status %, amount_stroops %)', step_name, rec7.status, rec7.amount_stroops;
+              END IF;
+
+              SELECT * INTO rec8 FROM challenges WHERE id = 'ch_legacy_seed_8';
+              IF rec8.status IS DISTINCT FROM 'INCONCLUSIVE_MANUAL_REVIEW' OR rec8.amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: overflow string row not isolated (status %, amount_stroops %)', step_name, rec8.status, rec8.amount_stroops;
+              END IF;
+
+              -- H. Purge & Structural Preservation Assertions
               -- 1. idx_legacy_duplicate_bound MUST be purged
               IF EXISTS (
                 SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -348,12 +399,12 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: idx_legacy_duplicate_bound was not purged by Case D', step_name;
               END IF;
 
-              -- 2. idx_legacy_incompatible_nulls_not_distinct MUST be purged
+              -- 2. idx_legacy_incompatible_nulls_not_distinct_desc MUST be purged
               IF EXISTS (
                 SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relname = 'idx_legacy_incompatible_nulls_not_distinct' AND n.nspname = current_schema()
+                WHERE c.relname = 'idx_legacy_incompatible_nulls_not_distinct_desc' AND n.nspname = current_schema()
               ) THEN
-                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_incompatible_nulls_not_distinct was not purged by Case D', step_name;
+                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_incompatible_nulls_not_distinct_desc was not purged by Case D', step_name;
               END IF;
 
               -- 3. idx_legacy_partial_bound MUST be preserved with exact predicate
@@ -381,7 +432,7 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: canonical constraint missing, unvalidated, or not standard unique (got indnullsnotdistinct=%)', step_name, v_indnullsnotdistinct;
               END IF;
 
-              -- H. Operational Test: assert multiple pending challenges with bound_tx_hash IS NULL insert cleanly
+              -- I. Operational Test: assert multiple pending challenges with bound_tx_hash IS NULL insert cleanly
               INSERT INTO challenges (
                 id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash
               ) VALUES (
@@ -410,7 +461,7 @@ jobs:
                 NULL
               );
 
-              -- I. Duplicate Non-Null Hash Rejection Test: assert exact constraint rejection diagnostic
+              -- J. Duplicate Non-Null Hash Rejection Test: assert exact constraint rejection diagnostic
               BEGIN
                 INSERT INTO challenges (
                   id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash
@@ -433,6 +484,29 @@ jobs:
                 IF v_diag_constraint IS DISTINCT FROM 'uq_challenges_bound_tx_hash' THEN
                   RAISE EXCEPTION '[%] Assertion failed: unique violation triggered by % instead of uq_challenges_bound_tx_hash', step_name, v_diag_constraint;
                 END IF;
+              END;
+
+              -- K. Rejection of NaN on operational rows: assert chk_challenge_amount rejects NaN
+              BEGIN
+                INSERT INTO challenges (
+                  id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash
+                ) VALUES (
+                  'ch_op_nan_' || step_name,
+                  'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+                  'NaN'::numeric,
+                  'XLM',
+                  'mcp://tools/test',
+                  'memo_nan',
+                  'testnet',
+                  'PENDING',
+                  clock_timestamp(),
+                  clock_timestamp() + interval '5 minutes',
+                  'tx_nan_hash_' || step_name
+                );
+                RAISE EXCEPTION '[%] Assertion failed: NaN amount_stroops was not rejected on operational row', step_name;
+              EXCEPTION WHEN check_violation THEN
+                -- Expected behavior: chk_challenge_amount strictly rejected NaN!
+                NULL;
               END;
             END;
             $$ LANGUAGE plpgsql;
