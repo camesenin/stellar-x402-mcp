@@ -90,8 +90,8 @@ jobs:
           # - Legacy table with amount_stroops NOT NULL
           # - Missing 'resource' column
           # - Row 1: Valid legacy challenge with text amount '0.05' and unpopulated amount_stroops=0 -> converts to 500,000 stroops
-          # - Row 2: Incomplete redeemed challenge (is_redeemed=1, missing txHash) -> isolates into RECONCILIATION_REQUIRED
-          # - Row 3: Challenge previously marked status='REDEEMED' with missing evidence -> isolates into RECONCILIATION_REQUIRED
+          # - Row 2: Incomplete redeemed challenge (is_redeemed=1, bound_tx_hash=NULL) -> converges into RECONCILIATION_REQUIRED
+          # - Row 3: Challenge previously marked status='REDEEMED' (bound_tx_hash=NULL) -> converges into RECONCILIATION_REQUIRED (tests multiple NULL hashes converging to same status under incompatible index!)
           # - Row 4: Unmetered/unknown amount (amount IS NULL) with amount_stroops=0 -> normalizes to amount_stroops=NULL and isolates into INCONCLUSIVE_MANUAL_REVIEW
           # - Row 5: Challenge already in PERMANENT_QUARANTINE with amount_stroops=0 -> normalizes to amount_stroops=NULL and strictly PRESERVES PERMANENT_QUARANTINE
           # - Row 6: Challenge already in INCONCLUSIVE_MANUAL_REVIEW with amount_stroops='NaN' -> normalizes to amount_stroops=NULL and strictly PRESERVES INCONCLUSIVE_MANUAL_REVIEW
@@ -145,7 +145,10 @@ jobs:
               0
             );
 
-            -- Row 2: Incomplete is_redeemed=1 without hash -> must transition safely to RECONCILIATION_REQUIRED
+            -- Row 2: Incomplete is_redeemed=1 with bound_tx_hash IS NULL (starts PENDING)
+            -- Both Row 2 and Row 3 converge to status = 'RECONCILIATION_REQUIRED' while bound_tx_hash IS NULL.
+            -- Under an incompatible composite unique index (status, bound_tx_hash) NULLS NOT DISTINCT,
+            -- this would fail if EVOLVE_DATA ran before Case D. With early structural purge, this transitions safely!
             INSERT INTO challenges (
               challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
             ) VALUES (
@@ -159,11 +162,11 @@ jobs:
               'PENDING',
               1793815821820,
               1793815521820,
-              'tx_incomplete_hash_2',
+              NULL,
               1
             );
 
-            -- Row 3: Previously marked status='REDEEMED' but lacking hash/proof -> must transition to RECONCILIATION_REQUIRED
+            -- Row 3: Previously marked status='REDEEMED' with bound_tx_hash IS NULL
             INSERT INTO challenges (
               challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
             ) VALUES (
@@ -177,7 +180,7 @@ jobs:
               'REDEEMED',
               1793815821820,
               1793815521820,
-              'tx_incomplete_hash_3',
+              NULL,
               1
             );
 
@@ -310,6 +313,9 @@ jobs:
             -- 6. Protected partial unique index strictly on NOT NULL (MUST be preserved)
             CREATE UNIQUE INDEX idx_legacy_protected_partial_not_null ON challenges (bound_tx_hash) WHERE (bound_tx_hash IS NOT NULL);
 
+            -- 6b. Protected partial index with legitimate conjunction (bound_tx_hash IS NOT NULL AND status != 'CANCELLED')
+            CREATE INDEX idx_legacy_protected_partial_conjunctive ON challenges (bound_tx_hash) WHERE (bound_tx_hash IS NOT NULL AND status != 'CANCELLED');
+
             -- 7. Protected specialized opclass index (MUST be preserved)
             CREATE INDEX idx_legacy_pattern_bound ON challenges USING btree (bound_tx_hash text_pattern_ops);
           EOF
@@ -379,15 +385,15 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: created_at timestamp mismatch (got %)', step_name, rec1.created_at;
               END IF;
 
-              -- D. Safe isolation check for incomplete redeemed challenges
+              -- D. Safe convergence check for multiple incomplete challenges with bound_tx_hash IS NULL
               SELECT * INTO rec2 FROM challenges WHERE id = 'ch_legacy_seed_2';
-              IF rec2.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
-                RAISE EXCEPTION '[%] Assertion failed: incomplete is_redeemed row not safely isolated into RECONCILIATION_REQUIRED (got %)', step_name, rec2.status;
+              IF rec2.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' OR rec2.bound_tx_hash IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: rec2 not converged to RECONCILIATION_REQUIRED with NULL hash (status %, hash %)', step_name, rec2.status, rec2.bound_tx_hash;
               END IF;
 
               SELECT * INTO rec3 FROM challenges WHERE id = 'ch_legacy_seed_3';
-              IF rec3.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
-                RAISE EXCEPTION '[%] Assertion failed: unproven REDEEMED row not safely isolated into RECONCILIATION_REQUIRED (got %)', step_name, rec3.status;
+              IF rec3.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' OR rec3.bound_tx_hash IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: rec3 not converged to RECONCILIATION_REQUIRED with NULL hash (status %, hash %)', step_name, rec3.status, rec3.bound_tx_hash;
               END IF;
 
               -- E. Safe isolation of unmetered challenge
@@ -483,6 +489,14 @@ jobs:
               WHERE c.relname = 'idx_legacy_protected_partial_not_null' AND n.nspname = current_schema();
               IF v_pred IS DISTINCT FROM '(bound_tx_hash IS NOT NULL)' THEN
                 RAISE EXCEPTION '[%] Assertion failed: idx_legacy_protected_partial_not_null lost its exact predicate (got %)', step_name, v_pred;
+              END IF;
+
+              -- 6b. idx_legacy_protected_partial_conjunctive MUST be preserved
+              SELECT pg_get_expr(i.indpred, i.indrelid) INTO v_pred
+              FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE c.relname = 'idx_legacy_protected_partial_conjunctive' AND n.nspname = current_schema();
+              IF v_pred IS NULL OR v_pred !~* 'bound_tx_hash IS NOT NULL' THEN
+                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_protected_partial_conjunctive lost its exact predicate (got %)', step_name, v_pred;
               END IF;
 
               -- 7. idx_legacy_pattern_bound MUST be preserved with text_pattern_ops

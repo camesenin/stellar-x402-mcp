@@ -50,15 +50,24 @@ CREATE TABLE IF NOT EXISTS challenges (
 );
 
 -- Evolutionary schema migration support for existing deployments
--- 0. Early Drop of Legacy CHECK constraints on status:
--- In legacy tables with CHECK (status IN ('PENDING', 'REDEEMED')), updating rows to
--- 'RECONCILIATION_REQUIRED' or 'INCONCLUSIVE_MANUAL_REVIEW' would fail if existing check constraints are not dropped first.
-DO $EARLY_STATUS_DROP$
+-- 0. Early Drop of Legacy CHECK constraints and Incompatible UNIQUE constraints/indexes:
+-- In legacy tables:
+-- a) CHECK (status IN ('PENDING', 'REDEEMED')) would fail updates to 'RECONCILIATION_REQUIRED' or 'INCONCLUSIVE_MANUAL_REVIEW'.
+-- b) Unique constraints/indexes with indnullsnotdistinct = true covering bound_tx_hash (e.g. (status, bound_tx_hash))
+--    would fail if multiple rows with bound_tx_hash IS NULL converge to the same status (e.g. 'RECONCILIATION_REQUIRED') during EVOLVE_DATA!
+-- Therefore, all legacy status checks and incompatible bound_tx_hash unique indexes/constraints MUST be dropped/renamed BEFORE EVOLVE_DATA.
+DO $EARLY_STRUCTURAL_PURGE$
 DECLARE
   r RECORD;
   status_attnum int2;
+  bound_attnum int2;
+  rename_suffix int := 1;
+  target_rename text;
 BEGIN
   SELECT attnum INTO status_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'status';
+  SELECT attnum INTO bound_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'bound_tx_hash';
+
+  -- A. Early drop of status check constraints
   IF status_attnum IS NOT NULL THEN
     ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_status;
     FOR r IN (
@@ -71,8 +80,99 @@ BEGIN
       EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
     END LOOP;
   END IF;
+
+  -- B. Early handling of UNIQUE constraints and indexes covering bound_tx_hash
+  IF bound_attnum IS NOT NULL THEN
+    -- Case A: Name collision where 'uq_challenges_bound_tx_hash' exists on different columns -> rename it
+    IF EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'challenges'::regclass
+        AND contype = 'u'
+        AND conname = 'uq_challenges_bound_tx_hash'
+        AND conkey != ARRAY[bound_attnum]
+    ) THEN
+      LOOP
+        target_rename := 'uq_challenges_legacy_composite_' || rename_suffix::text;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint c
+          JOIN pg_class t ON t.oid = c.conrelid
+          WHERE t.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'challenges'::regclass)
+            AND c.conname = target_rename
+        ) AND NOT EXISTS (
+          SELECT 1 FROM pg_class
+          WHERE relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'challenges'::regclass)
+            AND relname = target_rename
+        ) THEN
+          EXECUTE format('ALTER TABLE challenges RENAME CONSTRAINT uq_challenges_bound_tx_hash TO %I', target_rename);
+          EXIT;
+        END IF;
+        rename_suffix := rename_suffix + 1;
+      END LOOP;
+    END IF;
+
+    -- Case B: Drop non-canonical single-column UNIQUE constraints covering bound_tx_hash
+    FOR r IN (
+      SELECT con.conname
+      FROM pg_constraint con
+      WHERE con.conrelid = 'challenges'::regclass
+        AND con.contype = 'u'
+        AND con.conkey = ARRAY[bound_attnum]
+        AND con.conname != 'uq_challenges_bound_tx_hash'
+    ) LOOP
+      EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
+    END LOOP;
+
+    -- Case C: If existing uq_challenges_bound_tx_hash has NULLS NOT DISTINCT = true, drop it early
+    IF EXISTS (
+      SELECT 1 FROM pg_constraint con
+      JOIN pg_index i ON i.indexrelid = con.conindid
+      WHERE con.conrelid = 'challenges'::regclass
+        AND con.contype = 'u'
+        AND con.conname = 'uq_challenges_bound_tx_hash'
+        AND i.indnullsnotdistinct = true
+    ) THEN
+      ALTER TABLE challenges DROP CONSTRAINT uq_challenges_bound_tx_hash;
+    END IF;
+
+    -- Case D: Early purge of standalone incompatible indexes covering bound_tx_hash
+    -- Purge ANY unique index with indnullsnotdistinct = true covering bound_tx_hash in any position,
+    -- unless its predicate is strictly and solely bound_tx_hash IS NOT NULL without disjunctions (OR).
+    FOR r IN (
+      SELECT idx.relname AS index_name
+      FROM pg_index i
+      JOIN pg_class idx ON idx.oid = i.indexrelid
+      JOIN pg_class tbl ON tbl.oid = i.indrelid
+      JOIN pg_am am ON am.oid = idx.relam
+      JOIN pg_opclass opc ON opc.oid = i.indclass[0]
+      JOIN pg_namespace opcnsp ON opcnsp.oid = opc.opcnamespace
+      LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
+      WHERE tbl.oid = 'challenges'::regclass
+        AND con.oid IS NULL
+        AND (bound_attnum = ANY(i.indkey[0:i.indnkeyatts-1]))
+        AND (
+          (
+            i.indisunique = true 
+            AND i.indnullsnotdistinct = true
+            AND (
+              i.indpred IS NULL 
+              OR pg_get_expr(i.indpred, i.indrelid) ~* '\s+OR\s+'
+              OR pg_get_expr(i.indpred, i.indrelid) !~* '^\(?\s*bound_tx_hash\s+IS\s+NOT\s+NULL\s*\)?$'
+            )
+          )
+          OR
+          (
+            i.indkey[0] = bound_attnum AND i.indnkeyatts = 1 AND i.indnatts = 1 AND i.indpred IS NULL
+            AND am.amname = 'btree' AND opc.opcname = 'text_ops' AND opcnsp.nspname = 'pg_catalog'
+            AND i.indoption[0] = 0
+            AND i.indnullsnotdistinct = false
+          )
+        )
+    ) LOOP
+      EXECUTE format('DROP INDEX IF EXISTS %I', r.index_name);
+    END LOOP;
+  END IF;
 END;
-$EARLY_STATUS_DROP$;
+$EARLY_STRUCTURAL_PURGE$;
 
 -- 1. Identifier alignment: rename legacy 'challenge_id' to canonical 'id' if table used legacy PK name
 DO $EVOLVE_ID$
@@ -264,87 +364,17 @@ ALTER TABLE IF EXISTS challenges ALTER COLUMN amount_stroops TYPE NUMERIC(40, 0)
 ALTER TABLE IF EXISTS challenges ALTER COLUMN paid_amount_stroops TYPE NUMERIC(40, 0);
 
 -- Evolutionary check constraints enforcement and structural validation
-DO $BODY$
+DO $FINAL_INVARIANTS$
 DECLARE
-  r RECORD;
-  status_attnum int2;
   bound_attnum int2;
-  rename_suffix int := 1;
-  target_rename text;
 BEGIN
-  -- Obtain exact attribute numbers for structural validation
-  SELECT attnum INTO status_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'status';
   SELECT attnum INTO bound_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'bound_tx_hash';
 
-  -- 1. Structural purge of legacy CHECK constraints covering 'status'
-  -- Unconditionally drops any constraint named 'chk_challenge_status' (even if CHECK (TRUE)) plus any legacy single-column check on status_attnum
+  -- Canonical status CHECK constraint
   ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_status;
-  FOR r IN (
-    SELECT con.conname
-    FROM pg_constraint con
-    WHERE con.conrelid = 'challenges'::regclass
-      AND con.contype = 'c'
-      AND (status_attnum = ANY(con.conkey) OR con.conkey = ARRAY[status_attnum])
-  ) LOOP
-    EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
-  END LOOP;
   ALTER TABLE challenges ADD CONSTRAINT chk_challenge_status CHECK (status IN ('PENDING', 'RECONCILIATION_REQUIRED', 'INCONCLUSIVE_MANUAL_REVIEW', 'CONFIRMED', 'REDEEMED', 'CANCELLED', 'PERMANENT_QUARANTINE'));
 
-  -- 2. Structural handling of UNIQUE constraints covering bound_tx_hash
-  -- Case A: Name collision where 'uq_challenges_bound_tx_hash' exists on different columns.
-  -- RENAME the existing constraint dynamically checking pg_constraint AND pg_class in current schema to prevent index collisions
-  IF EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conrelid = 'challenges'::regclass
-      AND contype = 'u'
-      AND conname = 'uq_challenges_bound_tx_hash'
-      AND conkey != ARRAY[bound_attnum]
-  ) THEN
-    LOOP
-      target_rename := 'uq_challenges_legacy_composite_' || rename_suffix::text;
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint c
-        JOIN pg_class t ON t.oid = c.conrelid
-        WHERE t.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'challenges'::regclass)
-          AND c.conname = target_rename
-      ) AND NOT EXISTS (
-        SELECT 1 FROM pg_class
-        WHERE relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'challenges'::regclass)
-          AND relname = target_rename
-      ) THEN
-        EXECUTE format('ALTER TABLE challenges RENAME CONSTRAINT uq_challenges_bound_tx_hash TO %I', target_rename);
-        EXIT;
-      END IF;
-      rename_suffix := rename_suffix + 1;
-    END LOOP;
-  END IF;
-
-  -- Case B: Drop non-canonical single-column UNIQUE constraints covering bound_tx_hash
-  -- Normalizes schema to canonical standard uniqueness (allowing multiple nulls for pending challenges)
-  FOR r IN (
-    SELECT con.conname
-    FROM pg_constraint con
-    WHERE con.conrelid = 'challenges'::regclass
-      AND con.contype = 'u'
-      AND con.conkey = ARRAY[bound_attnum]
-      AND con.conname != 'uq_challenges_bound_tx_hash'
-  ) LOOP
-    EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
-  END LOOP;
-
-  -- Case C: Ensure canonical uq_challenges_bound_tx_hash exists covering exactly bound_tx_hash with standard uniqueness
-  -- If an existing constraint has NULLS NOT DISTINCT = true, drop and recreate as standard unique to allow multiple pending null hashes
-  IF EXISTS (
-    SELECT 1 FROM pg_constraint con
-    JOIN pg_index i ON i.indexrelid = con.conindid
-    WHERE con.conrelid = 'challenges'::regclass
-      AND con.contype = 'u'
-      AND con.conname = 'uq_challenges_bound_tx_hash'
-      AND i.indnullsnotdistinct = true
-  ) THEN
-    ALTER TABLE challenges DROP CONSTRAINT uq_challenges_bound_tx_hash;
-  END IF;
-
+  -- Ensure canonical uq_challenges_bound_tx_hash exists covering exactly bound_tx_hash with standard uniqueness
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint
     WHERE conrelid = 'challenges'::regclass
@@ -362,56 +392,7 @@ BEGIN
     ALTER TABLE challenges ADD CONSTRAINT uq_challenges_bound_tx_hash UNIQUE (bound_tx_hash);
   END IF;
 
-  -- 3. Case D: Drop standalone duplicate or incompatible indexes covering bound_tx_hash:
-  -- A. Drop ANY standalone unique index covering bound_tx_hash that enforces indnullsnotdistinct = true
-  --    (regardless of ASC/DESC, opclass, or INCLUDE attributes), because it would reject multiple pending challenges with hash IS NULL!
-  -- B. Drop redundant standalone btree single-column standard indexes matching the canonical index definition,
-  --    while strictly PRESERVING partial indexes (indpred IS NOT NULL) and specialized pattern opclasses (text_pattern_ops).
-  FOR r IN (
-    SELECT idx.relname AS index_name
-    FROM pg_index i
-    JOIN pg_class idx ON idx.oid = i.indexrelid
-    JOIN pg_class tbl ON tbl.oid = i.indrelid
-    JOIN pg_am am ON am.oid = idx.relam
-    JOIN pg_opclass opc ON opc.oid = i.indclass[0]
-    JOIN pg_namespace opcnsp ON opcnsp.oid = opc.opcnamespace
-    LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
-    WHERE tbl.oid = 'challenges'::regclass
-      AND con.oid IS NULL -- Standalone index (not backing a constraint)
-      AND (bound_attnum = ANY(i.indkey[0:i.indnkeyatts-1]))
-      AND (
-        -- Condition A: ANY unique index with indnullsnotdistinct = true covering bound_tx_hash in any position
-        -- (which would reject multiple pending challenges with hash IS NULL), unless its partial predicate is strictly
-        -- and solely bound_tx_hash IS NOT NULL without disjunctions (OR) that could admit null hashes
-        (
-          i.indisunique = true 
-          AND i.indnullsnotdistinct = true
-          AND (
-            i.indpred IS NULL 
-            OR pg_get_expr(i.indpred, i.indrelid) ~* '\s+OR\s+'
-            OR pg_get_expr(i.indpred, i.indrelid) !~* '^\(?\s*bound_tx_hash\s+IS\s+NOT\s+NULL\s*\)?$'
-          )
-        )
-        OR
-        -- Condition B: Redundant identical single-column btree text_ops index matching canonical definition
-        (
-          i.indkey[0] = bound_attnum AND i.indnkeyatts = 1 AND i.indnatts = 1 AND i.indpred IS NULL
-          AND am.amname = 'btree' AND opc.opcname = 'text_ops' AND opcnsp.nspname = 'pg_catalog'
-          AND i.indcollation[0] = (
-            SELECT ci.indcollation[0] FROM pg_index ci
-            JOIN pg_constraint cc ON cc.conindid = ci.indexrelid
-            WHERE cc.conrelid = 'challenges'::regclass AND cc.conname = 'uq_challenges_bound_tx_hash'
-          )
-          AND i.indoption[0] = 0
-          AND i.indnullsnotdistinct = false
-        )
-      )
-  ) LOOP
-    EXECUTE format('DROP INDEX IF EXISTS %I', r.index_name);
-  END LOOP;
-
-  -- 4. Invariant checks structural definition validation: Re-assert canonical definitions and ensure convalidated = true
-  -- Drop existing named check if definition or validity differs, then add canonical validated check
+  -- Invariant checks structural definition validation: Re-assert canonical definitions and ensure convalidated = true
   ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_amount;
   ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (
     (amount_stroops IS NOT NULL AND amount_stroops != 'NaN'::numeric AND amount_stroops > 0) OR
@@ -453,7 +434,7 @@ BEGIN
   ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_version;
   ALTER TABLE challenges ADD CONSTRAINT chk_challenge_version CHECK (version >= 1);
 END;
-$BODY$;
+$FINAL_INVARIANTS$;
 
 CREATE INDEX IF NOT EXISTS idx_challenges_status ON challenges(status);
 CREATE INDEX IF NOT EXISTS idx_challenges_expires_at ON challenges(expires_at);
