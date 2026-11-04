@@ -56,12 +56,12 @@ cd stellar-x402-mcp
 pnpm install
 
 # Build contracts and packages
-cargo build --target wasm32v1-none --release
+cargo build --manifest-path packages/contracts/Cargo.toml --target wasm32v1-none --release
 pnpm build
 
 # Run test suites
 pnpm test
-cargo test --package receipt-vault
+cargo test --manifest-path packages/contracts/Cargo.toml
 ```
 
 ---
@@ -125,16 +125,16 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 
 #### Issue 5: Contract Settlement Semantic Assertions & Event Parsing
 - **Tier:** Medium (150 pts)
-- **Target File:** `contracts/receipt-vault/tests/settlement_semantics.rs`
+- **Target File:** `packages/contracts/tests/settlement_semantics.rs`
 - **Prerequisites:** None
-- **Scope:** Add unit tests asserting exact event topics `("SETTLE", receipt_id)` and data fields `(payer, beneficiary, amount, token)`. Verify that unauthorized invocations fail and that `Persistent` storage entry TTL is respected.
-- **Verification Command:** `cargo test --package receipt-vault --test settlement_semantics`
+- **Scope:** Add integration unit tests asserting exact event topics `("settle", payer, recipient)` and data fields `(token, amount, challenge_hash)` emitted by `X402PaymentVault`. Verify that unauthorized invocations fail and that `Persistent` storage entry TTL is respected.
+- **Verification Command:** `cargo test --manifest-path packages/contracts/Cargo.toml`
 
 #### Issue 6: `PostgresChallengeStore` Implementation with Fencing Tokens
 - **Tier:** High (200 pts)
-- **Target File:** `packages/gateway/src/stores/postgres.ts`
+- **Target File:** `packages/gateway/src/stores/postgres.ts`, `packages/gateway/src/stores/types.ts`
 - **Prerequisites:** Issue 4
-- **Scope:** Implement `IChallengeStore` against PostgreSQL with `clock_timestamp()` fencing tokens and monotonic `lease_generation`. Prevent concurrent zombie worker overrides.
+- **Scope:** Define the common `IChallengeStore` interface (extracting it from `ChallengeStore`) and implement `PostgresChallengeStore` against PostgreSQL with `clock_timestamp()` fencing tokens and monotonic `lease_generation`. Prevent concurrent zombie worker overrides.
 - **Verification Command:** `pnpm --filter @stellar-x402/gateway test`
 
 #### Issue 8: SEP-0041 SAC Deterministic Address Resolution & Asset Typing
@@ -185,10 +185,10 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 
 #### Issue 12: Decoupled `beneficiary: Address` in ReceiptVault
 - **Tier:** High (200 pts)
-- **Target File:** `contracts/receipt-vault/src/lib.rs`
+- **Target File:** `packages/contracts/src/lib.rs`
 - **Prerequisites:** Issue 5
 - **Scope:** Decouple `payer` (who authorizes the transfer) from `beneficiary` (the agent receiving the resource access), allowing smart contracts (`C...`) to pay on behalf of agents.
-- **Verification Command:** `cargo test --package receipt-vault`
+- **Verification Command:** `cargo test --manifest-path packages/contracts/Cargo.toml`
 
 #### Issue 13: Asynchronous Reconciliation Worker for Interrupted Challenges
 - **Tier:** High (200 pts)
