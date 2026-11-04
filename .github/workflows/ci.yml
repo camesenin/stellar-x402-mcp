@@ -86,17 +86,17 @@ jobs:
 
           # 2. Setup realistic legacy test fixtures with real multi-row data across all edge cases:
           # - Legacy column 'challenge_id' (before rename to id)
-          # - Legacy composite CHECK constraint covering status AND amount
+          # - Legacy composite CHECK constraint covering status AND amount_stroops
           # - Legacy table with amount_stroops NOT NULL
           # - Missing 'resource' column
-          # - Row 1: Valid legacy challenge with text amount '0.05' and distinct bound_tx_hash
+          # - Row 1: Valid legacy challenge with text amount '0.05' and distinct bound_tx_hash (requires REAL conversion to amount_stroops=500000)
           # - Row 2: Incomplete redeemed challenge (is_redeemed=1, missing txHash) -> must isolate into RECONCILIATION_REQUIRED
           # - Row 3: Challenge previously marked status='REDEEMED' with missing evidence -> must isolate into RECONCILIATION_REQUIRED
-          # - Row 4: Unmetered/unknown amount (amount IS NULL) -> must isolate into INCONCLUSIVE_MANUAL_REVIEW with amount_stroops NULL
-          # - Row 5: Challenge already in PERMANENT_QUARANTINE with NULL amount_stroops -> must PRESERVE status and NULL
-          # - Unique index/constraint test on challenges (canonical standard uniqueness allowing multiple nulls):
-          #   Row 2, 3 and 5 all have bound_tx_hash IS NULL, perfectly valid under standard unique constraint.
-          # - Protected specialized indexes: partial, text_pattern_ops, duplicate to purge.
+          # - Row 4: Unmetered/unknown amount (amount IS NULL) with amount_stroops=0 -> must normalize to amount_stroops=NULL and isolate into INCONCLUSIVE_MANUAL_REVIEW
+          # - Row 5: Challenge already in PERMANENT_QUARANTINE with amount_stroops=0 -> must normalize amount_stroops to NULL while strictly PRESERVING PERMANENT_QUARANTINE status
+          # - Duplicate btree index on bound_tx_hash to be purged
+          # - Protected partial index (WHERE status = 'PENDING')
+          # - Protected specialized text_pattern_ops index
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
             CREATE TABLE challenges (
               challenge_id TEXT PRIMARY KEY,
@@ -114,14 +114,14 @@ jobs:
               CONSTRAINT chk_legacy_composite CHECK (status IN ('PENDING', 'REDEEMED', 'PERMANENT_QUARANTINE') AND amount_stroops >= 0)
             );
 
-            -- Row 1: Valid legacy challenge
+            -- Row 1: Valid legacy challenge starting with amount_stroops unpopulated (0 in legacy schema) to test REAL conversion from '0.05'
             INSERT INTO challenges (
               challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
             ) VALUES (
               'ch_legacy_seed_1',
               'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
               '0.05',
-              500000,
+              0,
               'XLM',
               'memo_seed_1',
               'testnet',
@@ -168,7 +168,7 @@ jobs:
               1
             );
 
-            -- Row 4: Unmetered amount (amount IS NULL) -> must isolate to INCONCLUSIVE_MANUAL_REVIEW
+            -- Row 4: Unmetered amount (amount IS NULL, legacy amount_stroops=0) -> must isolate to INCONCLUSIVE_MANUAL_REVIEW with amount_stroops=NULL
             INSERT INTO challenges (
               challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
             ) VALUES (
@@ -186,7 +186,7 @@ jobs:
               0
             );
 
-            -- Row 5: Challenge already in PERMANENT_QUARANTINE with NULL hash -> status must be PRESERVED
+            -- Row 5: Challenge already in PERMANENT_QUARANTINE with amount_stroops=0 -> status must be PRESERVED and amount_stroops normalized to NULL
             INSERT INTO challenges (
               challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
             ) VALUES (
@@ -226,7 +226,10 @@ jobs:
               rec3 RECORD;
               rec4 RECORD;
               rec5 RECORD;
-              is_nullable TEXT;
+              v_is_nullable TEXT;
+              v_indnullsnotdistinct BOOLEAN;
+              v_pred TEXT;
+              v_opcname TEXT;
             BEGIN
               -- A. Column evolution and rename checks
               IF NOT EXISTS (
@@ -250,14 +253,15 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: resource column missing', step_name;
               END IF;
 
-              -- B. amount_stroops column must be nullable to support unmetered quarantined rows
-              SELECT is_nullable INTO is_nullable FROM information_schema.columns 
-              WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'amount_stroops';
-              IF is_nullable IS DISTINCT FROM 'YES' THEN
-                RAISE EXCEPTION '[%] Assertion failed: amount_stroops is not nullable (got %)', step_name, is_nullable;
+              -- B. amount_stroops column must be nullable (disables legacy NOT NULL)
+              SELECT cols.is_nullable INTO v_is_nullable FROM information_schema.columns cols
+              WHERE cols.table_schema = current_schema() AND cols.table_name = 'challenges' AND cols.column_name = 'amount_stroops';
+              IF v_is_nullable IS DISTINCT FROM 'YES' THEN
+                RAISE EXCEPTION '[%] Assertion failed: amount_stroops is not nullable (got %)', step_name, v_is_nullable;
               END IF;
 
-              -- C. Data preservation and conversion checks
+              -- C. Data preservation and conversion checks:
+              -- Validates that '0.05' was REAL converted to 500,000 stroops (started at 0 in fixture)
               SELECT * INTO rec1 FROM challenges WHERE id = 'ch_legacy_seed_1';
               IF rec1.id IS NULL THEN
                 RAISE EXCEPTION '[%] Assertion failed: legacy seed data was lost', step_name;
@@ -265,8 +269,9 @@ jobs:
               IF rec1.amount_stroops IS DISTINCT FROM 500000 THEN
                 RAISE EXCEPTION '[%] Assertion failed: amount 0.05 XLM not converted to 500,000 stroops (got %)', step_name, rec1.amount_stroops;
               END IF;
-              IF rec1.resource IS NULL OR rec1.created_at IS NULL OR rec1.expires_at IS NULL THEN
-                RAISE EXCEPTION '[%] Assertion failed: timestamps or resource not populated', step_name;
+              -- Verify exact converted timestamp (1793815521820 ms = 2026-11-04 18:05:21.82 UTC)
+              IF rec1.created_at IS DISTINCT FROM to_timestamp(1793815521820::double precision / 1000.0) THEN
+                RAISE EXCEPTION '[%] Assertion failed: created_at timestamp mismatch (got %)', step_name, rec1.created_at;
               END IF;
 
               -- D. Safe isolation check for incomplete redeemed challenges
@@ -285,14 +290,20 @@ jobs:
               IF rec4.status IS DISTINCT FROM 'INCONCLUSIVE_MANUAL_REVIEW' THEN
                 RAISE EXCEPTION '[%] Assertion failed: unmetered row not isolated into INCONCLUSIVE_MANUAL_REVIEW (got %)', step_name, rec4.status;
               END IF;
+              IF rec4.amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: unmetered row must have amount_stroops NULL (got %)', step_name, rec4.amount_stroops;
+              END IF;
 
-              -- F. Preservation of PERMANENT_QUARANTINE
+              -- F. Preservation of PERMANENT_QUARANTINE with NULL amount_stroops
               SELECT * INTO rec5 FROM challenges WHERE id = 'ch_legacy_seed_5';
               IF rec5.status IS DISTINCT FROM 'PERMANENT_QUARANTINE' THEN
                 RAISE EXCEPTION '[%] Assertion failed: PERMANENT_QUARANTINE degraded to %', step_name, rec5.status;
               END IF;
+              IF rec5.amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: quarantined row must have amount_stroops NULL (got %)', step_name, rec5.amount_stroops;
+              END IF;
 
-              -- G. Purge & Preservation Assertions
+              -- G. Purge & Structural Preservation Assertions
               -- 1. idx_legacy_duplicate_bound MUST be purged
               IF EXISTS (
                 SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -301,28 +312,29 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: idx_legacy_duplicate_bound was not purged by Case D', step_name;
               END IF;
 
-              -- 2. idx_legacy_partial_bound MUST be preserved
-              IF NOT EXISTS (
-                SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relname = 'idx_legacy_partial_bound' AND n.nspname = current_schema()
-              ) THEN
-                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_partial_bound was unexpectedly dropped', step_name;
+              -- 2. idx_legacy_partial_bound MUST be preserved with correct predicate
+              SELECT pg_get_expr(i.indpred, i.indrelid) INTO v_pred
+              FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE c.relname = 'idx_legacy_partial_bound' AND n.nspname = current_schema();
+              IF v_pred IS NULL OR v_pred NOT LIKE '%PENDING%' THEN
+                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_partial_bound lost its partial predicate (got %)', step_name, v_pred;
               END IF;
 
-              -- 3. idx_legacy_pattern_bound MUST be preserved
-              IF NOT EXISTS (
-                SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relname = 'idx_legacy_pattern_bound' AND n.nspname = current_schema()
-              ) THEN
-                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_pattern_bound was unexpectedly dropped', step_name;
+              -- 3. idx_legacy_pattern_bound MUST be preserved with text_pattern_ops
+              SELECT opc.opcname INTO v_opcname
+              FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+              JOIN pg_opclass opc ON opc.oid = i.indclass[0]
+              WHERE c.relname = 'idx_legacy_pattern_bound' AND n.nspname = current_schema();
+              IF v_opcname IS DISTINCT FROM 'text_pattern_ops' THEN
+                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_pattern_bound lost text_pattern_ops (got %)', step_name, v_opcname;
               END IF;
 
-              -- 4. Canonical constraint uq_challenges_bound_tx_hash MUST exist and be validated
-              IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
-                WHERE con.conname = 'uq_challenges_bound_tx_hash' AND c.relname = 'challenges' AND con.convalidated = true
-              ) THEN
-                RAISE EXCEPTION '[%] Assertion failed: canonical uq_challenges_bound_tx_hash constraint missing or unvalidated', step_name;
+              -- 4. Canonical constraint uq_challenges_bound_tx_hash MUST exist, be validated, and use standard uniqueness (indnullsnotdistinct = false)
+              SELECT i.indnullsnotdistinct INTO v_indnullsnotdistinct
+              FROM pg_constraint con JOIN pg_index i ON i.indexrelid = con.conindid JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE con.conname = 'uq_challenges_bound_tx_hash' AND c.relname = 'challenges' AND n.nspname = current_schema() AND con.convalidated = true;
+              IF v_indnullsnotdistinct IS NULL OR v_indnullsnotdistinct != false THEN
+                RAISE EXCEPTION '[%] Assertion failed: canonical constraint missing, unvalidated, or not standard unique (got indnullsnotdistinct=%)', step_name, v_indnullsnotdistinct;
               END IF;
             END;
             $$ LANGUAGE plpgsql;
@@ -366,6 +378,35 @@ jobs:
               clock_timestamp() + interval '5 minutes',
               NULL
             );
+          EOF
+
+          # 8. Rejection test: assert duplicate non-null bound_tx_hash is strictly rejected
+          psql -X -v ON_ERROR_STOP=1 << 'EOF'
+            DO $$
+            BEGIN
+              BEGIN
+                INSERT INTO challenges (
+                  id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash
+                ) VALUES (
+                  'ch_op_duplicate_hash',
+                  'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+                  100000,
+                  'XLM',
+                  'mcp://tools/test',
+                  'memo_dup',
+                  'testnet',
+                  'PENDING',
+                  clock_timestamp(),
+                  clock_timestamp() + interval '5 minutes',
+                  'tx_seed_hash_abc123' -- already used in ch_legacy_seed_1
+                );
+                RAISE EXCEPTION 'Assertion failed: duplicate non-null bound_tx_hash was not rejected';
+              EXCEPTION WHEN unique_violation THEN
+                -- Expected behavior
+                NULL;
+              END;
+            END;
+            $$;
           EOF
 
       - name: Run Vitest Unit Tests

@@ -114,20 +114,32 @@ BEGIN
     SELECT 1 FROM information_schema.columns 
     WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'amount'
   ) THEN
-    -- Convert valid numeric representations
+    -- Convert valid positive numeric representations
     UPDATE challenges 
     SET amount_stroops = (amount::NUMERIC * 10000000)::NUMERIC(40, 0)
     WHERE amount_stroops IS NULL AND amount IS NOT NULL 
       AND (amount::TEXT ~ '^[0-9]+(\.[0-9]{1,7})?$')
       AND (amount::NUMERIC > 0);
-
-    -- Unmetered, negative, or invalid amounts: do NOT fabricate currency!
-    -- Safely isolate into INCONCLUSIVE_MANUAL_REVIEW while preserving amount_stroops as NULL
-    -- Preserve rows that already have status = 'PERMANENT_QUARANTINE' or 'INCONCLUSIVE_MANUAL_REVIEW'
-    UPDATE challenges 
-    SET status = 'INCONCLUSIVE_MANUAL_REVIEW'
-    WHERE amount_stroops IS NULL AND (status IS NULL OR status NOT IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'));
   END IF;
+
+  -- Normalize unmetered or non-positive legacy amounts:
+  -- In canonical schema, amount_stroops must be NULL for quarantined rows (INCONCLUSIVE_MANUAL_REVIEW or PERMANENT_QUARANTINE),
+  -- and strictly > 0 for operational rows.
+  -- 1. Rows with amount_stroops <= 0 or invalid:
+  UPDATE challenges
+  SET status = 'INCONCLUSIVE_MANUAL_REVIEW', amount_stroops = NULL
+  WHERE (amount_stroops IS NOT NULL AND amount_stroops <= 0)
+    AND (status IS NULL OR status NOT IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'));
+
+  -- 2. Rows already in PERMANENT_QUARANTINE with non-positive amount: ensure amount_stroops is NULL
+  UPDATE challenges
+  SET amount_stroops = NULL
+  WHERE status = 'PERMANENT_QUARANTINE' AND amount_stroops IS NOT NULL AND amount_stroops <= 0;
+
+  -- 3. Rows with amount_stroops IS NULL: isolate to INCONCLUSIVE_MANUAL_REVIEW if not already permanently quarantined
+  UPDATE challenges 
+  SET status = 'INCONCLUSIVE_MANUAL_REVIEW'
+  WHERE amount_stroops IS NULL AND (status IS NULL OR status NOT IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'));
 
   -- Sync legacy is_redeemed boolean/int to status:
   IF EXISTS (
@@ -277,22 +289,32 @@ BEGIN
     END LOOP;
   END IF;
 
-  -- Case B: Drop non-canonical single-column UNIQUE constraints strictly covering bound_tx_hash
+  -- Case B: Drop non-canonical single-column UNIQUE constraints covering bound_tx_hash
+  -- Normalizes schema to canonical standard uniqueness (allowing multiple nulls for pending challenges)
   FOR r IN (
     SELECT con.conname
     FROM pg_constraint con
-    LEFT JOIN pg_index i ON i.indexrelid = con.conindid
     WHERE con.conrelid = 'challenges'::regclass
       AND con.contype = 'u'
       AND con.conkey = ARRAY[bound_attnum]
       AND con.conname != 'uq_challenges_bound_tx_hash'
-      AND (i.indnullsnotdistinct IS NULL OR i.indnullsnotdistinct = false) -- Strictly preserves any non-standard NULLS NOT DISTINCT constraint via pg_index
   ) LOOP
     EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
   END LOOP;
 
-  -- Case C: Ensure canonical uq_challenges_bound_tx_hash exists covering exactly bound_tx_hash
-  -- If another relation in the schema already occupies the canonical name, abort with explicit actionable diagnostic
+  -- Case C: Ensure canonical uq_challenges_bound_tx_hash exists covering exactly bound_tx_hash with standard uniqueness
+  -- If an existing constraint has NULLS NOT DISTINCT = true, drop and recreate as standard unique to allow multiple pending null hashes
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint con
+    JOIN pg_index i ON i.indexrelid = con.conindid
+    WHERE con.conrelid = 'challenges'::regclass
+      AND con.contype = 'u'
+      AND con.conname = 'uq_challenges_bound_tx_hash'
+      AND i.indnullsnotdistinct = true
+  ) THEN
+    ALTER TABLE challenges DROP CONSTRAINT uq_challenges_bound_tx_hash;
+  END IF;
+
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint
     WHERE conrelid = 'challenges'::regclass
