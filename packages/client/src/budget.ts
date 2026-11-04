@@ -176,15 +176,21 @@ export class BudgetManager {
    * Finalize reservation upon successful on-chain confirmation
    */
       public finalize(reservationId: string, destination: string, txHash: string, amountXlmFallback?: number): void {
-    // Idempotency: If this exact txHash has already been finalized, no-op to prevent duplicate billing!
+    const res = this.reservations.get(reservationId);
+
+    // Strict identity validation: if reservation exists and already has an assigned txHash, it MUST match!
+    if (res && res.txHash && res.txHash !== txHash) {
+      return; // Foreign transaction hash: preserve reservation in quarantine!
+    }
+
+    // Idempotency: If this exact txHash has already been finalized
     if (this.receipts.some(r => r.txHash === txHash)) {
-      if (this.reservations.has(reservationId)) {
+      if (res && (!res.txHash || res.txHash === txHash)) {
         this.reservations.delete(reservationId);
       }
       return;
     }
 
-    const res = this.reservations.get(reservationId);
     let amountStroops: bigint;
     if (res) {
       amountStroops = res.amountStroops;
@@ -313,10 +319,15 @@ export class BudgetManager {
     if (typeof outcome === 'object') {
       status = outcome.status;
       const parseEpochSec = (val: unknown): number | undefined => {
-        if (typeof val === 'number') return Number.isFinite(val) ? val : undefined;
+        if (typeof val === 'number') {
+          return Number.isFinite(val) && Number.isSafeInteger(val) && val > 0 ? val : undefined;
+        }
         if (typeof val === 'string') {
-          const parsed = Number(val.trim());
-          return Number.isFinite(parsed) ? parsed : undefined;
+          const trimmed = val.trim();
+          // Strictly require decimal digits only (reject hex, octal, scientific notation)
+          if (!/^\d+$/.test(trimmed)) return undefined;
+          const parsed = Number(trimmed);
+          return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
         }
         return undefined;
       };
@@ -344,18 +355,13 @@ export class BudgetManager {
     }
 
     if (status === 'SUCCESS') {
-      this.totalSettledStroops += res.amountStroops;
+      // Re-use finalize logic to ensure strict deduplication by txHash and atomic bookkeeping
       if (res.txHash && res.destination) {
-        this.receipts.push({
-          amount: stroopsToXlmNumber(res.amountStroops),
-          amountXlm: stroopsToXlmNumber(res.amountStroops),
-          amountStroops: res.amountStroops.toString(),
-          destination: res.destination,
-          timestamp: now,
-          txHash: res.txHash,
-        });
+        this.finalize(reservationId, res.destination, res.txHash, stroopsToXlmNumber(res.amountStroops));
+      } else {
+        this.totalSettledStroops += res.amountStroops;
+        this.reservations.delete(reservationId);
       }
-      this.reservations.delete(reservationId);
       return;
     }
 

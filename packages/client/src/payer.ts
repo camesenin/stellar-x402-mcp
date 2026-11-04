@@ -292,7 +292,10 @@ export class StellarPayer {
     }
 
     if (sendRes.hash && sendRes.hash.toLowerCase() !== localTxHash.toLowerCase()) {
-      throw new Error('RPC returned mismatched transaction hash');
+      const mismatchErr: any = new Error('RPC returned mismatched transaction hash');
+      mismatchErr.txHash = localTxHash;
+      mismatchErr.maxTime = signedMaxTimeSec;
+      throw mismatchErr;
     }
     const txHash = localTxHash;
 
@@ -395,7 +398,10 @@ export class StellarPayer {
     }
 
     if (result.hash && result.hash.toLowerCase() !== localTxHash.toLowerCase()) {
-      throw new Error('Horizon returned mismatched transaction hash');
+      const mismatchErr: any = new Error('Horizon returned mismatched transaction hash');
+      mismatchErr.txHash = localTxHash;
+      mismatchErr.maxTime = signedMaxTimeSec;
+      throw mismatchErr;
     }
 
     return {
