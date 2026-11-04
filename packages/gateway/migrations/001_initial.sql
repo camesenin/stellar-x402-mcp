@@ -6,7 +6,7 @@ BEGIN;
 CREATE TABLE IF NOT EXISTS challenges (
   id TEXT PRIMARY KEY,
   destination TEXT NOT NULL,
-  amount_stroops NUMERIC(40, 0) NOT NULL CHECK (amount_stroops > 0),
+  amount_stroops NUMERIC(40, 0),
   asset TEXT NOT NULL,
   resource TEXT NOT NULL,
   memo TEXT,
@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS challenges (
   bound_tx_hash TEXT,
   redeemed_at TIMESTAMPTZ,
   payer TEXT,
-  paid_amount_stroops NUMERIC(40, 0) CHECK (paid_amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops),
+  paid_amount_stroops NUMERIC(40, 0) CHECK (paid_amount_stroops IS NULL OR amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops),
   redeemed_ledger BIGINT CHECK (redeemed_ledger IS NULL OR redeemed_ledger >= 0),
   min_valid_ledger BIGINT CHECK (min_valid_ledger IS NULL OR min_valid_ledger >= 0),
   max_valid_ledger BIGINT CHECK (max_valid_ledger IS NULL OR (max_valid_ledger >= 0 AND (min_valid_ledger IS NULL OR max_valid_ledger >= min_valid_ledger))),
@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS challenges (
   lease_generation BIGINT NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
   version BIGINT NOT NULL DEFAULT 1 CHECK (version >= 1),
   CONSTRAINT chk_challenge_expiry CHECK (expires_at >= created_at),
+  CONSTRAINT chk_challenge_amount CHECK (
+    (amount_stroops IS NOT NULL AND amount_stroops > 0) OR
+    (amount_stroops IS NULL AND status IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'))
+  ),
   CONSTRAINT chk_redeemed_consistency CHECK (
     (status != 'REDEEMED') OR (bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND redeemed_at IS NOT NULL)
   ),
@@ -38,6 +42,30 @@ CREATE TABLE IF NOT EXISTS challenges (
 );
 
 -- Evolutionary schema migration support for existing deployments
+-- 0. Early Drop of Legacy CHECK constraints on status:
+-- In legacy tables with CHECK (status IN ('PENDING', 'REDEEMED')), updating rows to
+-- 'RECONCILIATION_REQUIRED' or 'INCONCLUSIVE_MANUAL_REVIEW' would fail if existing check constraints are not dropped first.
+DO $EARLY_STATUS_DROP$
+DECLARE
+  r RECORD;
+  status_attnum int2;
+BEGIN
+  SELECT attnum INTO status_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'status';
+  IF status_attnum IS NOT NULL THEN
+    ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_status;
+    FOR r IN (
+      SELECT con.conname
+      FROM pg_constraint con
+      WHERE con.conrelid = 'challenges'::regclass
+        AND con.contype = 'c'
+        AND con.conkey = ARRAY[status_attnum]
+    ) LOOP
+      EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
+    END LOOP;
+  END IF;
+END;
+$EARLY_STATUS_DROP$;
+
 -- 1. Identifier alignment: rename legacy 'challenge_id' to canonical 'id' if table used legacy PK name
 DO $EVOLVE_ID$
 BEGIN
@@ -78,20 +106,27 @@ ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS version BIGINT DEFAULT
 -- 3. Populate amount_stroops and reconcile legacy statuses
 DO $EVOLVE_DATA$
 BEGIN
-  -- Populate amount_stroops with exact scale without 64-bit intermediate clamp
+  -- Populate amount_stroops with exact scale without 64-bit intermediate clamp.
+  -- Safe cast: handles numeric or textual amounts that match Stellar decimal format (up to 7 decimal places).
   IF EXISTS (
     SELECT 1 FROM information_schema.columns 
     WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'amount'
   ) THEN
+    -- Convert valid numeric representations
     UPDATE challenges 
-    SET amount_stroops = ROUND(amount::NUMERIC * 10000000)::NUMERIC(40, 0)
-    WHERE amount_stroops IS NULL AND amount IS NOT NULL AND amount ~ '^[0-9]+(\.[0-9]+)?$';
+    SET amount_stroops = (amount::NUMERIC * 10000000)::NUMERIC(40, 0)
+    WHERE amount_stroops IS NULL AND amount IS NOT NULL 
+      AND (amount::TEXT ~ '^[0-9]+(\.[0-9]{1,7})?$')
+      AND (amount::NUMERIC > 0);
+
+    -- Unmetered, negative, or invalid amounts: do NOT fabricate currency!
+    -- Safely isolate into INCONCLUSIVE_MANUAL_REVIEW while preserving amount_stroops as NULL
+    UPDATE challenges 
+    SET status = 'INCONCLUSIVE_MANUAL_REVIEW'
+    WHERE amount_stroops IS NULL;
   END IF;
 
   -- Sync legacy is_redeemed boolean/int to status:
-  -- If full redemption cryptographic proof exists, transition to 'REDEEMED'
-  -- If redemption evidence is incomplete (missing hash, paid amount or timestamp), transition to 'RECONCILIATION_REQUIRED'
-  -- to isolate historical records without violating chk_redeemed_consistency!
   IF EXISTS (
     SELECT 1 FROM information_schema.columns 
     WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'is_redeemed'
@@ -108,6 +143,12 @@ BEGIN
       AND (is_redeemed::TEXT = '1' OR is_redeemed::TEXT = 'true')
       AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR redeemed_at IS NULL);
   END IF;
+
+  -- Reconcile any existing rows that were ALREADY marked 'REDEEMED' but lack proof:
+  UPDATE challenges
+  SET status = 'RECONCILIATION_REQUIRED'
+  WHERE status = 'REDEEMED'
+    AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR redeemed_at IS NULL);
 END;
 $EVOLVE_DATA$;
 
@@ -156,14 +197,12 @@ $EVOLVE_TIMESTAMPS$;
 UPDATE challenges SET resource = 'mcp://tools/default' WHERE resource IS NULL;
 -- Reconcile or quarantine unmetered rows without fabricating currency
 UPDATE challenges SET status = 'INCONCLUSIVE_MANUAL_REVIEW' WHERE amount_stroops IS NULL;
-UPDATE challenges SET amount_stroops = 0 WHERE amount_stroops IS NULL;
 UPDATE challenges SET status = 'PENDING' WHERE status IS NULL;
 UPDATE challenges SET lease_generation = 0 WHERE lease_generation IS NULL;
 UPDATE challenges SET version = 1 WHERE version IS NULL;
 
 ALTER TABLE IF EXISTS challenges ALTER COLUMN destination SET NOT NULL;
 ALTER TABLE IF EXISTS challenges ALTER COLUMN status SET NOT NULL;
-ALTER TABLE IF EXISTS challenges ALTER COLUMN amount_stroops SET NOT NULL;
 ALTER TABLE IF EXISTS challenges ALTER COLUMN asset SET NOT NULL;
 ALTER TABLE IF EXISTS challenges ALTER COLUMN resource SET NOT NULL;
 ALTER TABLE IF EXISTS challenges ALTER COLUMN network SET NOT NULL;
@@ -300,7 +339,10 @@ BEGIN
   -- 4. Invariant checks structural definition validation: Re-assert canonical definitions and ensure convalidated = true
   -- Drop existing named check if definition or validity differs, then add canonical validated check
   ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_amount;
-  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (amount_stroops > 0);
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (
+    (amount_stroops IS NOT NULL AND amount_stroops > 0) OR
+    (amount_stroops IS NULL AND status IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'))
+  );
 
   ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_redeemed_consistency;
   ALTER TABLE challenges ADD CONSTRAINT chk_redeemed_consistency CHECK ((status != 'REDEEMED') OR (bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND redeemed_at IS NOT NULL));

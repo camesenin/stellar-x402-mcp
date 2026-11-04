@@ -84,28 +84,28 @@ jobs:
           # Drop table to prepare realistic legacy migration suite
           psql -X -v ON_ERROR_STOP=1 -c "DROP TABLE IF EXISTS redeemed_transactions CASCADE; DROP TABLE IF EXISTS challenges CASCADE;"
 
-          # 2. Setup realistic legacy test fixtures with real multi-row data:
+          # 2. Setup realistic legacy test fixtures with real multi-row data across all edge cases:
           # - Legacy column 'challenge_id' (before rename to id)
-          # - BIGINT epoch milliseconds for created_at and expires_at
+          # - Legacy CHECK on status (CHECK status IN ('PENDING', 'REDEEMED'))
           # - Missing 'resource' column
-          # - Text amount (e.g. '0.05')
-          # - Row 1: Valid pending challenge with txHash
-          # - Row 2: Incomplete redeemed challenge (missing txHash -> isolated as RECONCILIATION_REQUIRED)
-          # - Row 3: Pending challenge without bound_tx_hash (hash IS NULL)
-          # - Row 4: Multiple pending challenges with hash IS NULL
+          # - Row 1: Valid legacy challenge with text amount '0.05'
+          # - Row 2: Incomplete redeemed challenge (is_redeemed=1, missing txHash) -> must isolate into RECONCILIATION_REQUIRED
+          # - Row 3: Challenge already marked status='REDEEMED' with missing evidence -> must isolate into RECONCILIATION_REQUIRED
+          # - Row 4: Unmetered/unknown amount (amount IS NULL) -> must isolate into INCONCLUSIVE_MANUAL_REVIEW with amount_stroops NULL
+          # - Row 5: Pending challenge with bound_tx_hash IS NULL
           # - Duplicate index to purge
           # - Protected partial index, protected text_pattern_ops index
           # - Protected standalone NULLS NOT DISTINCT index
-          # - Protected unique CONSTRAINT with NULLS NOT DISTINCT (valid PG16 syntax: UNIQUE NULLS NOT DISTINCT (col))
+          # - Protected unique CONSTRAINT with NULLS NOT DISTINCT (valid PG16 syntax)
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
             CREATE TABLE challenges (
               challenge_id TEXT PRIMARY KEY,
               destination TEXT NOT NULL,
-              amount TEXT NOT NULL,
+              amount TEXT,
               asset TEXT NOT NULL,
               memo TEXT NOT NULL,
               network TEXT NOT NULL,
-              status TEXT NOT NULL DEFAULT 'PENDING',
+              status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'REDEEMED')),
               expires_at BIGINT NOT NULL,
               created_at BIGINT NOT NULL,
               bound_tx_hash TEXT,
@@ -129,7 +129,7 @@ jobs:
               0
             );
 
-            -- Row 2: Incomplete redeemed record to verify safe isolation without failing chk_redeemed_consistency
+            -- Row 2: Incomplete is_redeemed=1 without hash -> must transition safely to RECONCILIATION_REQUIRED
             INSERT INTO challenges (
               challenge_id, destination, amount, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
             ) VALUES (
@@ -146,6 +146,40 @@ jobs:
               1
             );
 
+            -- Row 3: Previously marked status='REDEEMED' but lacking hash/proof -> must transition to RECONCILIATION_REQUIRED
+            INSERT INTO challenges (
+              challenge_id, destination, amount, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_3',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              '0.20',
+              'XLM',
+              'memo_seed_3',
+              'testnet',
+              'REDEEMED',
+              1793815821820,
+              1793815521820,
+              NULL,
+              1
+            );
+
+            -- Row 4: Unmetered amount (amount IS NULL) -> must isolate to INCONCLUSIVE_MANUAL_REVIEW without fabricating currency
+            INSERT INTO challenges (
+              challenge_id, destination, amount, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_4',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              NULL,
+              'XLM',
+              'memo_seed_4',
+              'testnet',
+              'PENDING',
+              1793815821820,
+              1793815521820,
+              'tx_unmetered_hash',
+              0
+            );
+
             -- 1. Index to be purged by Case D (standard duplicate btree text_ops on bound_tx_hash)
             CREATE INDEX idx_legacy_duplicate_bound ON challenges USING btree (bound_tx_hash);
 
@@ -158,19 +192,21 @@ jobs:
             -- 4. Protected standalone NULLS NOT DISTINCT index (MUST be preserved)
             CREATE UNIQUE INDEX idx_legacy_nulls_not_distinct ON challenges USING btree (bound_tx_hash) NULLS NOT DISTINCT;
 
-            -- 5. Protected unique CONSTRAINT with NULLS NOT DISTINCT (valid PostgreSQL 16 syntax: UNIQUE NULLS NOT DISTINCT (col))
+            -- 5. Protected unique CONSTRAINT with NULLS NOT DISTINCT (valid PostgreSQL 16 syntax)
             ALTER TABLE challenges ADD CONSTRAINT uq_legacy_nulls_not_distinct UNIQUE NULLS NOT DISTINCT (bound_tx_hash);
           EOF
 
           # 3. First evolutionary migration run
           psql -X -v ON_ERROR_STOP=1 -f packages/gateway/migrations/001_initial.sql
 
-          # 4. Comprehensive Schema & Data Integrity Assertions
+          # 4. Comprehensive Schema & Data Integrity Assertions (Run 1)
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
             DO $$
             DECLARE
               rec1 RECORD;
               rec2 RECORD;
+              rec3 RECORD;
+              rec4 RECORD;
             BEGIN
               -- A. Table & column evolution checks
               IF NOT EXISTS (
@@ -206,13 +242,27 @@ jobs:
                 RAISE EXCEPTION 'Assertion failed: timestamps or resource not populated';
               END IF;
 
-              -- C. Safe isolation check for incomplete redeemed challenge
+              -- C. Safe isolation check for incomplete redeemed challenges
               SELECT * INTO rec2 FROM challenges WHERE id = 'ch_legacy_seed_2';
               IF rec2.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
-                RAISE EXCEPTION 'Assertion failed: incomplete redeemed row not safely isolated into RECONCILIATION_REQUIRED (got %)', rec2.status;
+                RAISE EXCEPTION 'Assertion failed: incomplete is_redeemed row not safely isolated into RECONCILIATION_REQUIRED (got %)', rec2.status;
               END IF;
 
-              -- D. Purge & Preservation Assertions
+              SELECT * INTO rec3 FROM challenges WHERE id = 'ch_legacy_seed_3';
+              IF rec3.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
+                RAISE EXCEPTION 'Assertion failed: unproven REDEEMED row not safely isolated into RECONCILIATION_REQUIRED (got %)', rec3.status;
+              END IF;
+
+              -- D. Safe isolation check for unmetered row
+              SELECT * INTO rec4 FROM challenges WHERE id = 'ch_legacy_seed_4';
+              IF rec4.status IS DISTINCT FROM 'INCONCLUSIVE_MANUAL_REVIEW' THEN
+                RAISE EXCEPTION 'Assertion failed: unmetered row not isolated into INCONCLUSIVE_MANUAL_REVIEW (got %)', rec4.status;
+              END IF;
+              IF rec4.amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION 'Assertion failed: currency was fabricated for unmetered row (got %)', rec4.amount_stroops;
+              END IF;
+
+              -- E. Purge & Preservation Assertions
               -- 1. idx_legacy_duplicate_bound MUST be purged
               IF EXISTS (
                 SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -272,11 +322,30 @@ jobs:
             DO $$
             DECLARE
               rec1 RECORD;
+              rec2 RECORD;
+              rec3 RECORD;
+              rec4 RECORD;
             BEGIN
               SELECT * INTO rec1 FROM challenges WHERE id = 'ch_legacy_seed_1';
               IF rec1.id IS NULL OR rec1.amount_stroops IS DISTINCT FROM 500000 THEN
                 RAISE EXCEPTION 'Assertion failed: data degraded after 2nd run';
               END IF;
+
+              SELECT * INTO rec2 FROM challenges WHERE id = 'ch_legacy_seed_2';
+              IF rec2.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
+                RAISE EXCEPTION 'Assertion failed: rec2 degraded after 2nd run';
+              END IF;
+
+              SELECT * INTO rec3 FROM challenges WHERE id = 'ch_legacy_seed_3';
+              IF rec3.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
+                RAISE EXCEPTION 'Assertion failed: rec3 degraded after 2nd run';
+              END IF;
+
+              SELECT * INTO rec4 FROM challenges WHERE id = 'ch_legacy_seed_4';
+              IF rec4.status IS DISTINCT FROM 'INCONCLUSIVE_MANUAL_REVIEW' OR rec4.amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION 'Assertion failed: rec4 degraded after 2nd run';
+              END IF;
+
               IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_challenges_bound_tx_hash' AND convalidated = true) THEN
                 RAISE EXCEPTION 'Assertion failed: idempotency broken, uq_challenges_bound_tx_hash missing after 2nd run';
               END IF;
