@@ -129,10 +129,13 @@ BEGIN
 
     -- Case D: Early purge of standalone duplicate or incompatible indexes covering bound_tx_hash
     -- A. Drop ANY standalone unique index covering bound_tx_hash in ANY position with indnullsnotdistinct = true,
-    --    UNLESS its predicate strictly and safely guarantees that bound_tx_hash IS NOT NULL
-    --    (i.e. contains bound_tx_hash IS NOT NULL without any OR disjunction).
+    --    UNLESS its predicate strictly and structurally guarantees that bound_tx_hash IS NOT NULL as a top-level positive conjunction:
+    --    - Rejects NULL predicates (unconditional unique nulls not distinct).
+    --    - Rejects disjunctions (OR) that could admit NULLs on other branches.
+    --    - Rejects negations and boolean wrappers (NOT, IS TRUE, IS FALSE, IS NOT TRUE, IS NOT FALSE, NULLIF, CASE, COALESCE).
+    --    - Strictly requires positive top-level term 'bound_tx_hash IS NOT NULL'.
     -- B. Drop redundant identical single-column btree text_ops index matching canonical definition,
-    --    while strictly preserving partial indexes and specialized opclasses.
+    --    while strictly preserving valid partial indexes and specialized opclasses.
     FOR r IN (
       SELECT idx.relname AS index_name
       FROM pg_index i
@@ -152,6 +155,9 @@ BEGIN
             AND (
               i.indpred IS NULL 
               OR pg_get_expr(i.indpred, i.indrelid) ~* '\s+OR\s+'
+              OR pg_get_expr(i.indpred, i.indrelid) ~* '\bNOT\b'
+              OR pg_get_expr(i.indpred, i.indrelid) ~* '\bIS\s+(NOT\s+)?(TRUE|FALSE)\b'
+              OR pg_get_expr(i.indpred, i.indrelid) ~* '\b(CASE|COALESCE|NULLIF)\b'
               OR pg_get_expr(i.indpred, i.indrelid) !~* 'bound_tx_hash\s+IS\s+NOT\s+NULL'
             )
           )
