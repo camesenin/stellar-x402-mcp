@@ -38,7 +38,10 @@ To accommodate evaluator readiness criteria (curated backlog of 15–20 tasks) w
 - **Code Review:** PRs reviewed and commented within **< 48 hours**.
 - **Max Work-in-Progress (WIP):** Maximum 2 active issues per contributor to prevent hoarding.
 - **Fair Inactivity Timeout:** If an assigned contributor produces zero commits, zero draft PRs, and no communication for **48 hours**, the assignment is revoked. Contributor wait time due to maintainer review or CI infrastructure is explicitly excluded from this timeout.
-- **Resolution of Inconclusive Challenges:** If a reconciliation worker flags `INCONCLUSIVE_MANUAL_REVIEW`, maintainers investigate within 24h using Horizon transaction archive and resolve the challenge state without allowing duplicate settlements.
+- **Resolution of Inconclusive Challenges (Bounded Envelope Invalidation):** If a reconciliation worker flags `INCONCLUSIVE_MANUAL_REVIEW`, maintainers cannot administratively cancel the challenge or authorize a retry until one of two conditions is strictly proven on-chain:
+  1. The envelope's `timeBounds.maxTime` (or `ledgerBounds.maxLedger`) has definitively passed relative to the latest ledger timestamp, rendering the envelope cryptographically unexecutable.
+  2. A sequence-bumping or no-op transaction from the payer's source account has been mined at or beyond the envelope's sequence number.
+  This guarantees zero risk of duplicate execution if a delayed or re-transmitted envelope is mined after a retry.
 
 ### Local Development Environment
 ```bash
