@@ -90,18 +90,27 @@ export function createX402Fetch(config: ClientConfig) {
       let waitMs = 500 * Math.pow(2, retryAttempts); // Exponential backoff: 1000ms, 2000ms, 4000ms
       const retryAfterHeader = retryResponse.headers.get('Retry-After');
       if (retryAfterHeader) {
-        const parsedSec = parseInt(retryAfterHeader, 10);
-        if (!isNaN(parsedSec) && parsedSec > 0) {
-          waitMs = Math.max(waitMs, parsedSec * 1000);
+        const trimmedHeader = retryAfterHeader.trim();
+        // Strict integer seconds matching RFC 7231 (only digits)
+        if (/^\d+$/.test(trimmedHeader)) {
+          const parsedSec = Number(trimmedHeader);
+          if (parsedSec > 0) {
+            waitMs = Math.max(waitMs, parsedSec * 1000);
+          }
         } else {
-          const parsedDate = Date.parse(retryAfterHeader);
+          const parsedDate = Date.parse(trimmedHeader);
           if (!isNaN(parsedDate) && parsedDate > Date.now()) {
             waitMs = Math.max(waitMs, parsedDate - Date.now());
           }
         }
       }
 
-      await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 5000)));
+      // If server requests a wait exceeding 30s, do not delay silently; preserve receipt and return response
+      if (waitMs > 30_000) {
+        return retryResponse;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, waitMs));
       retryResponse = await fetch(input, retryInit);
     }
 

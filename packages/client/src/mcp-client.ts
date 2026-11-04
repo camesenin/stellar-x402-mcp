@@ -98,11 +98,18 @@ export class StellarPaidMcpClient {
           const isRetriable503 = callErr?.data?.retriable === true && callErr?.data?.statusCode === 503;
           if (isRetriable503 && mcpRetryAttempts < 3) {
             mcpRetryAttempts++;
-            // Exponential backoff: base 500ms * 2^attempts, respecting server retryAfterSec
+            // Exponential backoff: base 500ms * 2^attempts (1000ms, 2000ms, 4000ms)
             const baseWaitMs = 500 * Math.pow(2, mcpRetryAttempts);
-            const serverWaitMs = typeof callErr?.data?.retryAfterSec === 'number' ? callErr.data.retryAfterSec * 1000 : 0;
-            const finalWaitMs = Math.min(Math.max(baseWaitMs, serverWaitMs), 5000);
-            await new Promise(resolve => setTimeout(resolve, finalWaitMs));
+            const serverSec = callErr?.data?.retryAfterSec;
+            const validServerSec = typeof serverSec === 'number' && !isNaN(serverSec) && serverSec > 0 ? Math.floor(serverSec) : 0;
+            const serverWaitMs = validServerSec * 1000;
+            const waitMs = Math.max(baseWaitMs, serverWaitMs);
+
+            if (waitMs > 30_000) {
+              throw callErr;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, waitMs));
             continue;
           }
           throw callErr;

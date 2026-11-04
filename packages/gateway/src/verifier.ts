@@ -107,6 +107,9 @@ export class StellarPaymentVerifier {
    * completely independent of SDK internal private methods
    */
   public async fetchSorobanTxJsonRpc(txHash: string): Promise<Record<string, any> | null> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+
     try {
       const res = await fetch(this.sorobanRpcUrl, {
         method: 'POST',
@@ -117,12 +120,30 @@ export class StellarPaymentVerifier {
           method: 'getTransaction',
           params: { hash: txHash },
         }),
+        signal: controller.signal,
       });
-      if (!res.ok) return null;
+
+      if (!res.ok) {
+        if (res.status >= 500) {
+          throw new Error(`Soroban RPC HTTP ${res.status} gateway error`);
+        }
+        return null;
+      }
+
       const data = (await res.json()) as any;
+      if (data?.error) {
+        if (data.error.code === -32603 || /internal|timeout|busy/i.test(data.error.message)) {
+          throw new Error(`Soroban JSON-RPC transient error (${data.error.code}): ${data.error.message}`);
+        }
+      }
       return data?.result || null;
-    } catch {
+    } catch (err: any) {
+      if (err.name === 'AbortError' || /timeout|500|502|503|504|ECONNRESET/i.test(err.message)) {
+        throw new Error(`Soroban RPC getTransaction network timeout/transient failure: ${err.message}`);
+      }
       return null;
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -179,7 +200,8 @@ export class StellarPaymentVerifier {
     }
 
     // Strict Challenge Expiration Defense: reject if challenge is already expired before querying ledger (respecting allowGracePeriodMs up to 60s)
-    const effectiveGrace = Math.min(Math.max(0, allowGracePeriodMs), 60_000);
+    const numGrace = typeof allowGracePeriodMs === 'number' && !isNaN(allowGracePeriodMs) ? allowGracePeriodMs : 0;
+    const effectiveGrace = Math.min(Math.max(0, numGrace), 60_000);
     if (Date.now() > challenge.expiresAt + effectiveGrace) {
       return {
         valid: false,
@@ -509,6 +531,16 @@ export class StellarPaymentVerifier {
       };
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : String(err);
+      const isTransient = /503|504|502|500|timeout|ECONNRESET|ECONNREFUSED|ENOTFOUND/i.test(errorMsg);
+      if (isTransient) {
+        return {
+          valid: false,
+          retriable: true,
+          statusCode: 503,
+          reason: `Soroban RPC transient infrastructure failure: ${errorMsg}. Payment verification may be safely retried.`,
+          txHash,
+        };
+      }
       return {
         valid: false,
         reason: `Soroban verification error: ${errorMsg}`,
@@ -598,7 +630,7 @@ export class StellarPaymentVerifier {
     } catch (rpcErr: any) {
       // If error is genuine network/RPC timeout/5xx, rethrow as retriable RPC error instead of confusing with missing receipt
       const msg = rpcErr instanceof Error ? rpcErr.message : String(rpcErr);
-      if (msg.includes('504') || msg.includes('503') || msg.includes('timeout') || msg.includes('ENOTFOUND') || msg.includes('ECONNREFUSED')) {
+      if (/500|502|503|504|timeout|ECONNRESET|ECONNREFUSED|ENOTFOUND/i.test(msg)) {
         throw new Error(`Soroban RPC getContractData transient network failure: ${msg}`);
       }
       // If key is not found / 404 on ledger, return null

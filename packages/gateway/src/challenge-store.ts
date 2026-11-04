@@ -199,8 +199,9 @@ export class ChallengeStore {
     allowGracePeriodMs: number = 0
   ): void {
     const cleanHash = txHash.toLowerCase();
-    // Cap grace period at strict security boundary of 60_000ms
-    const effectiveGraceMs = Math.min(Math.max(0, allowGracePeriodMs), 60_000);
+    // Rigorous validation: parse and cap grace period at strict security boundary of 60_000ms
+    const numGrace = typeof allowGracePeriodMs === 'number' && !isNaN(allowGracePeriodMs) ? allowGracePeriodMs : 0;
+    const effectiveGraceMs = Math.min(Math.max(0, numGrace), 60_000);
 
     // Explicit IMMEDIATE transaction: acquires reserved write lock immediately preventing concurrent writers
     const transaction = this.db.transaction(() => {
@@ -245,7 +246,9 @@ export class ChallengeStore {
   }
 
   public cleanupExpired(graceSafetyMarginMs: number = 60_000): void {
-    const threshold = Date.now() - graceSafetyMarginMs;
+    // Invariant: Never allow grace margin to fall below 60,000ms safety boundary
+    const safeMargin = Math.max(typeof graceSafetyMarginMs === 'number' && !isNaN(graceSafetyMarginMs) ? graceSafetyMarginMs : 60_000, 60_000);
+    const threshold = Date.now() - safeMargin;
     const stmt = this.db.prepare(`
       DELETE FROM challenges WHERE expires_at < ? AND is_redeemed = 0
     `);

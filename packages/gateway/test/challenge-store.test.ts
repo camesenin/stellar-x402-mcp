@@ -20,7 +20,8 @@ export function setupWorkerPromiseLifecycle<T>(
   timeoutMs: number,
   timeoutMessage: string,
   onMessageReceived: (msg: unknown, settle: (err?: Error | null, val?: T) => void) => void,
-  commandToPost?: any
+  commandToPost?: any,
+  timerSpy?: { onTimerCleared?: () => void; onTimerFired?: () => void }
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let isSettled = false;
@@ -32,6 +33,7 @@ export function setupWorkerPromiseLifecycle<T>(
       if (deadlineTimer) {
         clearTimeout(deadlineTimer);
         deadlineTimer = null;
+        if (timerSpy?.onTimerCleared) timerSpy.onTimerCleared();
       }
       worker.off('message', onMessage);
       worker.off('exit', onExit);
@@ -56,6 +58,7 @@ export function setupWorkerPromiseLifecycle<T>(
 
     try {
       deadlineTimer = setTimeout(() => {
+        if (timerSpy?.onTimerFired) timerSpy.onTimerFired();
         settle(new Error(timeoutMessage));
       }, timeoutMs);
 
@@ -504,13 +507,20 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
         50,
         'Watchdog timeout',
         () => {},
-        { type: 'TEST_POST' }
+        { type: 'TEST_POST' },
+        {
+          onTimerCleared: () => { timerCleared = true; },
+          onTimerFired: () => { timerFired = true; },
+        }
       )
     ).rejects.toThrow('Simulated synchronous throw on exit registration');
 
     // Wait 100ms past the 50ms deadline to prove timer callback remained cancelled and never fired
     await new Promise(resolve => setTimeout(resolve, 100));
 
+    // Verifies timer was cancelled immediately and never fired (Condition 3)
+    expect(timerCleared).toBe(true);
+    expect(timerFired).toBe(false);
     expect(mockWorker.handlers['message']).toHaveLength(0);
   });
 
@@ -611,6 +621,60 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
 
     // c2 is beyond 60s grace window: safely purged!
     expect(store.getChallengeAllowExpired(c2.challengeId)).toBeUndefined();
+
+    // Verify invariant: calling cleanupExpired(0), negative values, or NaN NEVER bypasses 60s safety margin
+    store.cleanupExpired(0);
+    expect(store.getChallengeAllowExpired(c1.challengeId)).toBeDefined();
+
+    store.cleanupExpired(-5000);
+    expect(store.getChallengeAllowExpired(c1.challengeId)).toBeDefined();
+
+    store.cleanupExpired(NaN);
+    expect(store.getChallengeAllowExpired(c1.challengeId)).toBeDefined();
+
+    store.close();
+  });
+
+  it('strictly validates grace boundary limits at expiresAt + 60_000ms vs expiresAt + 60_001ms and rejects NaN/excessive grace', () => {
+    const store = new ChallengeStore(tempDbPath, 60_000);
+    const now = Date.now();
+    const txHash = '1'.repeat(64);
+
+    // Challenge that expired 59,900ms ago (within 60s grace)
+    const cValidGrace = store.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/res-edge-1',
+      'testnet',
+      undefined,
+      -59_900
+    );
+
+    // Should succeed within 60_000ms grace
+    expect(() => {
+      store.markRedeemed(cValidGrace.challengeId, txHash, undefined, 60_000);
+    }).not.toThrow();
+
+    // Challenge that expired 60,100ms ago (past 60s grace)
+    const cExpiredPastGrace = store.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/res-edge-2',
+      'testnet',
+      undefined,
+      -60_100
+    );
+
+    // Even if caller requests 120,000ms grace or NaN, store caps at 60,000ms and rejects!
+    expect(() => {
+      store.markRedeemed(cExpiredPastGrace.challengeId, '2'.repeat(64), undefined, 120_000);
+    }).toThrow('expired');
+
+    expect(() => {
+      store.markRedeemed(cExpiredPastGrace.challengeId, '3'.repeat(64), undefined, NaN);
+    }).toThrow('expired');
 
     store.close();
   });
