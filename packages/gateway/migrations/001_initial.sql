@@ -56,7 +56,7 @@ ALTER TABLE IF EXISTS challenges ALTER COLUMN amount_stroops TYPE NUMERIC(40, 0)
 ALTER TABLE IF EXISTS challenges ALTER COLUMN paid_amount_stroops TYPE NUMERIC(40, 0);
 
 -- Evolutionary check constraints enforcement for existing installations
-DO $
+DO $do$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_amount') THEN
     ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (amount_stroops > 0);
@@ -92,7 +92,7 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_version') THEN
     ALTER TABLE challenges ADD CONSTRAINT chk_challenge_version CHECK (version >= 1);
   END IF;
-END $;
+END $do$;
 
 CREATE INDEX IF NOT EXISTS idx_challenges_status ON challenges(status);
 CREATE INDEX IF NOT EXISTS idx_challenges_expires_at ON challenges(expires_at);

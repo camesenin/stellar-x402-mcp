@@ -94,20 +94,20 @@ export class BudgetManager {
    * - If a reservation has no txHash and was released with releaseAt, it is pruned once releaseAt passes.
    * - If a reservation was never finalized/released and TTL passes, it is pruned as abandoned.
    */
-  private pruneExpiredReservations(): void {
+    private pruneExpiredReservations(): void {
     const now = this.clock();
     for (const [id, res] of this.reservations.entries()) {
+      // In-flight broadcast transaction: protect from silent unmetered pruning
       if (res.txHash) {
-        // In-flight broadcast transaction: protect from silent unmetered pruning
         continue;
       }
+      // Explicitly released reservation without txHash
       if (res.releaseAt) {
         if (now >= res.releaseAt) {
           this.reservations.delete(id);
         }
-      } else if (now - res.reservedAt > this.reservationTtlMs) {
-        this.reservations.delete(id);
       }
+      // Never prune unreleased active reservations! They represent active operations in flight.
     }
   }
 
@@ -174,16 +174,22 @@ export class BudgetManager {
   /**
    * Finalize reservation upon successful on-chain confirmation
    */
-  public finalize(reservationId: string, destination: string, txHash: string): void {
+    public finalize(reservationId: string, destination: string, txHash: string, amountXlmFallback?: number): void {
     const res = this.reservations.get(reservationId);
-    if (!res) return;
+    let amountStroops: bigint;
+    if (res) {
+      amountStroops = res.amountStroops;
+      this.reservations.delete(reservationId);
+    } else {
+      // If reservation was somehow missing, guarantee expenditure accounting to prevent unmetered spending:
+      amountStroops = amountXlmFallback ? xlmToStroopsBigInt(amountXlmFallback) : this.maxPerCallStroops;
+    }
 
-    this.reservations.delete(reservationId);
-    this.totalSettledStroops += res.amountStroops;
+    this.totalSettledStroops += amountStroops;
     this.receipts.push({
-      amount: stroopsToXlmNumber(res.amountStroops),
-      amountXlm: stroopsToXlmNumber(res.amountStroops),
-      amountStroops: res.amountStroops.toString(),
+      amount: stroopsToXlmNumber(amountStroops),
+      amountXlm: stroopsToXlmNumber(amountStroops),
+      amountStroops: amountStroops.toString(),
       destination,
       timestamp: this.clock(),
       txHash,
@@ -338,15 +344,17 @@ export class BudgetManager {
 
     // For non-success outcomes (NOT_FOUND, FAILED): enforce fail-closed cryptographic proof
     if (res.txHash) {
-      if (latestLedgerCloseTime === undefined || isNaN(latestLedgerCloseTime)) {
+      // Must be finite positive numbers: reject Infinity, -Infinity, NaN, <= 0
+      if (typeof latestLedgerCloseTime !== 'number' || !Number.isFinite(latestLedgerCloseTime) || latestLedgerCloseTime <= 0) {
         return; // Ambiguous ledger time: maintain quarantine
       }
 
       const maxTimeSec = res.maxTimeSec ?? (res.releaseAt ? Math.floor((res.releaseAt - 15_000) / 1000) : undefined);
-      if (maxTimeSec === undefined || isNaN(maxTimeSec)) {
+      if (typeof maxTimeSec !== 'number' || !Number.isFinite(maxTimeSec) || maxTimeSec <= 0) {
         return; // Missing cryptographic bound: maintain quarantine
       }
 
+      // Ledger must have definitively advanced past transaction maxTime
       if (latestLedgerCloseTime <= maxTimeSec) {
         return; // Transaction could still land before maxTime: maintain quarantine
       }
@@ -355,7 +363,11 @@ export class BudgetManager {
         // Receipt definitively absent past expiration bound
       } else {
         const broadcastSec = res.broadcastAtSec ?? (maxTimeSec - 60);
-        if (oldestLedgerCloseTime === undefined || isNaN(oldestLedgerCloseTime) || oldestLedgerCloseTime > broadcastSec) {
+        if (
+          typeof oldestLedgerCloseTime !== 'number' ||
+          !Number.isFinite(oldestLedgerCloseTime) ||
+          oldestLedgerCloseTime > broadcastSec
+        ) {
           return; // RPC retention window pruned or missing: maintain quarantine
         }
       }

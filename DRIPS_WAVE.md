@@ -2,7 +2,7 @@
 
 **Repository:** `camesenin/stellar-x402-mcp`  
 **Network Program:** Drips Stellar Wave / Stellar Community Fund  
-**Audit Baseline Commit:** main branch (HEAD git rev-parse HEAD)
+**Audit Baseline Commit:** 3de5c10 (3de5c1059083270713eb07d55a6394f9aff5fc65 on main)  
 **QA Test Status:** 100% Green (55 Vitest automated test cases across packages + 8 Soroban Rust tests + simulated end-to-end agent MCP micropayment demo)  
 
 ---
@@ -41,7 +41,7 @@ The repository provides a complete curated catalog of **16 issues totaling 2,400
 - **Max Work-in-Progress (WIP):** Maximum 2 active issues per contributor to prevent hoarding.
 - **Fair Inactivity Timeout:** If an assigned contributor produces zero commits, zero draft PRs, and no communication for **48 hours**, the assignment is revoked. Contributor wait time due to maintainer review or CI infrastructure is explicitly excluded from this timeout.
 - **Resolution of Inconclusive Challenges (Dual-Proof Invariant against Double Charge):** If a reconciliation worker flags INCONCLUSIVE_MANUAL_REVIEW, a second charge or retry is strictly forbidden until the prior execution history is definitively proven. The maintainer or reconciler must execute the following deterministic protocol:
-  1. **Historical Ledger Lookup:** Query ound_tx_hash against Soroban RPC getTransaction and Horizon /transactions/{hash} across the entire ledger range spanning [created_ledger, max_valid_ledger]. Reconciler must verify that the RPC/Horizon node retention window fully covers created_ledger; if the node retention has pruned that ledger range (NOT_FOUND due to retention horizon), the transaction cannot be assumed non-executed and must proceed directly to Case C.
+  1. **Historical Ledger Lookup:** Query bound_tx_hash against Soroban RPC getTransaction and Horizon /transactions/{hash} across the entire ledger range spanning [created_ledger, max_valid_ledger]. Reconciler must verify that the RPC/Horizon node retention window fully covers created_ledger; if the node retention has pruned that ledger range (NOT_FOUND due to retention horizon), the transaction cannot be assumed non-executed and must proceed directly to Case C.
   2. **Case A (Prior Execution Detected & Semantically Validated):** If the transaction is discovered mined, it is NOT sufficient to check successful: true. The reconciler strictly parses operation payloads / contract events to verify: target contract/destination matches challenge contractId or destination, for Soroban contract invocations, the invoked function is settle_payment (emitting topic settle with [payer, recipient]) matching destination, exact token address, and exact stroops in canonical contract hash (nonce/hash based); for Classic payments, recipient matches destination, asset matches, memo matches challenge.memo exactly, and cumulative paid stroops >= amount_stroops. Once all semantic assertions pass, the challenge is promoted to CONFIRMED and the protected resource/token is released.
   3. **Case B (Proof of Non-Execution + Future Impossibility):** A challenge may ONLY be marked CANCELLED or released for a client retry if BOTH conditions are met: (a) *Past Non-Execution:* The transaction is proven to have never executed or failed irrevocably on-chain (	x_failed verified in closed ledger, distinguishing on-chain failure from submission rejections) across an unbroken ledger history window verified on a fully synced node whose retention encompasses both created_ledger and the expired validity bound, and (b) *Future Cryptographic Impossibility:* The envelope's 	imeBounds.maxTime (or ledgerBounds.maxLedger) has definitively elapsed past the latest closed ledger timestamp/sequence, guaranteeing it can never be mined subsequently.
   4. **Case C (Ambiguous Ledger History / Pruned RPC):** If ledger history within the validity window cannot be verified with 100% certainty, the challenge transitions to PERMANENT_QUARANTINE. Retries and refunds are locked until manual node ledger inspection, guaranteeing zero double-spend or double-fulfillment.
@@ -131,17 +131,17 @@ The backlog features **10 standalone tasks** with zero prerequisites, and **6 de
 
 #### Issue 6: PostgresChallengeStore Implementation with Fencing Tokens
 - **Tier:** High (200 pts)
-- **Target Files:** packages/gateway/src/stores/postgres.ts, packages/gateway/src/stores/types.ts, packages/gateway/src/verifier.ts, packages/gateway/src/middleware.ts, packages/client/src/payer.ts
+- **Target Files:** packages/gateway/src/stores/postgres.ts, packages/gateway/src/stores/types.ts, packages/gateway/src/verifier.ts, packages/gateway/src/middleware.ts, packages/client/src/payer.ts, packages/gateway/src/index.ts
 - **Prerequisites:** Issue 4
 - **Scope:**
-  1. **Asynchronous Interface Implementation:** Implement IChallengeStore against PostgreSQL 16 (pg connection pool) supporting all 11 core operations (createChallenge, getChallenge, indSubmissionTx, markRedeemed, isChallengeRedeemed, isTxRedeemed, getPendingChallenges, updateChallengeStatus, cquireLease, 
+  1. **Asynchronous Interface Implementation:** Implement IChallengeStore against PostgreSQL 16 (pg connection pool) supporting all 11 core operations (createChallenge, getChallenge, bindSubmissionTx, markRedeemed, isChallengeRedeemed, isTxRedeemed, getPendingChallenges, updateChallengeStatus, acquireLease, 
 enewLease, 
 eleaseLease).
-  2. **Verifier & Middleware Async Adaptation:** Upgrade StellarPaymentVerifier.verifyPayment and gateway middleware (middleware.ts) to fully wait store operations (wait store.isChallengeRedeemed(...), wait store.isTxRedeemed(...), and const committed = await store.markRedeemed(...)). Reject redemptions with 500/503 and do NOT grant resource access if database commit fails or is fenced out.
-  3. **Temporal & Generational Fencing:** In markRedeemed and updateChallengeStatus, enforce atomic CAS in SQL: WHERE id =  AND (lease_generation IS NULL OR lease_generation = ) AND (lease_owner IS NULL OR lease_owner = ) AND (lease_expires_at IS NULL OR lease_expires_at > clock_timestamp()).
-  4. **Pre-Broadcast Binding Handshake:** In packages/client/src/payer.ts and gateway router (POST /x402/bind), compute transaction hash locally from signed envelope XDR before RPC dispatch, and invoke binding handshake to register (challengeId, bound_tx_hash, envelope_xdr, min_valid_ledger, max_valid_ledger). Gateway enforces immutable 1:1 binding to prevent transaction substitution or front-running across distributed reconcilers.
+  2. **Verifier & Middleware Async Adaptation:** Upgrade StellarPaymentVerifier.verifyPayment and gateway middleware (middleware.ts) to fully await store operations (await store.isChallengeRedeemed(...), await store.isTxRedeemed(...), and const committed = await store.markRedeemed(...)). Reject redemptions with 500/503 and do NOT grant resource access if database commit fails or is fenced out.
+  3. **Temporal & Generational Fencing:** In markRedeemed and updateChallengeStatus, enforce atomic CAS in SQL: WHERE id =  AND (lease_generation IS NULL OR lease_generation = ) AND (lease_owner IS NULL OR lease_owner = ) AND (lease_expires_at IS NULL OR lease_expires_at > clock_timestamp()). Check 
+owCount === 1; abort and reject if 0 rows updated.
+  4. **Pre-Broadcast Binding Handshake Endpoint:** In packages/gateway/src/index.ts (route POST /x402/bind) and packages/client/src/payer.ts, compute transaction hash locally from signed envelope XDR before RPC dispatch, and invoke binding handshake to register (challengeId, bound_tx_hash, envelope_xdr, min_valid_ledger, max_valid_ledger). Gateway enforces immutable 1:1 binding to prevent transaction substitution or front-running across distributed reconcilers.
 - **Verification Command:** pnpm --filter @stellar-x402/gateway test && pnpm --filter @stellar-x402/client test
-
 #### Issue 8: SEP-0041 SAC Deterministic Address Resolution & Asset Typing
 - **Tier:** High (200 pts)
 - **Target File:** `packages/client/src/tokens/sac.ts`

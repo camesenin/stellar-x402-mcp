@@ -264,18 +264,34 @@ export class StellarPayer {
     }
 
     // Sign transaction with payer keypair
+    // Sign transaction with payer keypair
     prepared.sign(this.keypair);
 
-    // Submit transaction to Soroban RPC
-    const sendRes = await this.sorobanServer.sendTransaction(prepared);
+    // Cryptographic identity and bounds extracted locally prior to broadcast:
+    const localTxHash = (prepared as any).hash().toString('hex');
+    const signedMaxTimeSec = (prepared as any).timeBounds?.maxTime ? Number((prepared as any).timeBounds.maxTime) : Math.floor(Date.now() / 1000) + 60;
 
-    if (sendRes.status === 'ERROR') {
-      throw new Error(
-        `Soroban transaction submission failed: ${JSON.stringify(sendRes.errorResult)}`
-      );
+    // Submit transaction to Soroban RPC
+    let sendRes: any;
+    try {
+      sendRes = await this.sorobanServer.sendTransaction(prepared);
+    } catch (netErr: any) {
+      const broadcastErr: any = new Error('Soroban transport error');
+      broadcastErr.txHash = localTxHash;
+      broadcastErr.maxTime = signedMaxTimeSec;
+      throw broadcastErr;
     }
 
-    const txHash = sendRes.hash;
+    if (sendRes.status === 'ERROR') {
+      const subErr: any = new Error(
+        'Soroban transaction submission failed'
+      );
+      subErr.txHash = localTxHash;
+      subErr.maxTime = signedMaxTimeSec;
+      throw subErr;
+    }
+
+    const txHash = sendRes.hash || localTxHash;
 
     // Poll for ledger inclusion safely using standard JSON-RPC 2.0 (protocol-version agnostic)
     let status: string = sendRes.status;
@@ -285,26 +301,32 @@ export class StellarPayer {
     for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
       await new Promise((r) => setTimeout(r, 1000));
 
-      const rawTx = await fetchSorobanTxJsonRpc(this.sorobanRpcUrl, txHash);
-      if (rawTx) {
-        status = rawTx.status;
-        ledger = rawTx.ledger || rawTx.latestLedger;
-        if (status === 'SUCCESS') {
-          break;
+      try {
+        const rawTx = await fetchSorobanTxJsonRpc(this.sorobanRpcUrl, txHash);
+        if (rawTx) {
+          status = rawTx.status;
+          ledger = rawTx.ledger || rawTx.latestLedger;
+          if (status === 'SUCCESS') {
+            break;
+          }
+          if (status === 'FAILED') {
+            const failErr: any = new Error('Soroban settlement transaction failed on-chain');
+            failErr.txHash = txHash;
+            failErr.maxTime = signedMaxTimeSec;
+            throw failErr;
+          }
         }
-        if (status === 'FAILED') {
-          throw new Error(`Soroban settlement transaction failed on-chain: ${txHash}`);
-        }
+      } catch (pollErr: any) {
+        if (pollErr.message?.includes('failed on-chain')) throw pollErr;
       }
     }
 
     if (status !== 'SUCCESS') {
-      const timeoutErr: any = new Error(`Soroban transaction timed out waiting for inclusion. Hash: ${txHash}`);
+      const timeoutErr: any = new Error('Soroban transaction timed out waiting for inclusion');
       timeoutErr.txHash = txHash;
-      timeoutErr.maxTime = Math.floor(Date.now() / 1000) + 60;
+      timeoutErr.maxTime = signedMaxTimeSec;
       throw timeoutErr;
     }
-
     return {
       txHash,
       challengeId: challenge.challengeId,
@@ -356,7 +378,18 @@ export class StellarPayer {
 
     transaction.sign(this.keypair);
 
-    const result = await this.horizonServer.submitTransaction(transaction);
+    const localTxHash = transaction.hash().toString('hex');
+    const signedMaxTimeSec = transaction.timeBounds?.maxTime ? Number(transaction.timeBounds.maxTime) : Math.floor(Date.now() / 1000) + 60;
+
+    let result: any;
+    try {
+      result = await this.horizonServer.submitTransaction(transaction);
+    } catch (submitErr: any) {
+      const wrappedErr: any = new Error('Classic payment submission error');
+      wrappedErr.txHash = localTxHash;
+      wrappedErr.maxTime = signedMaxTimeSec;
+      throw wrappedErr;
+    }
 
     return {
       txHash: result.hash,
