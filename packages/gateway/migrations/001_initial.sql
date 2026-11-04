@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS challenges (
   network TEXT NOT NULL,
   contract_id TEXT,
   token_address TEXT,
+  beneficiary TEXT,
   status TEXT NOT NULL DEFAULT 'PENDING',
   created_at TIMESTAMPTZ NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL,

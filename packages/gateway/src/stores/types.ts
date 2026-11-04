@@ -1,5 +1,13 @@
 import { X402Challenge, VerificationResult } from '../types.js';
 
+export type ChallengeStatus =
+  | 'PENDING'
+  | 'RECONCILIATION_REQUIRED'
+  | 'CONFIRMED'
+  | 'REDEEMED'
+  | 'CANCELLED'
+  | 'PERMANENT_QUARANTINE';
+
 export interface IChallengeStore {
   createChallenge(
     destination: string,
@@ -33,6 +41,14 @@ export interface IChallengeStore {
   isChallengeRedeemed(challengeId: string): Promise<boolean>;
 
   isTxRedeemed(txHash: string): Promise<boolean>;
+
+  getPendingChallenges(limit?: number): Promise<X402Challenge[]>;
+
+  updateChallengeStatus(
+    challengeId: string,
+    status: ChallengeStatus,
+    reason?: string
+  ): Promise<boolean>;
 
   acquireLease(
     challengeId: string,
