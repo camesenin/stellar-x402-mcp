@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS challenges (
   bound_tx_hash TEXT,
   redeemed_at TIMESTAMPTZ,
   payer TEXT,
-  paid_amount_stroops NUMERIC(40, 0) CHECK (paid_amount_stroops IS NULL OR amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops),
+  paid_amount_stroops NUMERIC(40, 0),
   redeemed_ledger BIGINT CHECK (redeemed_ledger IS NULL OR redeemed_ledger >= 0),
   min_valid_ledger BIGINT CHECK (min_valid_ledger IS NULL OR min_valid_ledger >= 0),
   max_valid_ledger BIGINT CHECK (max_valid_ledger IS NULL OR (max_valid_ledger >= 0 AND (min_valid_ledger IS NULL OR max_valid_ledger >= min_valid_ledger))),
@@ -34,6 +34,14 @@ CREATE TABLE IF NOT EXISTS challenges (
   CONSTRAINT chk_challenge_amount CHECK (
     (amount_stroops IS NOT NULL AND amount_stroops != 'NaN'::numeric AND amount_stroops > 0) OR
     (amount_stroops IS NULL AND status IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'))
+  ),
+  CONSTRAINT chk_challenge_paid_amount CHECK (
+    paid_amount_stroops IS NULL OR 
+    (paid_amount_stroops != 'NaN'::numeric AND paid_amount_stroops > 0 AND (amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops))
+  ),
+  CONSTRAINT chk_challenge_z_i128_max CHECK (
+    (amount_stroops IS NULL OR amount_stroops <= 170141183460469231731687303715884105727) AND 
+    (paid_amount_stroops IS NULL OR paid_amount_stroops <= 170141183460469231731687303715884105727)
   ),
   CONSTRAINT chk_redeemed_consistency CHECK (
     (status != 'REDEEMED') OR (bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND redeemed_at IS NOT NULL)
@@ -373,11 +381,16 @@ BEGIN
       AND (bound_attnum = ANY(i.indkey[0:i.indnkeyatts-1]))
       AND (
         -- Condition A: ANY unique index with indnullsnotdistinct = true covering bound_tx_hash in any position
-        -- (which would reject multiple pending challenges with hash IS NULL), unless its partial predicate excludes nulls
+        -- (which would reject multiple pending challenges with hash IS NULL), unless its partial predicate is strictly
+        -- and solely bound_tx_hash IS NOT NULL without disjunctions (OR) that could admit null hashes
         (
           i.indisunique = true 
           AND i.indnullsnotdistinct = true
-          AND (i.indpred IS NULL OR pg_get_expr(i.indpred, i.indrelid) !~* 'bound_tx_hash\s+IS\s+NOT\s+NULL')
+          AND (
+            i.indpred IS NULL 
+            OR pg_get_expr(i.indpred, i.indrelid) ~* '\s+OR\s+'
+            OR pg_get_expr(i.indpred, i.indrelid) !~* '^\(?\s*bound_tx_hash\s+IS\s+NOT\s+NULL\s*\)?$'
+          )
         )
         OR
         -- Condition B: Redundant identical single-column btree text_ops index matching canonical definition
@@ -415,17 +428,21 @@ BEGIN
     (max_valid_ledger IS NULL OR (max_valid_ledger >= 0 AND (min_valid_ledger IS NULL OR max_valid_ledger >= min_valid_ledger)))
   );
 
-  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_i128_max;
-  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_i128_max CHECK (amount_stroops <= 170141183460469231731687303715884105727 AND (paid_amount_stroops IS NULL OR paid_amount_stroops <= 170141183460469231731687303715884105727));
-
-  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_expiry;
-  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_expiry CHECK (expires_at >= created_at);
-
   ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_paid_amount;
   ALTER TABLE challenges ADD CONSTRAINT chk_challenge_paid_amount CHECK (
     paid_amount_stroops IS NULL OR 
-    (paid_amount_stroops != 'NaN'::numeric AND (amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops))
+    (paid_amount_stroops != 'NaN'::numeric AND paid_amount_stroops > 0 AND (amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops))
   );
+
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_i128_max;
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_z_i128_max;
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_z_i128_max CHECK (
+    (amount_stroops IS NULL OR amount_stroops <= 170141183460469231731687303715884105727) AND 
+    (paid_amount_stroops IS NULL OR paid_amount_stroops <= 170141183460469231731687303715884105727)
+  );
+
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_expiry;
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_expiry CHECK (expires_at >= created_at);
 
   ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_redeemed_ledger;
   ALTER TABLE challenges ADD CONSTRAINT chk_challenge_redeemed_ledger CHECK (redeemed_ledger IS NULL OR redeemed_ledger >= 0);
