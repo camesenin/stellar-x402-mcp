@@ -97,8 +97,10 @@ jobs:
           # - Row 6: Challenge already in INCONCLUSIVE_MANUAL_REVIEW with amount_stroops='NaN' -> normalizes to amount_stroops=NULL and strictly PRESERVES INCONCLUSIVE_MANUAL_REVIEW
           # - Row 7: Legacy challenge with corrupt non-numeric amount text 'malformed_500' -> safe short-circuit isolates to INCONCLUSIVE_MANUAL_REVIEW without aborting
           # - Row 8: Legacy challenge with 34-digit integer overflow text -> safe short-circuit isolates to INCONCLUSIVE_MANUAL_REVIEW without aborting
+          # - Row 9: Legacy challenge with paid_amount_stroops = 'NaN' -> safe sanitization normalizes to NULL and isolates to RECONCILIATION_REQUIRED
           # - Legacy constraint with NULLS NOT DISTINCT (uq_challenges_bound_tx_hash) -> exercises Case C transition to standard unique!
           # - Duplicate btree index on bound_tx_hash to be purged
+          # - Incompatible composite unique index (status, bound_tx_hash) with NULLS NOT DISTINCT -> must be purged by Case D!
           # - Incompatible standalone unique index with NULLS NOT DISTINCT AND DESC order -> must be purged by Case D!
           # - Protected partial index (WHERE status = 'PENDING')
           # - Protected specialized text_pattern_ops index
@@ -115,6 +117,8 @@ jobs:
               expires_at BIGINT NOT NULL,
               created_at BIGINT NOT NULL,
               bound_tx_hash TEXT,
+              paid_amount_stroops NUMERIC(40, 0),
+              redeemed_at BIGINT,
               is_redeemed INTEGER NOT NULL DEFAULT 0,
               CONSTRAINT chk_legacy_composite CHECK (status IN ('PENDING', 'REDEEMED', 'INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE')),
               -- Legacy non-standard constraint with NULLS NOT DISTINCT exercising Case C transition:
@@ -265,16 +269,38 @@ jobs:
               0
             );
 
-            -- 1. Index to be purged by Case D (standard duplicate btree text_ops on bound_tx_hash)
+            -- Row 9: Row with paid_amount_stroops = 'NaN' -> tests safe sanitization of paid_amount_stroops
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, paid_amount_stroops, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_9',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              '0.30',
+              3000000,
+              'XLM',
+              'memo_seed_9',
+              'testnet',
+              'REDEEMED',
+              1793815821820,
+              1793815521820,
+              'tx_quarantined_hash_9',
+              'NaN'::numeric,
+              1
+            );
+
+            -- 1. Duplicate btree index on bound_tx_hash to be purged
             CREATE INDEX idx_legacy_duplicate_bound ON challenges USING btree (bound_tx_hash);
 
-            -- 2. Incompatible standalone unique index with NULLS NOT DISTINCT AND DESC order -> must be purged by Case D!
+            -- 2. Incompatible composite unique index (status, bound_tx_hash) with NULLS NOT DISTINCT -> must be purged by Case D!
+            CREATE UNIQUE INDEX idx_legacy_incompatible_composite_status_hash ON challenges (status, bound_tx_hash) NULLS NOT DISTINCT;
+
+            -- 3. Incompatible standalone unique index with NULLS NOT DISTINCT AND DESC order -> must be purged by Case D!
             CREATE UNIQUE INDEX idx_legacy_incompatible_nulls_not_distinct_desc ON challenges (bound_tx_hash DESC) NULLS NOT DISTINCT;
 
-            -- 3. Protected partial index (MUST be preserved)
+            -- 4. Protected partial index (MUST be preserved)
             CREATE INDEX idx_legacy_partial_bound ON challenges USING btree (bound_tx_hash) WHERE (status = 'PENDING');
 
-            -- 4. Protected specialized opclass index (MUST be preserved)
+            -- 5. Protected specialized opclass index (MUST be preserved)
             CREATE INDEX idx_legacy_pattern_bound ON challenges USING btree (bound_tx_hash text_pattern_ops);
           EOF
 
@@ -293,6 +319,7 @@ jobs:
               rec6 RECORD;
               rec7 RECORD;
               rec8 RECORD;
+              rec9 RECORD;
               v_is_nullable TEXT;
               v_indnullsnotdistinct BOOLEAN;
               v_pred TEXT;
@@ -390,7 +417,16 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: overflow string row not isolated (status %, amount_stroops %)', step_name, rec8.status, rec8.amount_stroops;
               END IF;
 
-              -- H. Purge & Structural Preservation Assertions
+              -- H. Safe sanitization of paid_amount_stroops = NaN
+              SELECT * INTO rec9 FROM challenges WHERE id = 'ch_legacy_seed_9';
+              IF rec9.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
+                RAISE EXCEPTION '[%] Assertion failed: rec9 with NaN paid_amount not isolated to RECONCILIATION_REQUIRED (got %)', step_name, rec9.status;
+              END IF;
+              IF rec9.paid_amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: NaN paid_amount was not sanitized to NULL (got %)', step_name, rec9.paid_amount_stroops;
+              END IF;
+
+              -- I. Purge & Structural Preservation Assertions
               -- 1. idx_legacy_duplicate_bound MUST be purged
               IF EXISTS (
                 SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -399,7 +435,15 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: idx_legacy_duplicate_bound was not purged by Case D', step_name;
               END IF;
 
-              -- 2. idx_legacy_incompatible_nulls_not_distinct_desc MUST be purged
+              -- 2. idx_legacy_incompatible_composite_status_hash MUST be purged
+              IF EXISTS (
+                SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relname = 'idx_legacy_incompatible_composite_status_hash' AND n.nspname = current_schema()
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_incompatible_composite_status_hash was not purged by Case D', step_name;
+              END IF;
+
+              -- 3. idx_legacy_incompatible_nulls_not_distinct_desc MUST be purged
               IF EXISTS (
                 SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE c.relname = 'idx_legacy_incompatible_nulls_not_distinct_desc' AND n.nspname = current_schema()
@@ -407,7 +451,7 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: idx_legacy_incompatible_nulls_not_distinct_desc was not purged by Case D', step_name;
               END IF;
 
-              -- 3. idx_legacy_partial_bound MUST be preserved with exact predicate
+              -- 4. idx_legacy_partial_bound MUST be preserved with exact predicate
               SELECT pg_get_expr(i.indpred, i.indrelid) INTO v_pred
               FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
               WHERE c.relname = 'idx_legacy_partial_bound' AND n.nspname = current_schema();
@@ -415,7 +459,7 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: idx_legacy_partial_bound lost its exact partial predicate (got %)', step_name, v_pred;
               END IF;
 
-              -- 4. idx_legacy_pattern_bound MUST be preserved with text_pattern_ops
+              -- 5. idx_legacy_pattern_bound MUST be preserved with text_pattern_ops
               SELECT opc.opcname INTO v_opcname
               FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
               JOIN pg_opclass opc ON opc.oid = i.indclass[0]
@@ -424,7 +468,7 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: idx_legacy_pattern_bound lost text_pattern_ops (got %)', step_name, v_opcname;
               END IF;
 
-              -- 5. Canonical constraint uq_challenges_bound_tx_hash MUST exist, be validated, and use standard uniqueness (indnullsnotdistinct = false)
+              -- 6. Canonical constraint uq_challenges_bound_tx_hash MUST exist, be validated, and use standard uniqueness (indnullsnotdistinct = false)
               SELECT i.indnullsnotdistinct INTO v_indnullsnotdistinct
               FROM pg_constraint con JOIN pg_index i ON i.indexrelid = con.conindid JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace
               WHERE con.conname = 'uq_challenges_bound_tx_hash' AND c.relname = 'challenges' AND n.nspname = current_schema() AND con.convalidated = true;
@@ -432,7 +476,7 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: canonical constraint missing, unvalidated, or not standard unique (got indnullsnotdistinct=%)', step_name, v_indnullsnotdistinct;
               END IF;
 
-              -- I. Operational Test: assert multiple pending challenges with bound_tx_hash IS NULL insert cleanly
+              -- J. Operational Test: assert multiple pending challenges with bound_tx_hash IS NULL insert cleanly
               INSERT INTO challenges (
                 id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash
               ) VALUES (
@@ -461,7 +505,7 @@ jobs:
                 NULL
               );
 
-              -- J. Duplicate Non-Null Hash Rejection Test: assert exact constraint rejection diagnostic
+              -- K. Duplicate Non-Null Hash Rejection Test: assert exact constraint rejection diagnostic
               BEGIN
                 INSERT INTO challenges (
                   id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash
@@ -486,7 +530,7 @@ jobs:
                 END IF;
               END;
 
-              -- K. Rejection of NaN on operational rows: assert chk_challenge_amount rejects NaN
+              -- L. Rejection of NaN on operational rows: assert chk_challenge_amount rejects NaN with exact constraint name diagnostic
               BEGIN
                 INSERT INTO challenges (
                   id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash
@@ -505,8 +549,36 @@ jobs:
                 );
                 RAISE EXCEPTION '[%] Assertion failed: NaN amount_stroops was not rejected on operational row', step_name;
               EXCEPTION WHEN check_violation THEN
-                -- Expected behavior: chk_challenge_amount strictly rejected NaN!
-                NULL;
+                GET STACKED DIAGNOSTICS v_diag_constraint = CONSTRAINT_NAME;
+                IF v_diag_constraint IS DISTINCT FROM 'chk_challenge_amount' THEN
+                  RAISE EXCEPTION '[%] Assertion failed: check violation triggered by % instead of chk_challenge_amount', step_name, v_diag_constraint;
+                END IF;
+              END;
+
+              -- M. Rejection of NaN on paid_amount_stroops: assert chk_challenge_paid_amount rejects NaN with exact constraint name diagnostic
+              BEGIN
+                INSERT INTO challenges (
+                  id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash, paid_amount_stroops
+                ) VALUES (
+                  'ch_op_nan_paid_' || step_name,
+                  'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+                  100000,
+                  'XLM',
+                  'mcp://tools/test',
+                  'memo_nan_paid',
+                  'testnet',
+                  'PENDING',
+                  clock_timestamp(),
+                  clock_timestamp() + interval '5 minutes',
+                  'tx_nan_paid_hash_' || step_name,
+                  'NaN'::numeric
+                );
+                RAISE EXCEPTION '[%] Assertion failed: NaN paid_amount_stroops was not rejected on operational row', step_name;
+              EXCEPTION WHEN check_violation THEN
+                GET STACKED DIAGNOSTICS v_diag_constraint = CONSTRAINT_NAME;
+                IF v_diag_constraint IS DISTINCT FROM 'chk_challenge_paid_amount' THEN
+                  RAISE EXCEPTION '[%] Assertion failed: check violation triggered by % instead of chk_challenge_paid_amount', step_name, v_diag_constraint;
+                END IF;
               END;
             END;
             $$ LANGUAGE plpgsql;

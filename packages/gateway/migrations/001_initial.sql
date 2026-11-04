@@ -134,6 +134,13 @@ BEGIN
       );
   END IF;
 
+  -- Sanitize paid_amount_stroops across all rows:
+  -- If paid_amount_stroops is NaN, non-positive, or corrupt, normalize it to NULL.
+  UPDATE challenges
+  SET paid_amount_stroops = NULL
+  WHERE paid_amount_stroops IS NOT NULL 
+    AND (paid_amount_stroops = 'NaN'::numeric OR paid_amount_stroops <= 0);
+
   -- Normalize unmetered, non-positive, or NaN legacy amounts:
   -- In canonical schema, amount_stroops must be NULL for quarantined rows (INCONCLUSIVE_MANUAL_REVIEW or PERMANENT_QUARANTINE),
   -- and strictly > 0 and != 'NaN' for operational rows.
@@ -165,20 +172,20 @@ BEGIN
     SET status = 'REDEEMED' 
     WHERE (status IS NULL OR status = 'PENDING') 
       AND (is_redeemed::TEXT = '1' OR is_redeemed::TEXT = 'true')
-      AND bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND redeemed_at IS NOT NULL;
+      AND bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND paid_amount_stroops != 'NaN'::numeric AND redeemed_at IS NOT NULL;
 
     UPDATE challenges 
     SET status = 'RECONCILIATION_REQUIRED' 
     WHERE (status IS NULL OR status = 'PENDING') 
       AND (is_redeemed::TEXT = '1' OR is_redeemed::TEXT = 'true')
-      AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR redeemed_at IS NULL);
+      AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR paid_amount_stroops = 'NaN'::numeric OR redeemed_at IS NULL);
   END IF;
 
-  -- Reconcile any existing rows that were ALREADY marked 'REDEEMED' but lack proof:
+  -- Reconcile any existing rows that were ALREADY marked 'REDEEMED' but lack proof or had NaN paid_amount:
   UPDATE challenges
   SET status = 'RECONCILIATION_REQUIRED'
   WHERE status = 'REDEEMED'
-    AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR redeemed_at IS NULL);
+    AND (bound_tx_hash IS NULL OR paid_amount_stroops IS NULL OR paid_amount_stroops = 'NaN'::numeric OR redeemed_at IS NULL);
 END;
 $EVOLVE_DATA$;
 
@@ -363,14 +370,19 @@ BEGIN
     LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
     WHERE tbl.oid = 'challenges'::regclass
       AND con.oid IS NULL -- Standalone index (not backing a constraint)
-      AND i.indkey[0] = bound_attnum
+      AND (bound_attnum = ANY(i.indkey[0:i.indnkeyatts-1]))
       AND (
-        -- Condition A: Incompatible standalone unique index with indnullsnotdistinct = true covering bound_tx_hash as primary key
-        (i.indisunique = true AND i.indnullsnotdistinct = true)
-        OR
-        -- Condition B: Redundant identical btree text_ops index matching canonical definition
+        -- Condition A: ANY unique index with indnullsnotdistinct = true covering bound_tx_hash in any position
+        -- (which would reject multiple pending challenges with hash IS NULL), unless its partial predicate excludes nulls
         (
-          i.indnkeyatts = 1 AND i.indnatts = 1 AND i.indpred IS NULL
+          i.indisunique = true 
+          AND i.indnullsnotdistinct = true
+          AND (i.indpred IS NULL OR pg_get_expr(i.indpred, i.indrelid) !~* 'bound_tx_hash\s+IS\s+NOT\s+NULL')
+        )
+        OR
+        -- Condition B: Redundant identical single-column btree text_ops index matching canonical definition
+        (
+          i.indkey[0] = bound_attnum AND i.indnkeyatts = 1 AND i.indnatts = 1 AND i.indpred IS NULL
           AND am.amname = 'btree' AND opc.opcname = 'text_ops' AND opcnsp.nspname = 'pg_catalog'
           AND i.indcollation[0] = (
             SELECT ci.indcollation[0] FROM pg_index ci
