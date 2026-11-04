@@ -9,10 +9,12 @@
 
 ## 1. Program Structure & Budget Caps (Exact Arithmetic Match)
 
-To accommodate evaluator readiness criteria (curated backlog of 15–20 tasks) while strictly adhering to Drips Network budget caps per repository/organization:
+The repository provides a complete curated catalog of **16 issues totaling 2,400 points** ready for immediate onboarding in the Drips Stellar Wave:
 
-- **Tranche 1 (Committed Wave 11 Allocation — Exactly 1,200 Points, 8 Issues):** Primary wave allocation fitting standard single-repository budget limits.
-- **Tranche 2 (Expansion / Wave 12 Pipeline — Exactly 1,200 Points, 8 Issues):** Secondary queue unlocked strictly upon Wave Hub budget expansion or carried over to Wave 12.
+- **Scenario A (Full Repository Allocation — 2,400 Points):** If the Wave Hub assigns a 2,400-point budget to the repository, all 16 issues are published and activated simultaneously.
+- **Scenario B (Standard Single-Repository Quota — 1,200 Points):** If Drips limits initial single-repo onboarding to 1,200 points:
+  * **Tranche 1 (Day 1 Activation — Exactly 1,200 Points, 8 Issues):** Activated immediately upon wave launch.
+  * **Tranche 2 (Mid-Wave Quota Expansion / Wave 12 — Exactly 1,200 Points, 8 Issues):** Activated either upon in-wave budget expansion requested by the maintainer once 50% of Tranche 1 is merged, or carried forward into Wave 12.
 
 ### Reconciled Complexity Tier Breakdown
 | Tier | Points | Tranche 1 (Committed) | Tranche 2 (Pipeline) | Total Issues | Total Points |
@@ -38,10 +40,13 @@ To accommodate evaluator readiness criteria (curated backlog of 15–20 tasks) w
 - **Code Review:** PRs reviewed and commented within **< 48 hours**.
 - **Max Work-in-Progress (WIP):** Maximum 2 active issues per contributor to prevent hoarding.
 - **Fair Inactivity Timeout:** If an assigned contributor produces zero commits, zero draft PRs, and no communication for **48 hours**, the assignment is revoked. Contributor wait time due to maintainer review or CI infrastructure is explicitly excluded from this timeout.
-- **Resolution of Inconclusive Challenges (Bounded Envelope Invalidation):** If a reconciliation worker flags `INCONCLUSIVE_MANUAL_REVIEW`, maintainers cannot administratively cancel the challenge or authorize a retry until one of two conditions is strictly proven on-chain:
-  1. The envelope's `timeBounds.maxTime` (or `ledgerBounds.maxLedger`) has definitively passed relative to the latest ledger timestamp, rendering the envelope cryptographically unexecutable.
-  2. A sequence-bumping or no-op transaction from the payer's source account has been mined at or beyond the envelope's sequence number.
-  This guarantees zero risk of duplicate execution if a delayed or re-transmitted envelope is mined after a retry.
+- **Resolution of Inconclusive Challenges (Dual-Proof Invariant against Double Charge):** If a reconciliation worker flags `INCONCLUSIVE_MANUAL_REVIEW`, a second charge or retry is strictly forbidden until the prior execution history is definitively proven. The maintainer or reconciler must execute the following deterministic protocol:
+  1. **Historical Ledger Lookup:** Query `bound_tx_hash` against Soroban RPC `getTransaction` and Horizon `/transactions/{hash}` across the entire ledger range spanning `[created_ledger, max_valid_ledger]`.
+  2. **Case A (Prior Execution Detected):** If the transaction was successfully mined, the challenge is immediately promoted to `CONFIRMED` and the protected resource/token is released. No second payment is ever requested.
+  3. **Case B (Proof of Non-Execution + Future Impossibility):** A challenge may ONLY be marked `CANCELLED` or released for a client retry if BOTH conditions are met:
+     - *Past Non-Execution:* The transaction is proven to have never executed or failed irrevocably on-chain (`tx_failed`, `tx_bad_auth`).
+     - *Future Cryptographic Impossibility:* The envelope's `timeBounds.maxTime` (or `ledgerBounds.maxLedger`) has definitively elapsed past the latest closed ledger timestamp, ensuring it can never be mined subsequently.
+  4. **Case C (Ambiguous Ledger History / Pruned RPC):** If ledger history within the validity window cannot be verified with 100% certainty, the challenge transitions to `PERMANENT_QUARANTINE`. Retries and refunds are locked until manual node ledger inspection, guaranteeing zero double-spend or double-fulfillment.
 
 ### Local Development Environment
 ```bash
