@@ -255,9 +255,6 @@ describe('StellarPayer & Autonomous Soroban Execution', () => {
         new Account(payer.getPublicKey(), '100')
       );
 
-      // Adversarial scenario 1: Horizon submitTransaction returns null
-      vi.spyOn((payer as any).horizonServer, 'submitTransaction').mockResolvedValueOnce(null);
-
       const challenge: ParsedChallenge = {
         challengeId: 'test-challenge-classic-null',
         destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
@@ -266,12 +263,31 @@ describe('StellarPayer & Autonomous Soroban Execution', () => {
         network: 'testnet',
       };
 
-      // Since result is null, receipt construction or post-broadcast handling should not escape without identity
-      // Actually result is null -> returnedHash is undefined, confirmedLedger is undefined, returns receipt with ledger: undefined
-      const receipt = await payer.settleClassicChallenge(challenge);
-      expect(receipt.txHash).toBeDefined();
-      expect(typeof receipt.txHash).toBe('string');
-      expect(receipt.ledger).toBeUndefined();
+      // Adversarial scenario 1A: Horizon submitTransaction returns null -> MUST FAIL CLOSED with localTxHash & maxTime!
+      vi.spyOn((payer as any).horizonServer, 'submitTransaction').mockResolvedValueOnce(null);
+
+      try {
+        await payer.settleClassicChallenge(challenge);
+        expect.unreachable('Should have thrown on null Horizon response');
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(Error);
+        expect(err.message).toContain('returned invalid or empty response');
+        expect(err.txHash).toBeDefined();
+        expect(err.maxTime).toBeGreaterThan(0);
+      }
+
+      // Adversarial scenario 1B: Horizon submitTransaction returns empty object or successful: false
+      vi.spyOn((payer as any).horizonServer, 'submitTransaction').mockResolvedValueOnce({ successful: false });
+
+      try {
+        await payer.settleClassicChallenge(challenge);
+        expect.unreachable('Should have thrown on failed Horizon response');
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(Error);
+        expect(err.message).toContain('failed on-chain');
+        expect(err.txHash).toBeDefined();
+        expect(err.maxTime).toBeGreaterThan(0);
+      }
 
       // Adversarial scenario 2: Horizon throws a primitive string
       vi.spyOn((payer as any).horizonServer, 'submitTransaction').mockRejectedValueOnce('Horizon internal socket hangup');
@@ -301,6 +317,19 @@ describe('StellarPayer & Autonomous Soroban Execution', () => {
         expect(err.txHash).not.toBe('FOREIGN_HASH');
         expect(err.txHash).toBeDefined();
         expect(err.maxTime).toBeGreaterThan(100);
+      }
+
+      // Adversarial scenario 4: Horizon throws unstringifiable object (Object.create(null))
+      const unstringifiable = Object.create(null);
+      vi.spyOn((payer as any).horizonServer, 'submitTransaction').mockRejectedValueOnce(unstringifiable);
+
+      try {
+        await payer.settleClassicChallenge(challenge);
+        expect.unreachable('Should have thrown on unstringifiable error');
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(Error);
+        expect(err.txHash).toBeDefined();
+        expect(err.maxTime).toBeGreaterThan(0);
       }
     });
   });

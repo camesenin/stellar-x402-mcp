@@ -324,13 +324,28 @@ export class StellarPayer {
         timestamp: Date.now(),
       };
     } catch (rawErr: any) {
-      const errMsg = rawErr instanceof Error ? rawErr.message : String(rawErr);
-      const enrichedErr: any = new Error(errMsg, { cause: rawErr });
+      let errMsg = 'Soroban settlement execution error';
+      try {
+        if (rawErr && typeof rawErr.message === 'string') {
+          errMsg = rawErr.message;
+        } else if (rawErr !== null && rawErr !== undefined) {
+          errMsg = String(rawErr);
+        }
+      } catch {
+        errMsg = 'Non-stringifiable Soroban settlement error';
+      }
+      let enrichedErr: any;
+      try {
+        enrichedErr = new Error(errMsg, { cause: rawErr });
+      } catch {
+        enrichedErr = new Error(errMsg);
+      }
       enrichedErr.txHash = localTxHash;
       enrichedErr.maxTime = signedMaxTimeSec;
       throw enrichedErr;
     }
   }
+  
 
   /**
    * Classic Stellar Horizon payment settlement
@@ -377,12 +392,27 @@ export class StellarPayer {
 
     try {
       const result: any = await this.horizonServer.submitTransaction(transaction);
-      const returnedHash = typeof result?.hash === 'string' ? result.hash : undefined;
+
+      if (!result || typeof result !== 'object') {
+        throw new Error('Horizon transaction submission returned invalid or empty response');
+      }
+
+      if (result.successful === false) {
+        throw new Error('Horizon transaction failed on-chain');
+      }
+
+      const returnedHash = typeof result.hash === 'string' ? result.hash : undefined;
       if (returnedHash && returnedHash.toLowerCase() !== localTxHash.toLowerCase()) {
         throw new Error('Horizon returned mismatched transaction hash');
       }
 
-      const confirmedLedger = typeof result?.ledger === 'number' ? result.ledger : undefined;
+      const confirmedLedger = typeof result.ledger === 'number' && Number.isSafeInteger(result.ledger) && result.ledger > 0
+        ? result.ledger
+        : undefined;
+
+      if (!confirmedLedger) {
+        throw new Error('Horizon transaction response missing valid ledger confirmation sequence');
+      }
 
       return {
         txHash: localTxHash,
@@ -394,8 +424,22 @@ export class StellarPayer {
         timestamp: Date.now(),
       };
     } catch (rawErr: any) {
-      const errMsg = rawErr instanceof Error ? rawErr.message : String(rawErr);
-      const enrichedErr: any = new Error(errMsg, { cause: rawErr });
+      let errMsg = 'Horizon settlement execution error';
+      try {
+        if (rawErr && typeof rawErr.message === 'string') {
+          errMsg = rawErr.message;
+        } else if (rawErr !== null && rawErr !== undefined) {
+          errMsg = String(rawErr);
+        }
+      } catch {
+        errMsg = 'Non-stringifiable Horizon settlement error';
+      }
+      let enrichedErr: any;
+      try {
+        enrichedErr = new Error(errMsg, { cause: rawErr });
+      } catch {
+        enrichedErr = new Error(errMsg);
+      }
       enrichedErr.txHash = localTxHash;
       enrichedErr.maxTime = signedMaxTimeSec;
       throw enrichedErr;

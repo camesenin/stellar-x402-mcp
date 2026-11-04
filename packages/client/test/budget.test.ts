@@ -334,8 +334,11 @@ describe('BudgetManager', () => {
     const r = budget.reserve(0.1);
     budget.release(r, 160_000, 'tx_hash_A', 'GMERCHANT_1');
 
-    // Adversarial second release attempt: trying to overwrite with hash B and shorter maxTime 101s (101_000ms)
+    // Adversarial second release attempt A: trying to overwrite with DIFFERENT hash B and shorter maxTime 101s (101_000ms)
     budget.release(r, 101_000, 'tx_hash_B', 'GMERCHANT_2');
+
+    // Adversarial second release attempt B: trying to shorten with the EXACT SAME hash A and shorter maxTime 101s (101_000ms)
+    budget.release(r, 101_000, 'tx_hash_A', 'GMERCHANT_1');
 
     // Advance mock time to 117s (117_000ms)
     mockTime = 117_000;
