@@ -160,7 +160,8 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
     let postWaitExpired = false;
 
     try {
-      store = new ChallengeStore(tempDbPath, 100, 10_000);
+      // Set busyTimeout to 4_000ms so SQLite unblocks before the 5_000ms phase deadline if held
+      store = new ChallengeStore(tempDbPath, 100, 4_000);
 
       // Worker script running in a genuine separate OS thread with independent SQLite connection
       const workerScript = `
@@ -199,7 +200,10 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
         const settle = (err?: Error | null) => {
           if (isSettled) return;
           isSettled = true;
-          if (deadlineTimer) clearTimeout(deadlineTimer);
+          if (deadlineTimer) {
+            clearTimeout(deadlineTimer);
+            deadlineTimer = null;
+          }
           if (worker) {
             worker.off('message', onMessage);
             worker.off('exit', onExit);
@@ -227,13 +231,17 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
           }
         };
 
-        deadlineTimer = setTimeout(() => {
-          settle(new Error('Worker initialization timed out after 3000ms'));
-        }, 3_000);
+        try {
+          deadlineTimer = setTimeout(() => {
+            settle(new Error('Worker initialization timed out after 3000ms'));
+          }, 3_000);
 
-        worker.on('message', onMessage);
-        worker.once('exit', onExit);
-        worker.once('error', onError);
+          worker.on('message', onMessage);
+          worker.once('exit', onExit);
+          worker.once('error', onError);
+        } catch (setupErr) {
+          settle(setupErr instanceof Error ? setupErr : new Error(String(setupErr)));
+        }
       });
 
       // 2. NOW create challenge with 120ms TTL (Worker is confirmed hot and ready)
@@ -256,7 +264,10 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
         const settle = (err?: Error | null) => {
           if (isSettled) return;
           isSettled = true;
-          if (deadlineTimer) clearTimeout(deadlineTimer);
+          if (deadlineTimer) {
+            clearTimeout(deadlineTimer);
+            deadlineTimer = null;
+          }
           if (worker) {
             worker.off('message', onMessage);
             worker.off('exit', onExit);
@@ -303,28 +314,53 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
           }
         };
 
-        deadlineTimer = setTimeout(() => {
-          settle(new Error('Contention lifecycle timed out after 5000ms'));
-        }, 5_000);
+        try {
+          deadlineTimer = setTimeout(() => {
+            settle(new Error('Contention lifecycle timed out after 5000ms'));
+          }, 5_000);
 
-        worker!.on('message', onMessage);
-        worker!.once('exit', onExit);
-        worker!.once('error', onError);
-        worker!.postMessage({ type: 'START_LOCK' });
+          worker!.on('message', onMessage);
+          worker!.once('exit', onExit);
+          worker!.once('error', onError);
+          worker!.postMessage({ type: 'START_LOCK' });
+        } catch (setupErr) {
+          settle(setupErr instanceof Error ? setupErr : new Error(String(setupErr)));
+        }
       });
     } finally {
-      // Robust termination & store closure: race worker termination against 2000ms timeout
+      // Robust termination & store closure: race worker termination against 2000ms timeout with active timer clearing
+      let workerTerminationError: Error | null = null;
       try {
         if (worker) {
-          await Promise.race([
-            worker.terminate(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Worker terminate timed out after 2000ms')), 2000)),
-          ]).catch(() => {});
+          let termTimer: NodeJS.Timeout | null = null;
+          try {
+            await Promise.race([
+              worker.terminate().then(() => {
+                if (termTimer) clearTimeout(termTimer);
+              }),
+              new Promise((_, reject) => {
+                termTimer = setTimeout(() => {
+                  reject(new Error('Worker termination timed out after 2000ms'));
+                }, 2000);
+              }),
+            ]);
+          } catch (termErr) {
+            workerTerminationError = termErr instanceof Error ? termErr : new Error(String(termErr));
+          } finally {
+            if (termTimer) {
+              clearTimeout(termTimer);
+              termTimer = null;
+            }
+          }
         }
       } finally {
         if (store) {
           store.close();
         }
+      }
+
+      if (workerTerminationError) {
+        throw workerTerminationError;
       }
     }
 
@@ -357,4 +393,12 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
       verifyStore.close();
     }
   }, 15_000);
+
+  it('guarantees database connection closure if ChallengeStore constructor throws during initialization', () => {
+    // Attempt to open ChallengeStore in a non-existent subdirectory
+    const invalidDbPath = path.join(os.tmpdir(), `non_existent_dir_${Date.now()}`, 'store.sqlite');
+    expect(() => {
+      new ChallengeStore(invalidDbPath);
+    }).toThrow();
+  });
 });

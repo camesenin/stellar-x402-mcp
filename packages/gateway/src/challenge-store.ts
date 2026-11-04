@@ -21,9 +21,18 @@ export class ChallengeStore {
     busyTimeoutMs: number = 10_000
   ) {
     this.db = new Database(dbPath, { timeout: busyTimeoutMs });
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = FULL');
-    this.initSchema();
+    try {
+      this.db.pragma('journal_mode = WAL');
+      this.db.pragma('synchronous = FULL');
+      this.initSchema();
+    } catch (err) {
+      try {
+        this.db.close();
+      } catch {
+        // Suppress secondary close errors during initialization abort
+      }
+      throw err;
+    }
   }
 
   private initSchema(): void {
