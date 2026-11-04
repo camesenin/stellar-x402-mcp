@@ -475,7 +475,20 @@ export class StellarPaymentVerifier {
           ledger: rawTx.ledger || rawTx.latestLedger,
         });
       } catch (redeemErr: unknown) {
+        const isBusy = (redeemErr as any)?.code === 'SQLITE_BUSY' ||
+          (redeemErr instanceof Error && (redeemErr.message.includes('SQLITE_BUSY') || redeemErr.message.includes('database is locked')));
         const errMsg = redeemErr instanceof Error ? redeemErr.message : String(redeemErr);
+
+        if (isBusy) {
+          return {
+            valid: false,
+            retriable: true,
+            statusCode: 503,
+            reason: `Database busy under writer contention: ${errMsg}. Payment is verified on-chain and unconsumed; please retry verification.`,
+            txHash,
+          };
+        }
+
         return {
           valid: false,
           reason: `Settlement aborted: ${errMsg}`,
@@ -774,7 +787,20 @@ export class StellarPaymentVerifier {
           ledger: tx.ledger_attr,
         });
       } catch (redeemErr: unknown) {
+        const isBusy = (redeemErr as any)?.code === 'SQLITE_BUSY' ||
+          (redeemErr instanceof Error && (redeemErr.message.includes('SQLITE_BUSY') || redeemErr.message.includes('database is locked')));
         const errMsg = redeemErr instanceof Error ? redeemErr.message : String(redeemErr);
+
+        if (isBusy) {
+          return {
+            valid: false,
+            retriable: true,
+            statusCode: 503,
+            reason: `Database busy under writer contention: ${errMsg}. Payment is verified on-chain and unconsumed; please retry verification.`,
+            txHash: cleanHash,
+          };
+        }
+
         return {
           valid: false,
           reason: `Settlement aborted: ${errMsg}`,

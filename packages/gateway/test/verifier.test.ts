@@ -843,5 +843,63 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
       expect(result.reason).toContain('Domain-separated message mismatch');
       expect(store.isTxRedeemed(cleanHash)).toBe(false);
     });
+
+    it('treats SQLITE_BUSY during redemption as temporary unconsumed retriable 503 without consuming challenge or requiring new payment', async () => {
+      const challenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/resource'
+      );
+
+      const payerKp = Keypair.random();
+      const cleanHash = 'busy_retriable_tx';
+
+      const mockTx = {
+        id: cleanHash,
+        successful: true,
+        source_account: payerKp.publicKey(),
+        memo: challenge.memo,
+        ledger_attr: 50005,
+        operations: async () => ({
+          records: [
+            {
+              type: 'payment',
+              to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+              from: payerKp.publicKey(),
+              source_account: payerKp.publicKey(),
+              amount: '0.05',
+              asset_type: 'native',
+            },
+          ],
+          next: async () => ({ records: [] }),
+        }),
+      };
+
+      vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+        transaction: vi.fn().mockReturnValue({
+          call: vi.fn().mockResolvedValue(mockTx),
+        }),
+      } as any);
+
+      // Simulate SQLITE_BUSY error on store.markRedeemed
+      const sqliteBusyError = new Error('SQLITE_BUSY: database is locked');
+      (sqliteBusyError as any).code = 'SQLITE_BUSY';
+      vi.spyOn(store, 'markRedeemed').mockImplementation(() => {
+        throw sqliteBusyError;
+      });
+
+      const result = await verifier.verifyPayment(cleanHash, challenge, store);
+
+      // 1. Assert result is valid: false, but marked retriable with 503 status code
+      expect(result.valid).toBe(false);
+      expect(result.retriable).toBe(true);
+      expect(result.statusCode).toBe(503);
+      expect(result.reason).toContain('Database busy under writer contention');
+
+      // 2. Challenge and tx hash remain completely unconsumed for retry!
+      expect(store.isTxRedeemed(cleanHash)).toBe(false);
+      expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(false);
+    });
   });
 });
