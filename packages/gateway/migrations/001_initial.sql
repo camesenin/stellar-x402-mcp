@@ -94,7 +94,7 @@ BEGIN
 
   -- 2. Structural handling of UNIQUE constraints covering bound_tx_hash
   -- Case A: Name collision where 'uq_challenges_bound_tx_hash' exists on different columns.
-  -- RENAME the existing constraint dynamically with unique suffix to preserve business invariants rather than dropping it!
+  -- RENAME the existing constraint dynamically checking pg_constraint AND pg_class in current schema to prevent index collisions
   IF EXISTS (
     SELECT 1 FROM pg_constraint
     WHERE conrelid = 'challenges'::regclass
@@ -104,7 +104,16 @@ BEGIN
   ) THEN
     LOOP
       target_rename := 'uq_challenges_legacy_composite_' || rename_suffix::text;
-      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = target_rename) THEN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        WHERE t.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'challenges'::regclass)
+          AND c.conname = target_rename
+      ) AND NOT EXISTS (
+        SELECT 1 FROM pg_class
+        WHERE relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'challenges'::regclass)
+          AND relname = target_rename
+      ) THEN
         EXECUTE format('ALTER TABLE challenges RENAME CONSTRAINT uq_challenges_bound_tx_hash TO %I', target_rename);
         EXIT;
       END IF;
@@ -135,75 +144,57 @@ BEGIN
     ALTER TABLE challenges ADD CONSTRAINT uq_challenges_bound_tx_hash UNIQUE (bound_tx_hash);
   END IF;
 
-  -- 3. Case D: Drop any redundant standalone indexes strictly on bound_tx_hash (leaving constraint index)
+  -- 3. Case D: Drop only redundant standalone indexes strictly on bound_tx_hash alone (no INCLUDE, no predicate, b-tree)
   FOR r IN (
     SELECT idx.relname AS index_name
     FROM pg_index i
     JOIN pg_class idx ON idx.oid = i.indexrelid
     JOIN pg_class tbl ON tbl.oid = i.indrelid
+    JOIN pg_am am ON am.oid = idx.relam
     LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
     WHERE tbl.oid = 'challenges'::regclass
       AND i.indnkeyatts = 1
+      AND i.indnatts = 1 -- Strictly exactly 1 column total: PRESERVES any INCLUDE columns!
       AND i.indkey[0] = bound_attnum
+      AND i.indpred IS NULL -- Preserves partial indexes!
+      AND am.amname = 'btree'
       AND con.oid IS NULL -- Not backing a constraint
   ) LOOP
     EXECUTE format('DROP INDEX IF EXISTS %I', r.index_name);
   END LOOP;
 
-  -- 4. Invariant checks structural definition validation
-  -- Amount > 0
-  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_amount') THEN
-    IF pg_get_constraintdef((SELECT oid FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_amount')) !~ '^\s*CHECK\s*\(\s*\(?amount_stroops\s*>\s*0\)?\s*\)\s*$' THEN
-      ALTER TABLE challenges DROP CONSTRAINT chk_challenge_amount;
-      ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (amount_stroops > 0);
-    END IF;
-  ELSE
-    ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (amount_stroops > 0);
-  END IF;
+  -- 4. Invariant checks structural definition validation: Re-assert canonical definitions and ensure convalidated = true
+  -- Drop existing named check if definition or validity differs, then add canonical validated check
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_amount;
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (amount_stroops > 0);
 
-  -- Redeemed consistency
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_redeemed_consistency') THEN
-    ALTER TABLE challenges ADD CONSTRAINT chk_redeemed_consistency CHECK ((status != 'REDEEMED') OR (bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND redeemed_at IS NOT NULL));
-  END IF;
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_redeemed_consistency;
+  ALTER TABLE challenges ADD CONSTRAINT chk_redeemed_consistency CHECK ((status != 'REDEEMED') OR (bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND redeemed_at IS NOT NULL));
 
-  -- Ledgers non-negative
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_ledgers') THEN
-    ALTER TABLE challenges ADD CONSTRAINT chk_challenge_ledgers CHECK (
-      (created_ledger IS NULL OR created_ledger >= 0) AND
-      (min_valid_ledger IS NULL OR min_valid_ledger >= 0) AND
-      (max_valid_ledger IS NULL OR (max_valid_ledger >= 0 AND (min_valid_ledger IS NULL OR max_valid_ledger >= min_valid_ledger)))
-    );
-  END IF;
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_ledgers;
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_ledgers CHECK (
+    (created_ledger IS NULL OR created_ledger >= 0) AND
+    (min_valid_ledger IS NULL OR min_valid_ledger >= 0) AND
+    (max_valid_ledger IS NULL OR (max_valid_ledger >= 0 AND (min_valid_ledger IS NULL OR max_valid_ledger >= min_valid_ledger)))
+  );
 
-  -- i128 max bound
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_i128_max') THEN
-    ALTER TABLE challenges ADD CONSTRAINT chk_challenge_i128_max CHECK (amount_stroops <= 170141183460469231731687303715884105727 AND (paid_amount_stroops IS NULL OR paid_amount_stroops <= 170141183460469231731687303715884105727));
-  END IF;
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_i128_max;
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_i128_max CHECK (amount_stroops <= 170141183460469231731687303715884105727 AND (paid_amount_stroops IS NULL OR paid_amount_stroops <= 170141183460469231731687303715884105727));
 
-  -- Expiry after creation
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_expiry') THEN
-    ALTER TABLE challenges ADD CONSTRAINT chk_challenge_expiry CHECK (expires_at >= created_at);
-  END IF;
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_expiry;
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_expiry CHECK (expires_at >= created_at);
 
-  -- Paid amount >= requested amount
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_paid_amount') THEN
-    ALTER TABLE challenges ADD CONSTRAINT chk_challenge_paid_amount CHECK (paid_amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops);
-  END IF;
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_paid_amount;
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_paid_amount CHECK (paid_amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops);
 
-  -- Redeemed ledger non-negative
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_redeemed_ledger') THEN
-    ALTER TABLE challenges ADD CONSTRAINT chk_challenge_redeemed_ledger CHECK (redeemed_ledger IS NULL OR redeemed_ledger >= 0);
-  END IF;
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_redeemed_ledger;
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_redeemed_ledger CHECK (redeemed_ledger IS NULL OR redeemed_ledger >= 0);
 
-  -- Lease generation >= 0
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_lease_gen') THEN
-    ALTER TABLE challenges ADD CONSTRAINT chk_challenge_lease_gen CHECK (lease_generation >= 0);
-  END IF;
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_lease_gen;
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_lease_gen CHECK (lease_generation >= 0);
 
-  -- Version >= 1
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_version') THEN
-    ALTER TABLE challenges ADD CONSTRAINT chk_challenge_version CHECK (version >= 1);
-  END IF;
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_version;
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_version CHECK (version >= 1);
 END;
 $BODY$;
 
