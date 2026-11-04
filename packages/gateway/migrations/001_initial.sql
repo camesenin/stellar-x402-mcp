@@ -61,13 +61,21 @@ DECLARE
   r RECORD;
   status_attnum int2;
   bound_attnum int2;
+  amount_attnum int2;
+  paid_amount_attnum int2;
   rename_suffix int := 1;
   target_rename text;
 BEGIN
   SELECT attnum INTO status_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'status';
   SELECT attnum INTO bound_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'bound_tx_hash';
+  SELECT attnum INTO amount_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'amount_stroops';
+  SELECT attnum INTO paid_amount_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'paid_amount_stroops';
 
-  -- A. Early drop of status check constraints
+  -- A. Early drop of status and monetary check constraints:
+  -- Drops legacy status checks and any legacy monetary check covering amount_stroops or paid_amount_stroops
+  -- (e.g. legacy check `paid_amount_stroops >= amount_stroops`) so that evolutionary data conversions
+  -- (e.g. converting amount='0.05' to amount_stroops=500000 while paid_amount_stroops=1)
+  -- do NOT abort before EVOLVE_DATA can record evidence and sanitize underpaid rows!
   IF status_attnum IS NOT NULL THEN
     ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_status;
     FOR r IN (
@@ -76,6 +84,25 @@ BEGIN
       WHERE con.conrelid = 'challenges'::regclass
         AND con.contype = 'c'
         AND (status_attnum = ANY(con.conkey) OR con.conkey = ARRAY[status_attnum])
+    ) LOOP
+      EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
+    END LOOP;
+  END IF;
+
+  IF amount_attnum IS NOT NULL OR paid_amount_attnum IS NOT NULL THEN
+    ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_amount;
+    ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_paid_amount;
+    ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_i128_max;
+    ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_z_i128_max;
+    FOR r IN (
+      SELECT con.conname
+      FROM pg_constraint con
+      WHERE con.conrelid = 'challenges'::regclass
+        AND con.contype = 'c'
+        AND (
+          (amount_attnum IS NOT NULL AND amount_attnum = ANY(con.conkey))
+          OR (paid_amount_attnum IS NOT NULL AND paid_amount_attnum = ANY(con.conkey))
+        )
     ) LOOP
       EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
     END LOOP;
@@ -227,6 +254,8 @@ CREATE TABLE IF NOT EXISTS migration_audit_log (
   pre_status TEXT,
   pre_amount_stroops NUMERIC(40, 0),
   pre_paid_amount_stroops NUMERIC(40, 0),
+  pre_amount_stroops_raw TEXT,
+  pre_paid_amount_stroops_raw TEXT,
   pre_amount_text TEXT,
   pre_bound_tx_hash TEXT,
   sanitization_reason TEXT NOT NULL,
@@ -244,10 +273,10 @@ BEGIN
     WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'amount'
   ) THEN
     INSERT INTO migration_audit_log (
-      challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason
+      challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason
     )
     SELECT 
-      id, 'INITIAL_PRE_MIGRATION_SNAPSHOT', status, amount_stroops, paid_amount_stroops, amount::TEXT, bound_tx_hash, 'CAPTURE_INITIAL_OBSERVED_STATE'
+      id, 'INITIAL_PRE_MIGRATION_SNAPSHOT', status, amount_stroops, paid_amount_stroops, amount_stroops::TEXT, paid_amount_stroops::TEXT, amount::TEXT, bound_tx_hash, 'CAPTURE_INITIAL_OBSERVED_STATE'
     FROM challenges
     WHERE NOT EXISTS (
       SELECT 1 FROM migration_audit_log mal 
@@ -255,10 +284,10 @@ BEGIN
     );
   ELSE
     INSERT INTO migration_audit_log (
-      challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_text, pre_bound_tx_hash, sanitization_reason
+      challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason
     )
     SELECT 
-      id, 'INITIAL_PRE_MIGRATION_SNAPSHOT', status, amount_stroops, paid_amount_stroops, NULL, bound_tx_hash, 'CAPTURE_INITIAL_OBSERVED_STATE'
+      id, 'INITIAL_PRE_MIGRATION_SNAPSHOT', status, amount_stroops, paid_amount_stroops, amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'CAPTURE_INITIAL_OBSERVED_STATE'
     FROM challenges
     WHERE NOT EXISTS (
       SELECT 1 FROM migration_audit_log mal 
@@ -636,6 +665,8 @@ CREATE TABLE IF NOT EXISTS migration_audit_log (
   pre_status TEXT,
   pre_amount_stroops NUMERIC(40, 0),
   pre_paid_amount_stroops NUMERIC(40, 0),
+  pre_amount_stroops_raw TEXT,
+  pre_paid_amount_stroops_raw TEXT,
   pre_amount_text TEXT,
   pre_bound_tx_hash TEXT,
   sanitization_reason TEXT NOT NULL,

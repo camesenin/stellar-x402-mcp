@@ -198,7 +198,7 @@ The backlog features **10 standalone tasks** with zero prerequisites, and **6 de
 - **Tier:** High (200 pts)
 - **Target File:** `packages/gateway/src/workers/reconciler.ts`
 - **Prerequisites:** Issue 6
-- **Scope:** Background reconciler for challenges left in `RECONCILIATION_REQUIRED`. Polls Soroban RPC `getTransaction`; if outside retention window, queries Horizon ledger history. Sets `INCONCLUSIVE_MANUAL_REVIEW` to lock the challenge and prevent double settlement if ambiguous.
+- **Scope:** Background reconciler for challenges left in `RECONCILIATION_REQUIRED`. Polls Soroban RPC `getTransaction`; if outside retention window, queries Horizon ledger history across [created_ledger, max_valid_ledger]. If history cannot be definitively proven (pruned retention horizon / ambiguous), executes deterministic transition to `PERMANENT_QUARANTINE` (Case C) to lock retries and refunds until manual maintainer ledger inspection, strictly preventing double settlement or duplicate token dispatch. Operates under human administrative clearance authority.
 - **Verification Command:** `pnpm --filter @stellar-x402/gateway test`
 
 #### Issue 14: MCP Streamable HTTP Transport (Spec 2025-11-25)

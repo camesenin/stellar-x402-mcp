@@ -123,6 +123,9 @@ jobs:
               redeemed_at BIGINT,
               is_redeemed INTEGER NOT NULL DEFAULT 0,
               CONSTRAINT chk_legacy_composite CHECK (status IN ('PENDING', 'REDEEMED', 'INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE')),
+              -- Legacy monetary check constraint: exercises early drop of monetary checks before data conversion!
+              -- Without early drop, converting Row 15 amount='0.05' to amount_stroops=500000 while paid_amount_stroops=1 would fail this check!
+              CONSTRAINT chk_legacy_monetary_paid_ge_amount CHECK (paid_amount_stroops IS NULL OR amount_stroops = 0 OR paid_amount_stroops >= amount_stroops),
               -- Incompatible composite UNIQUE constraint with NULLS NOT DISTINCT on (status, bound_tx_hash):
               -- Validly admits (PENDING, NULL) and (REDEEMED, NULL) during initial population!
               -- Tests that EARLY_STRUCTURAL_PURGE drops this incompatible constraint BEFORE EVOLVE_DATA,
@@ -399,6 +402,30 @@ jobs:
               1
             );
 
+            -- Row 15: LEGACY MONETARY CHECK CONFLICT CONTRAEXAMPLE:
+            -- Starts with amount = '0.05', legacy amount_stroops = 0, paid_amount_stroops = 1.
+            -- Initially satisfies legacy check (paid_amount_stroops >= amount_stroops because 1 >= 0).
+            -- When amount_stroops is converted to 500,000, without early monetary check purge this would violate legacy check!
+            -- With early monetary purge, legacy check is dropped first, EVOLVE_DATA records evidence and quarantines underpayment cleanly!
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, paid_amount_stroops, redeemed_at, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_15',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              '0.05',
+              0,
+              'XLM',
+              'memo_seed_15',
+              'testnet',
+              'REDEEMED',
+              1793815821820,
+              1793815521820,
+              'tx_legacy_check_conflict_hash_15',
+              1,
+              1793815621820,
+              1
+            );
+
             -- 1. Duplicate btree index on bound_tx_hash to be purged
             CREATE INDEX idx_legacy_duplicate_bound ON challenges USING btree (bound_tx_hash);
 
@@ -449,6 +476,7 @@ jobs:
               rec12 RECORD;
               rec13 RECORD;
               rec14 RECORD;
+              rec15 RECORD;
               v_audit_count BIGINT;
               v_is_nullable TEXT;
               v_indnullsnotdistinct BOOLEAN;
@@ -610,11 +638,42 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: rec14 paid_amount_stroops must be NULL (got %)', step_name, rec14.paid_amount_stroops;
               END IF;
 
+              -- H6b. Legacy monetary check conflict resolution: rec15 had amount='0.05', legacy amount_stroops=0, paid_amount_stroops=1
+              SELECT * INTO rec15 FROM challenges WHERE id = 'ch_legacy_seed_15';
+              IF rec15.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
+                RAISE EXCEPTION '[%] Assertion failed: rec15 not isolated to RECONCILIATION_REQUIRED (got %)', step_name, rec15.status;
+              END IF;
+              IF rec15.amount_stroops IS DISTINCT FROM 500000 THEN
+                RAISE EXCEPTION '[%] Assertion failed: rec15 amount_stroops not converted to 500000 (got %)', step_name, rec15.amount_stroops;
+              END IF;
+              IF rec15.paid_amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: rec15 paid_amount_stroops must be normalized to NULL (got %)', step_name, rec15.paid_amount_stroops;
+              END IF;
+
               -- H7. Forensic Audit Log Verification: assert exact per-challenge evidence preservation
-              -- 1. Initial snapshot captured for all 14 seed rows
-              SELECT count(*) INTO v_audit_count FROM migration_audit_log WHERE migration_step = 'INITIAL_PRE_MIGRATION_SNAPSHOT';
-              IF v_audit_count < 14 THEN
-                RAISE EXCEPTION '[%] Assertion failed: INITIAL_PRE_MIGRATION_SNAPSHOT missing rows (expected 14, got %)', step_name, v_audit_count;
+              -- 1. Individual snapshot verification: verify EXACTLY one snapshot exists for every challenge seed (1 through 15)
+              FOR r IN (
+                SELECT 'ch_legacy_seed_' || s::text AS ch_id
+                FROM generate_series(1, 15) s
+              ) LOOP
+                SELECT count(*) INTO v_audit_count 
+                FROM migration_audit_log 
+                WHERE challenge_id = r.ch_id AND migration_step = 'INITIAL_PRE_MIGRATION_SNAPSHOT';
+                IF v_audit_count != 1 THEN
+                  RAISE EXCEPTION '[%] Assertion failed: challenge % has % snapshots (expected exactly 1)', step_name, r.ch_id, v_audit_count;
+                END IF;
+              END LOOP;
+
+              -- 1b. Verify exact raw values preserved in snapshot for ch_legacy_seed_15
+              IF NOT EXISTS (
+                SELECT 1 FROM migration_audit_log 
+                WHERE challenge_id = 'ch_legacy_seed_15' 
+                  AND migration_step = 'INITIAL_PRE_MIGRATION_SNAPSHOT'
+                  AND pre_amount_text = '0.05'
+                  AND pre_amount_stroops_raw = '0'
+                  AND pre_paid_amount_stroops_raw = '1'
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: INITIAL_PRE_MIGRATION_SNAPSHOT raw text values missing for ch_legacy_seed_15', step_name;
               END IF;
 
               -- 2. Exact evidence for underpaid operational row (ch_legacy_seed_10)
