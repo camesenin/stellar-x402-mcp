@@ -75,7 +75,8 @@ export class StellarPaidMcpClient {
         this.budget.finalize(reservationId, challenge.destination, receipt.txHash);
       } catch (paymentErr: any) {
         const keepUntil = paymentErr?.maxTime ? paymentErr.maxTime : Date.now() + 75_000;
-        this.budget.release(reservationId, keepUntil);
+        const txHash = paymentErr?.txHash ?? undefined;
+        this.budget.release(reservationId, keepUntil, txHash, challenge.destination);
         throw paymentErr;
       }
 

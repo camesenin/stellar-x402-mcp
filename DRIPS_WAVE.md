@@ -84,8 +84,8 @@ The backlog features **10 standalone tasks** with zero prerequisites, and **6 de
 ```
 
 ### Breakdown of Independence & Parallelization:
-- **Standalone Tasks (11 issues):** Issues 1, 2, 3, 4, 5, 7, 9, 10, 11, 15, 16.
-  * In Tranche 1, **6 tasks (800 pts)** are standalone and immediately executable upon Wave opening.
+- **Standalone Tasks (10 issues):** Issues 1, 2, 3, 4, 5, 7, 9, 11, 15, 16.
+  * In Tranche 1, **5 tasks (650 pts)** are standalone and immediately executable upon Wave opening.
   * In Tranche 2, **5 tasks (600 pts)** are standalone.
 - **Dependent Tasks (5 issues):**
   * Issue 6 (`PostgresStore`) requires Issue 4 (DB Schema).
