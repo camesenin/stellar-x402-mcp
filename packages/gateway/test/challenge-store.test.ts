@@ -188,16 +188,34 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
     let postWaitExpired = false;
 
     try {
-      // 1. Wait for Worker to initialize connection and report WORKER_READY
+      // 1. Wait for Worker to initialize connection and report WORKER_READY (with 5s deadline & exit guard)
       await new Promise<void>((resolve, reject) => {
-        worker.once('message', (msg) => {
-          if (msg.type === 'WORKER_READY') resolve();
-          else reject(new Error('Unexpected worker initial message: ' + JSON.stringify(msg)));
-        });
-        worker.once('error', reject);
+        const deadline = setTimeout(() => reject(new Error('Worker initialization timed out')), 5000);
+        const onExit = (code: number) => {
+          clearTimeout(deadline);
+          reject(new Error(`Worker exited prematurely before ready with code ${code}`));
+        };
+        const onError = (err: Error) => {
+          clearTimeout(deadline);
+          reject(err);
+        };
+        const onMessage = (msg: { type: string }) => {
+          if (msg.type === 'WORKER_READY') {
+            clearTimeout(deadline);
+            worker.off('exit', onExit);
+            worker.off('error', onError);
+            resolve();
+          } else {
+            clearTimeout(deadline);
+            reject(new Error('Unexpected worker initial message: ' + JSON.stringify(msg)));
+          }
+        };
+        worker.once('message', onMessage);
+        worker.once('exit', onExit);
+        worker.once('error', onError);
       });
 
-      // 2. NOW create challenge with 120ms TTL (Worker is already hot and ready)
+      // 2. NOW create challenge with 120ms TTL (Worker is confirmed hot and ready)
       const challenge = store.createChallenge(
         'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
         '0.05',
@@ -209,63 +227,93 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
       );
       challengeId = challenge.challengeId;
 
-      // 3. Command Worker to acquire write lock and wait for LOCK_ACQUIRED
+      // 3. Command Worker to acquire write lock and wait for LOCK_ACQUIRED -> LOCK_RELEASED
       await new Promise<void>((resolve, reject) => {
-        worker.on('message', (msg) => {
-          if (msg.type === 'LOCK_ACQUIRED') {
-            // 4. Assert Precondition: Challenge MUST be fresh and NOT expired at entry
-            const tEntry = Date.now();
-            preCheckExpired = tEntry > challenge.expiresAt;
-            expect(preCheckExpired).toBe(false);
-            expect(tEntry).toBeLessThan(challenge.expiresAt);
+        const deadline = setTimeout(() => reject(new Error('Contention lifecycle timed out')), 10000);
+        const onExit = (code: number) => {
+          clearTimeout(deadline);
+          reject(new Error(`Worker exited prematurely during lock lifecycle with code ${code}`));
+        };
+        const onError = (err: Error) => {
+          clearTimeout(deadline);
+          reject(err);
+        };
+        const onMessage = (msg: { type: string }) => {
+          try {
+            if (msg.type === 'LOCK_ACQUIRED') {
+              // Precondition Check: Challenge MUST be fresh and NOT expired when entering markRedeemed
+              const tEntry = Date.now();
+              preCheckExpired = tEntry > challenge.expiresAt;
+              if (preCheckExpired) {
+                throw new Error(`Precondition failure: Challenge was already expired before markRedeemed called (tEntry=${tEntry}, expiresAt=${challenge.expiresAt})`);
+              }
 
-            // 5. Attempt markRedeemed on main thread. Main thread is blocked by SQLite waiting for Worker lock
-            try {
-              store.markRedeemed(challenge.challengeId, txHashContention);
-            } catch (err) {
-              mainThreadError = err;
-            } finally {
-              const tExit = Date.now();
-              mainThreadWaitTime = tExit - tEntry;
-              postWaitExpired = tExit > challenge.expiresAt;
+              // Attempt markRedeemed on main thread. Main thread is genuinely blocked waiting for Worker write lock
+              try {
+                store.markRedeemed(challenge.challengeId, txHashContention);
+              } catch (err) {
+                mainThreadError = err;
+              } finally {
+                const tExit = Date.now();
+                mainThreadWaitTime = tExit - tEntry;
+                postWaitExpired = tExit > challenge.expiresAt;
+              }
+            } else if (msg.type === 'LOCK_RELEASED') {
+              clearTimeout(deadline);
+              worker.off('message', onMessage);
+              worker.off('exit', onExit);
+              worker.off('error', onError);
+              resolve();
             }
-          } else if (msg.type === 'LOCK_RELEASED') {
-            resolve();
+          } catch (listenerErr) {
+            clearTimeout(deadline);
+            worker.off('message', onMessage);
+            worker.off('exit', onExit);
+            worker.off('error', onError);
+            reject(listenerErr);
           }
-        });
-        worker.once('error', reject);
+        };
+        worker.on('message', onMessage);
+        worker.once('exit', onExit);
+        worker.once('error', onError);
         worker.postMessage({ type: 'START_LOCK' });
       });
     } finally {
-      await worker.terminate();
-      store.close();
+      // Robust double-finally guarantees store is closed even if worker termination fails
+      try {
+        await worker.terminate();
+      } finally {
+        store.close();
+      }
     }
 
-    // Assertions verifying genuine race & postcondition:
+    // Assertions verifying genuine race & postconditions:
     // a) Proves challenge was fresh and unexpired when entering markRedeemed
     expect(preCheckExpired).toBe(false);
 
-    // b) Proves main thread genuinely waited for worker lock at the SQLite engine level (> 100ms)
+    // b) Proves main thread genuinely waited for worker lock at SQLite engine level (> 100ms)
     expect(mainThreadWaitTime).toBeGreaterThanOrEqual(100);
 
     // c) Proves challenge expired during the lock wait before acquisition
     expect(postWaitExpired).toBe(true);
 
-    // d) Proves markRedeemed failed with atomic expiration error
+    // d) Proves markRedeemed failed specifically with atomic expiration error
     expect(mainThreadError).toBeDefined();
     expect((mainThreadError as Error).message).toContain('expired');
 
-    // e) Direct DB query: Challenge row STILL exists, is unredeemed (is_redeemed === 0), and txHash is absent
+    // e) Direct DB query protected with its own try/finally:
     const verifyStore = new ChallengeStore(tempDbPath);
-    const rawDb = (verifyStore as any).db;
-    const challengeRow = rawDb.prepare('SELECT challenge_id, is_redeemed, expires_at FROM challenges WHERE challenge_id = ?').get(challengeId);
-    expect(challengeRow).toBeDefined();
-    expect(challengeRow.is_redeemed).toBe(0);
-    expect(challengeRow.expires_at).toBeLessThanOrEqual(Date.now());
+    try {
+      const rawDb = (verifyStore as any).db;
+      const challengeRow = rawDb.prepare('SELECT challenge_id, is_redeemed, expires_at FROM challenges WHERE challenge_id = ?').get(challengeId);
+      expect(challengeRow).toBeDefined();
+      expect(challengeRow.is_redeemed).toBe(0);
+      expect(challengeRow.expires_at).toBeLessThanOrEqual(Date.now());
 
-    const redeemedRow = rawDb.prepare('SELECT tx_hash FROM redeemed_transactions WHERE tx_hash = ?').get(txHashContention);
-    expect(redeemedRow).toBeUndefined();
-
-    verifyStore.close();
+      const redeemedRow = rawDb.prepare('SELECT tx_hash FROM redeemed_transactions WHERE tx_hash = ?').get(txHashContention);
+      expect(redeemedRow).toBeUndefined();
+    } finally {
+      verifyStore.close();
+    }
   });
 });
