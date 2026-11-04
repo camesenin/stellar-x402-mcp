@@ -85,8 +85,9 @@ The backlog features **10 standalone tasks** with zero prerequisites, and **6 de
 
 ### Breakdown of Independence & Parallelization:
 - **Standalone Tasks (10 issues):** Issues 1, 2, 3, 4, 5, 7, 9, 11, 15, 16.
-  * In Tranche 1, **5 tasks (650 pts)** are standalone and immediately executable upon Wave opening (Issue 1 @ 100, Issue 2 @ 100, Issue 4 @ 150, Issue 5 @ 150, Issue 9 @ 150 = 650 pts). The remaining 3 tasks in Tranche 1 are dependent (Issue 6 @ 200, Issue 8 @ 200, Issue 10 @ 150 = 550 pts), totaling 1,200 pts.
-  * In Tranche 2, **5 tasks (550 pts)** are standalone (Issue 3 @ 100, Issue 7 @ 100, Issue 16 @ 100, Issue 11 @ 150, Issue 15 @ 150 = 550 pts). The remaining 3 tasks in Tranche 2 are dependent (Issue 12 @ 200, Issue 13 @ 200, Issue 14 @ 200 = 600 pts), plus Tranche 1 rebalancing totaling exactly 1,200 pts per tranche and 2,400 pts overall.
+  * In Tranche 1, **5 tasks (650 pts)** are standalone (Issue 1 @ 100, Issue 2 @ 100, Issue 4 @ 150, Issue 5 @ 150, Issue 9 @ 150 = 650 pts). The remaining 3 tasks in Tranche 1 are dependent (Issue 6 @ 200, Issue 8 @ 200, Issue 10 @ 150 = 550 pts), summing to exactly **1,200 pts across 8 issues**.
+  * In Tranche 2, **5 tasks (600 pts)** are standalone (Issue 3 @ 100, Issue 7 @ 100, Issue 16 @ 100, Issue 11 @ 150, Issue 15 @ 150: 3 × 100 (300) + 2 × 150 (300) = 600 pts). The remaining 3 tasks in Tranche 2 are dependent (Issue 12 @ 200, Issue 13 @ 200, Issue 14 @ 200: 3 × 200 = 600 pts), summing to exactly **1,200 pts across 8 issues**.
+  * Grand Total: **10 standalone tasks (1,250 pts)** + **6 dependent tasks (1,150 pts)** = **exactly 2,400 pts across 16 issues**.
 - **Dependent Tasks (6 issues):**
   * Issue 6 (PostgresStore) requires Issue 4 (DB Schema).
   * Issue 8 (SEP-41 SAC) requires Issue 2 (StrKey Validator).

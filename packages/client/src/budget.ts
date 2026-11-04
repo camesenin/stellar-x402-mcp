@@ -59,6 +59,17 @@ export type StatusCheckerFn = (
   txHash: string
 ) => Promise<'SUCCESS' | 'FAILED' | 'NOT_FOUND' | 'PENDING' | TxStatusReport>;
 
+/**
+ * BudgetManager: Process-local concurrency-safe budget meter and fail-closed quarantine engine.
+ *
+ * Operational Lifecycle & Scope Boundary:
+ * - Scope: In-Memory / Live Process Instance. Guarantees fail-closed isolation and atomic accounting
+ *   within the running Node.js process / MCP agent session.
+ * - Non-Persistence Disclosure: Reservation maps and receipt logs are kept in-memory. If the process terminates,
+ *   is killed, or restarted, the in-memory reservation ledger is re-initialized to zero. For multi-replica deployments
+ *   or crash-recovery continuity across server reboots, persistent stores (e.g. PostgresStore / Redis challenge leases)
+ *   must be used as the authoritative boundary before recreating instances.
+ */
 export class BudgetManager {
   private totalSettledStroops: bigint = 0n;
   private reservations = new Map<string, ActiveReservation>();

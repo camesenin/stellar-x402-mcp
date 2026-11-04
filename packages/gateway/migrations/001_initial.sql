@@ -66,7 +66,6 @@ ALTER TABLE IF EXISTS challenges ALTER COLUMN paid_amount_stroops TYPE NUMERIC(4
 
 -- Evolutionary check constraints enforcement for existing installations
 DO $do$
-DO $do$
 DECLARE
   r RECORD;
 BEGIN
@@ -74,17 +73,28 @@ BEGIN
     ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (amount_stroops > 0);
   END IF;
 
-  -- 1. Drop any legacy or auto-named status check constraints (e.g. challenges_status_check, chk_challenge_status)
+  -- 1. Drop any legacy CHECK constraints covering the status column regardless of their name
   FOR r IN (
-    SELECT conname FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND contype = 'c' AND (conname LIKE '%status%' OR conname = 'chk_challenge_status')
+    SELECT con.conname
+    FROM pg_constraint con
+    JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ANY(con.conkey)
+    WHERE con.conrelid = 'challenges'::regclass
+      AND con.contype = 'c'
+      AND att.attname = 'status'
   ) LOOP
     EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
   END LOOP;
   ALTER TABLE challenges ADD CONSTRAINT chk_challenge_status CHECK (status IN ('PENDING', 'RECONCILIATION_REQUIRED', 'INCONCLUSIVE_MANUAL_REVIEW', 'CONFIRMED', 'REDEEMED', 'CANCELLED', 'PERMANENT_QUARANTINE'));
 
-  -- 2. Drop any legacy auto-named UNIQUE constraints on bound_tx_hash (e.g. challenges_bound_tx_hash_key)
+  -- 2. Drop any legacy UNIQUE constraints covering bound_tx_hash (except canonical uq_challenges_bound_tx_hash)
   FOR r IN (
-    SELECT conname FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND contype = 'u' AND conname != 'uq_challenges_bound_tx_hash' AND conname LIKE '%bound_tx_hash%'
+    SELECT con.conname
+    FROM pg_constraint con
+    JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ANY(con.conkey)
+    WHERE con.conrelid = 'challenges'::regclass
+      AND con.contype = 'u'
+      AND con.conname != 'uq_challenges_bound_tx_hash'
+      AND att.attname = 'bound_tx_hash'
   ) LOOP
     EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
   END LOOP;

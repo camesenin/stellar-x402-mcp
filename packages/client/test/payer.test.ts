@@ -345,5 +345,62 @@ describe('StellarPayer & Autonomous Soroban Execution', () => {
         expect(err.maxTime).toBeGreaterThan(0);
       }
     });
+    it('fails closed and enriches error with localTxHash when Soroban confirms SUCCESS without valid inclusion ledger sequence', async () => {
+      const payer = new StellarPayer({
+        secretKey: dummySecret,
+        network: 'testnet',
+      });
+
+      const { Account } = await import('@stellar/stellar-sdk');
+      vi.spyOn((payer as any).sorobanServer, 'getAccount').mockResolvedValue(
+        new Account(payer.getPublicKey(), '100')
+      );
+
+      const mockPreparedTx = {
+        operations: [],
+        sign: vi.fn(),
+        hash: () => Buffer.from('soroban_adversarial_tx_hash', 'utf-8'),
+        timeBounds: { maxTime: '1800000000' },
+      };
+
+      vi.spyOn((payer as any).sorobanServer, 'prepareTransaction').mockResolvedValue(mockPreparedTx);
+      vi.spyOn((payer as any).sorobanServer, 'sendTransaction').mockResolvedValue({
+        status: 'PENDING',
+        hash: Buffer.from('soroban_adversarial_tx_hash', 'utf-8').toString('hex'),
+      });
+
+      // Mock Soroban JSON-RPC returning SUCCESS but with only latestLedger (no inclusion ledger)
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({
+          result: {
+            status: 'SUCCESS',
+            latestLedger: 9999, // Only latestLedger, no ledger!
+          },
+        }),
+      });
+      global.fetch = mockFetch;
+
+      const challenge: ParsedChallenge = {
+        challengeId: 'soroban-challenge-missing-ledger',
+        destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        amount: '0.05',
+        asset: 'XLM',
+        network: 'testnet',
+        contractId: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+      };
+
+      try {
+        await payer.settleSorobanChallenge(challenge);
+        expect.unreachable('Should have thrown on missing inclusion ledger');
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(Error);
+        expect(err.message).toContain('missing valid inclusion ledger sequence');
+        expect(err.txHash).toBe(Buffer.from('soroban_adversarial_tx_hash', 'utf-8').toString('hex'));
+        expect(err.maxTime).toBe(1800000000);
+      }
+    });
   });
 });
