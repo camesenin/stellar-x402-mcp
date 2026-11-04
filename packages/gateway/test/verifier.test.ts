@@ -707,8 +707,57 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
       expect(result.payer).toBe(singlePayerKp.publicKey());
     });
 
+    it('correctly attributes payer to op.funder for create_account operation when tx source is a relayer', async () => {
+      const challenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '1.0',
+        'XLM',
+        '/resource'
+      );
+
+      const funderPayerKp = Keypair.random(); // actual funder
+      const relayerKp = Keypair.random();     // transaction envelope source
+
+      const mockCreateAccountTx = {
+        id: 'funder_create_account_tx',
+        successful: true,
+        source_account: relayerKp.publicKey(),
+        memo: challenge.memo,
+        ledger_attr: 50020,
+        operations: async () => ({
+          records: [
+            {
+              type: 'create_account',
+              account: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5', // destination account funded
+              funder: funderPayerKp.publicKey(), // funder providing starting balance
+              starting_balance: '1.0',
+            },
+          ],
+          next: async () => ({ records: [] }),
+        }),
+      };
+
+      vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+        transaction: () => ({ call: async () => mockCreateAccountTx }),
+      } as any);
+
+      const cleanHash = 'funder_create_account_tx';
+      const domainMsg = `stellar-x402:v1:${verifier.getNetworkPassphrase()}:/resource:${challenge.challengeId}:${cleanHash}:${challenge.expiresAt}`;
+      const validFunderSig = funderPayerKp.sign(Buffer.from(domainMsg, 'utf-8')).toString('base64');
+
+      const result = await verifier.verifyPayment(cleanHash, challenge, store, {
+        message: domainMsg,
+        signatureBase64: validFunderSig,
+      });
+
+      expect(result.valid).toBe(true);
+      expect(result.payer).toBe(funderPayerKp.publicKey());
+      expect(result.amount).toBe('1');
+      expect(store.isTxRedeemed(cleanHash)).toBe(true);
+      expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(true);
+    });
     it('rejects payment if challenge expires during Horizon network query and prevents redemption', async () => {
-      // Create challenge with very short TTL
+      let horizonQueryReached = false;
       const challenge = store.createChallenge(
         'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
         '0.05',
@@ -728,7 +777,8 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
         memo: challenge.memo,
         ledger_attr: 50012,
         operations: async () => {
-          // Simulate network delay causing challenge to expire during Horizon fetch
+          horizonQueryReached = true;
+          // Simulate ledger query latency that crosses the 50ms expiry boundary
           await new Promise((resolve) => setTimeout(resolve, 80));
           return {
             records: [
@@ -752,19 +802,21 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
       const domainMsg = `stellar-x402:v1:${verifier.getNetworkPassphrase()}:/resource:${challenge.challengeId}:${cleanHash}:${challenge.expiresAt}`;
       const validSig = payerKp.sign(Buffer.from(domainMsg, 'utf-8')).toString('base64');
 
-      let caughtError: unknown = null;
-      try {
-        await verifier.verifyPayment(cleanHash, challenge, store, {
-          message: domainMsg,
-          signatureBase64: validSig,
-        });
-      } catch (err) {
-        caughtError = err;
-      }
+      const result = await verifier.verifyPayment(cleanHash, challenge, store, {
+        message: domainMsg,
+        signatureBase64: validSig,
+      });
 
-      // Either verifier returns valid: false or markRedeemed throws atomic redemption failure
-      // Crucial assertion: transaction hash must NOT be redeemed, and challenge is not consumed!
+      // 1. Assert Horizon network query was actually executed and reached
+      expect(horizonQueryReached).toBe(true);
+
+      // 2. Assert verifier returns valid: false with atomic expiration failure reason
+      expect(result.valid).toBe(false);
+      expect(result.reason).toMatch(/expired/i);
+
+      // 3. Crucial integrity assertions: neither the tx hash nor the challenge is redeemed!
       expect(store.isTxRedeemed(cleanHash)).toBe(false);
+      expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(false);
     });
 
     it('verifier isolates and rejects domain message presentation mismatch even when passed directly', async () => {

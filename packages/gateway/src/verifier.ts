@@ -466,13 +466,22 @@ export class StellarPaymentVerifier {
         }
       }
 
-      // 8. Record atomic redemption in SQLite
-      store.markRedeemed(challenge.challengeId, txHash, {
-        payer: receipt.payer,
-        amount: challenge.amount,
-        asset: challenge.asset,
-        ledger: rawTx.ledger || rawTx.latestLedger,
-      });
+      // 8. Record atomic redemption in SQLite with fresh expiration check
+      try {
+        store.markRedeemed(challenge.challengeId, txHash, {
+          payer: receipt.payer,
+          amount: challenge.amount,
+          asset: challenge.asset,
+          ledger: rawTx.ledger || rawTx.latestLedger,
+        });
+      } catch (redeemErr: unknown) {
+        const errMsg = redeemErr instanceof Error ? redeemErr.message : String(redeemErr);
+        return {
+          valid: false,
+          reason: `Settlement aborted: ${errMsg}`,
+          txHash,
+        };
+      }
 
       return {
         valid: true,
@@ -756,13 +765,22 @@ export class StellarPaymentVerifier {
         }
       }
 
-      // Mark as redeemed in SQLite
-      store.markRedeemed(challenge.challengeId, cleanHash, {
-        payer: payerAddress,
-        amount: formattedPaid,
-        asset: matchedAsset || challenge.asset,
-        ledger: tx.ledger_attr,
-      });
+      // Mark as redeemed in SQLite with atomic lock & fresh expiration check
+      try {
+        store.markRedeemed(challenge.challengeId, cleanHash, {
+          payer: payerAddress,
+          amount: formattedPaid,
+          asset: matchedAsset || challenge.asset,
+          ledger: tx.ledger_attr,
+        });
+      } catch (redeemErr: unknown) {
+        const errMsg = redeemErr instanceof Error ? redeemErr.message : String(redeemErr);
+        return {
+          valid: false,
+          reason: `Settlement aborted: ${errMsg}`,
+          txHash: cleanHash,
+        };
+      }
 
       return {
         valid: true,

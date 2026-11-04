@@ -180,14 +180,22 @@ export class ChallengeStore {
     metadata?: { payer?: string; amount?: string; asset?: string; ledger?: number }
   ): void {
     const cleanHash = txHash.toLowerCase();
-    const now = Date.now();
 
+    // Explicit IMMEDIATE transaction: acquires reserved write lock immediately preventing concurrent writers
     const transaction = this.db.transaction(() => {
-      // 1. Enforce that challenge exists, is currently unredeemed, and has NOT expired
+      // FRESH timestamp sampled strictly INSIDE the locked write transaction
+      const currentRedemptionTime = Date.now();
+
+      // 1. Enforce that challenge exists, is currently unredeemed, and currentRedemptionTime <= expires_at
+      // Uniform boundary semantics across gateway: challenge is valid while currentRedemptionTime <= expires_at
       const updateChallenge = this.db.prepare(`
-        UPDATE challenges SET is_redeemed = 1 WHERE challenge_id = ? AND is_redeemed = 0 AND expires_at > ?
+        UPDATE challenges
+        SET is_redeemed = 1
+        WHERE challenge_id = ?
+          AND is_redeemed = 0
+          AND expires_at >= ?
       `);
-      const updateResult = updateChallenge.run(challengeId, now);
+      const updateResult = updateChallenge.run(challengeId, currentRedemptionTime);
       if (updateResult.changes === 0) {
         throw new Error(
           `Atomic redemption failed: Challenge '${challengeId}' not found, already redeemed, or expired.`
@@ -203,7 +211,7 @@ export class ChallengeStore {
       insertRedeemed.run(
         cleanHash,
         challengeId,
-        now,
+        currentRedemptionTime,
         metadata?.payer ?? null,
         metadata?.amount ?? null,
         metadata?.asset ?? null,
@@ -211,7 +219,8 @@ export class ChallengeStore {
       );
     });
 
-    transaction();
+    // Run as immediate transaction to acquire write authority immediately
+    transaction.immediate();
   }
 
   public cleanupExpired(): void {

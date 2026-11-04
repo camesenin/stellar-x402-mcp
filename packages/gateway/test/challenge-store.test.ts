@@ -155,4 +155,57 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
 
     store.close();
   });
+
+  it('rejects redemption under writer contention when challenge expires while waiting for locked immediate transaction', async () => {
+    // Two independent connections opening the SAME on-disk SQLite database
+    const storeWriter1 = new ChallengeStore(tempDbPath, 100); // 100ms TTL
+    const storeWriter2 = new ChallengeStore(tempDbPath, 100);
+
+    const challenge = storeWriter1.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/test-resource',
+      'testnet',
+      undefined,
+      120 // 120ms TTL
+    );
+
+    const txHashContention = 'e'.repeat(64);
+
+    // Connection 1 acquires exclusive write lock via immediate transaction and holds it for 160ms (past the 120ms expiry)
+    const holdLockTx = (storeWriter1 as any).db.transaction(() => {
+      const start = Date.now();
+      while (Date.now() - start < 160) {
+        // Busy-wait inside locked write transaction to block other SQLite writers
+      }
+    });
+
+    // Launch locked hold in connection 1 and immediately attempt markRedeemed on connection 2
+    const p1 = Promise.resolve().then(() => holdLockTx.immediate());
+
+    let p2Error: unknown = null;
+    const p2 = Promise.resolve().then(async () => {
+      // Small tick to ensure connection 1 has entered its immediate transaction
+      await new Promise((r) => setTimeout(r, 10));
+      try {
+        storeWriter2.markRedeemed(challenge.challengeId, txHashContention);
+      } catch (err) {
+        p2Error = err;
+      }
+    });
+
+    await Promise.all([p1, p2]);
+
+    // Connection 2 waited for connection 1's write lock to release, by which time currentRedemptionTime > expires_at
+    expect(p2Error).toBeDefined();
+    expect((p2Error as Error).message).toMatch(/expired|already redeemed|not found/i);
+
+    // Assert strict invariant: neither table contains a redeemed entry
+    expect(storeWriter2.isTxRedeemed(txHashContention)).toBe(false);
+    expect(storeWriter2.isChallengeRedeemed(challenge.challengeId)).toBe(false);
+
+    storeWriter1.close();
+    storeWriter2.close();
+  });
 });
