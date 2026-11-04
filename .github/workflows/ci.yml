@@ -107,23 +107,22 @@ jobs:
           # - Protected partial unique index (WHERE (bound_tx_hash IS NOT NULL))
           # - Protected specialized text_pattern_ops index
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
-            -- Pre-existing brownfield migration_audit_log table with fractional scale NUMERIC(38,2) and lacking raw columns
-            -- Verifies ALTER TABLE schema evolution backfills raw text verbatim BEFORE altering type to NUMERIC(40,0),
-            -- preserving exact fractional values without rounding evidence!
+            -- Pre-existing brownfield migration_audit_log table: incomplete schema testing
+            -- Case A: Table exists with ONLY pre_amount_stroops NUMERIC(38,2) (pre_paid_amount_stroops column does NOT exist at all!)
+            -- Verifies that ALTER TABLE ADD COLUMN runs before UPDATE, preventing undefined_column error 42703!
             CREATE TABLE migration_audit_log (
               id BIGSERIAL PRIMARY KEY,
               challenge_id TEXT NOT NULL,
               migration_step TEXT NOT NULL,
               pre_status TEXT,
               pre_amount_stroops NUMERIC(38, 2),
-              pre_paid_amount_stroops NUMERIC(38, 2),
               sanitization_reason TEXT NOT NULL,
               created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
             );
             INSERT INTO migration_audit_log (
-              challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, sanitization_reason
+              challenge_id, migration_step, pre_status, pre_amount_stroops, sanitization_reason
             ) VALUES (
-              'ch_pre_existing_legacy_audit', 'BROWNFIELD_PRE_MIGRATION', 'PENDING', 1000.75, 500.25, 'PRE_EXISTING_BROWNFIELD_RECORD'
+              'ch_pre_existing_legacy_audit', 'BROWNFIELD_PRE_MIGRATION', 'PENDING', 1000.75, 'PRE_EXISTING_BROWNFIELD_RECORD'
             );
 
             CREATE TABLE challenges (
@@ -828,13 +827,13 @@ jobs:
               END IF;
 
               -- 1c. Verify pre-existing brownfield migration_audit_log record preserved and schema evolved (harmonized from NUMERIC(38,2) to NUMERIC(40,0))
-              -- Asserts that raw columns captured exact fractional values BEFORE altering types, and both columns were widened to NUMERIC(40,0)
+              -- Asserts that raw columns captured exact fractional values BEFORE altering types, and missing pre_paid_amount_stroops was created cleanly
               IF NOT EXISTS (
                 SELECT 1 FROM migration_audit_log
                 WHERE challenge_id = 'ch_pre_existing_legacy_audit'
                   AND migration_step = 'BROWNFIELD_PRE_MIGRATION'
                   AND pre_amount_stroops_raw = '1000.75'
-                  AND pre_paid_amount_stroops_raw = '500.25'
+                  AND pre_paid_amount_stroops_raw IS NULL
               ) THEN
                 RAISE EXCEPTION '[%] Assertion failed: pre-existing brownfield audit record raw values not preserved before type alteration', step_name;
               END IF;

@@ -262,20 +262,22 @@ CREATE TABLE IF NOT EXISTS migration_audit_log (
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 -- Explicit schema evolution for brownfield deployments where migration_audit_log already existed:
--- 1. First add raw text columns to capture verbatim strings before any type alteration
+-- 1. FIRST: Ensure ALL columns exist (both raw text columns and numeric columns) before any DML or ALTER COLUMN executes
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_amount_stroops_raw TEXT;
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_paid_amount_stroops_raw TEXT;
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_amount_text TEXT;
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_bound_tx_hash TEXT;
--- 2. Backfill pre_amount_stroops_raw and pre_paid_amount_stroops_raw from existing numeric columns BEFORE modifying their types or scale
+ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_amount_stroops NUMERIC(40, 0);
+ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_paid_amount_stroops NUMERIC(40, 0);
+
+-- 2. SECOND: Backfill pre_amount_stroops_raw and pre_paid_amount_stroops_raw from existing numeric columns BEFORE modifying scale/type
 UPDATE migration_audit_log
 SET pre_amount_stroops_raw = COALESCE(pre_amount_stroops_raw, pre_amount_stroops::TEXT),
     pre_paid_amount_stroops_raw = COALESCE(pre_paid_amount_stroops_raw, pre_paid_amount_stroops::TEXT)
 WHERE pre_amount_stroops IS NOT NULL OR pre_paid_amount_stroops IS NOT NULL;
--- 3. Safely harmonize column types to NUMERIC(40,0) without losing evidence
-ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_amount_stroops NUMERIC(40, 0);
+
+-- 3. THIRD: Safely harmonize column types to NUMERIC(40,0) (guaranteed safe because raw strings were captured in step 2)
 ALTER TABLE IF EXISTS migration_audit_log ALTER COLUMN pre_amount_stroops TYPE NUMERIC(40, 0);
-ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_paid_amount_stroops NUMERIC(40, 0);
 ALTER TABLE IF EXISTS migration_audit_log ALTER COLUMN pre_paid_amount_stroops TYPE NUMERIC(40, 0);
 CREATE INDEX IF NOT EXISTS idx_migration_audit_challenge ON migration_audit_log(challenge_id);
 
@@ -770,8 +772,8 @@ ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_paid_amou
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_amount_text TEXT;
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_bound_tx_hash TEXT;
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_amount_stroops NUMERIC(40, 0);
-ALTER TABLE IF EXISTS migration_audit_log ALTER COLUMN pre_amount_stroops TYPE NUMERIC(40, 0);
 ALTER TABLE IF EXISTS migration_audit_log ADD COLUMN IF NOT EXISTS pre_paid_amount_stroops NUMERIC(40, 0);
+ALTER TABLE IF EXISTS migration_audit_log ALTER COLUMN pre_amount_stroops TYPE NUMERIC(40, 0);
 ALTER TABLE IF EXISTS migration_audit_log ALTER COLUMN pre_paid_amount_stroops TYPE NUMERIC(40, 0);
 CREATE INDEX IF NOT EXISTS idx_migration_audit_challenge ON migration_audit_log(challenge_id);
 
