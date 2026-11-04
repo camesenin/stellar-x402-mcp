@@ -89,12 +89,15 @@ jobs:
           # - Legacy composite CHECK constraint covering status AND amount_stroops
           # - Legacy table with amount_stroops NOT NULL
           # - Missing 'resource' column
-          # - Row 1: Valid legacy challenge with text amount '0.05' and distinct bound_tx_hash (requires REAL conversion to amount_stroops=500000)
-          # - Row 2: Incomplete redeemed challenge (is_redeemed=1, missing txHash) -> must isolate into RECONCILIATION_REQUIRED
-          # - Row 3: Challenge previously marked status='REDEEMED' with missing evidence -> must isolate into RECONCILIATION_REQUIRED
-          # - Row 4: Unmetered/unknown amount (amount IS NULL) with amount_stroops=0 -> must normalize to amount_stroops=NULL and isolate into INCONCLUSIVE_MANUAL_REVIEW
-          # - Row 5: Challenge already in PERMANENT_QUARANTINE with amount_stroops=0 -> must normalize amount_stroops to NULL while strictly PRESERVING PERMANENT_QUARANTINE status
+          # - Row 1: Valid legacy challenge with text amount '0.05' and unpopulated amount_stroops=0 -> converts to 500,000 stroops
+          # - Row 2: Incomplete redeemed challenge (is_redeemed=1, missing txHash) -> isolates into RECONCILIATION_REQUIRED
+          # - Row 3: Challenge previously marked status='REDEEMED' with missing evidence -> isolates into RECONCILIATION_REQUIRED
+          # - Row 4: Unmetered/unknown amount (amount IS NULL) with amount_stroops=0 -> normalizes to amount_stroops=NULL and isolates into INCONCLUSIVE_MANUAL_REVIEW
+          # - Row 5: Challenge already in PERMANENT_QUARANTINE with amount_stroops=0 -> normalizes to amount_stroops=NULL and strictly PRESERVES PERMANENT_QUARANTINE
+          # - Row 6: Challenge already in INCONCLUSIVE_MANUAL_REVIEW with amount_stroops=0 -> normalizes to amount_stroops=NULL and strictly PRESERVES INCONCLUSIVE_MANUAL_REVIEW
+          # - Legacy constraint with NULLS NOT DISTINCT (uq_challenges_bound_tx_hash) -> exercises Case C transition to standard unique!
           # - Duplicate btree index on bound_tx_hash to be purged
+          # - Incompatible standalone unique index with NULLS NOT DISTINCT to be purged by Case D
           # - Protected partial index (WHERE status = 'PENDING')
           # - Protected specialized text_pattern_ops index
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
@@ -111,10 +114,12 @@ jobs:
               created_at BIGINT NOT NULL,
               bound_tx_hash TEXT,
               is_redeemed INTEGER NOT NULL DEFAULT 0,
-              CONSTRAINT chk_legacy_composite CHECK (status IN ('PENDING', 'REDEEMED', 'PERMANENT_QUARANTINE') AND amount_stroops >= 0)
+              CONSTRAINT chk_legacy_composite CHECK (status IN ('PENDING', 'REDEEMED', 'INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE') AND amount_stroops >= 0),
+              -- Legacy non-standard constraint with NULLS NOT DISTINCT exercising Case C transition:
+              CONSTRAINT uq_challenges_bound_tx_hash UNIQUE NULLS NOT DISTINCT (bound_tx_hash)
             );
 
-            -- Row 1: Valid legacy challenge starting with amount_stroops unpopulated (0 in legacy schema) to test REAL conversion from '0.05'
+            -- Row 1: Valid legacy challenge starting with amount_stroops=0 to test REAL conversion from '0.05'
             INSERT INTO challenges (
               challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
             ) VALUES (
@@ -146,7 +151,7 @@ jobs:
               'PENDING',
               1793815821820,
               1793815521820,
-              NULL,
+              'tx_incomplete_hash_2',
               1
             );
 
@@ -164,7 +169,7 @@ jobs:
               'REDEEMED',
               1793815821820,
               1793815521820,
-              NULL,
+              'tx_incomplete_hash_3',
               1
             );
 
@@ -200,24 +205,45 @@ jobs:
               'PERMANENT_QUARANTINE',
               1793815821820,
               1793815521820,
+              'tx_quarantined_hash_5',
+              0
+            );
+
+            -- Row 6: Challenge already in INCONCLUSIVE_MANUAL_REVIEW with amount_stroops=0 -> status must be PRESERVED and amount_stroops normalized to NULL
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_6',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
               NULL,
+              0,
+              'XLM',
+              'memo_seed_6',
+              'testnet',
+              'INCONCLUSIVE_MANUAL_REVIEW',
+              1793815821820,
+              1793815521820,
+              'tx_quarantined_hash_6',
               0
             );
 
             -- 1. Index to be purged by Case D (standard duplicate btree text_ops on bound_tx_hash)
             CREATE INDEX idx_legacy_duplicate_bound ON challenges USING btree (bound_tx_hash);
 
-            -- 2. Protected partial index (MUST be preserved)
-            CREATE INDEX idx_legacy_partial_bound ON challenges USING btree (bound_tx_hash) WHERE status = 'PENDING';
+            -- 2. Incompatible standalone unique index with NULLS NOT DISTINCT to be purged by Case D
+            CREATE UNIQUE INDEX idx_legacy_incompatible_nulls_not_distinct ON challenges USING btree (bound_tx_hash) NULLS NOT DISTINCT;
 
-            -- 3. Protected specialized opclass index (MUST be preserved)
+            -- 3. Protected partial index (MUST be preserved)
+            CREATE INDEX idx_legacy_partial_bound ON challenges USING btree (bound_tx_hash) WHERE (status = 'PENDING');
+
+            -- 4. Protected specialized opclass index (MUST be preserved)
             CREATE INDEX idx_legacy_pattern_bound ON challenges USING btree (bound_tx_hash text_pattern_ops);
           EOF
 
           # 3. First evolutionary migration run
           psql -X -v ON_ERROR_STOP=1 -f packages/gateway/migrations/001_initial.sql
 
-          # 4. Shared Invariant Verification Function (Asserts schema, data preservation, quarantine and indexes)
+          # 4. Shared Invariant Verification Function (Asserts schema, data preservation, quarantine, indexes, multiple null inserts, and duplicate rejection)
           psql -X -v ON_ERROR_STOP=1 << 'EOF'
             CREATE OR REPLACE FUNCTION verify_migration_invariants(step_name TEXT) RETURNS VOID AS $$
             DECLARE
@@ -226,10 +252,12 @@ jobs:
               rec3 RECORD;
               rec4 RECORD;
               rec5 RECORD;
+              rec6 RECORD;
               v_is_nullable TEXT;
               v_indnullsnotdistinct BOOLEAN;
               v_pred TEXT;
               v_opcname TEXT;
+              v_diag_constraint TEXT;
             BEGIN
               -- A. Column evolution and rename checks
               IF NOT EXISTS (
@@ -294,13 +322,21 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: unmetered row must have amount_stroops NULL (got %)', step_name, rec4.amount_stroops;
               END IF;
 
-              -- F. Preservation of PERMANENT_QUARANTINE with NULL amount_stroops
+              -- F. Preservation of PERMANENT_QUARANTINE and INCONCLUSIVE_MANUAL_REVIEW with NULL amount_stroops
               SELECT * INTO rec5 FROM challenges WHERE id = 'ch_legacy_seed_5';
               IF rec5.status IS DISTINCT FROM 'PERMANENT_QUARANTINE' THEN
                 RAISE EXCEPTION '[%] Assertion failed: PERMANENT_QUARANTINE degraded to %', step_name, rec5.status;
               END IF;
               IF rec5.amount_stroops IS NOT NULL THEN
                 RAISE EXCEPTION '[%] Assertion failed: quarantined row must have amount_stroops NULL (got %)', step_name, rec5.amount_stroops;
+              END IF;
+
+              SELECT * INTO rec6 FROM challenges WHERE id = 'ch_legacy_seed_6';
+              IF rec6.status IS DISTINCT FROM 'INCONCLUSIVE_MANUAL_REVIEW' THEN
+                RAISE EXCEPTION '[%] Assertion failed: INCONCLUSIVE_MANUAL_REVIEW degraded to %', step_name, rec6.status;
+              END IF;
+              IF rec6.amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: quarantined row must have amount_stroops NULL (got %)', step_name, rec6.amount_stroops;
               END IF;
 
               -- G. Purge & Structural Preservation Assertions
@@ -312,15 +348,23 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: idx_legacy_duplicate_bound was not purged by Case D', step_name;
               END IF;
 
-              -- 2. idx_legacy_partial_bound MUST be preserved with correct predicate
+              -- 2. idx_legacy_incompatible_nulls_not_distinct MUST be purged
+              IF EXISTS (
+                SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relname = 'idx_legacy_incompatible_nulls_not_distinct' AND n.nspname = current_schema()
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_incompatible_nulls_not_distinct was not purged by Case D', step_name;
+              END IF;
+
+              -- 3. idx_legacy_partial_bound MUST be preserved with exact predicate
               SELECT pg_get_expr(i.indpred, i.indrelid) INTO v_pred
               FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
               WHERE c.relname = 'idx_legacy_partial_bound' AND n.nspname = current_schema();
-              IF v_pred IS NULL OR v_pred NOT LIKE '%PENDING%' THEN
-                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_partial_bound lost its partial predicate (got %)', step_name, v_pred;
+              IF v_pred IS DISTINCT FROM '(status = ''PENDING''::text)' THEN
+                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_partial_bound lost its exact partial predicate (got %)', step_name, v_pred;
               END IF;
 
-              -- 3. idx_legacy_pattern_bound MUST be preserved with text_pattern_ops
+              -- 4. idx_legacy_pattern_bound MUST be preserved with text_pattern_ops
               SELECT opc.opcname INTO v_opcname
               FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
               JOIN pg_opclass opc ON opc.oid = i.indclass[0]
@@ -329,66 +373,49 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: idx_legacy_pattern_bound lost text_pattern_ops (got %)', step_name, v_opcname;
               END IF;
 
-              -- 4. Canonical constraint uq_challenges_bound_tx_hash MUST exist, be validated, and use standard uniqueness (indnullsnotdistinct = false)
+              -- 5. Canonical constraint uq_challenges_bound_tx_hash MUST exist, be validated, and use standard uniqueness (indnullsnotdistinct = false)
               SELECT i.indnullsnotdistinct INTO v_indnullsnotdistinct
               FROM pg_constraint con JOIN pg_index i ON i.indexrelid = con.conindid JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace
               WHERE con.conname = 'uq_challenges_bound_tx_hash' AND c.relname = 'challenges' AND n.nspname = current_schema() AND con.convalidated = true;
               IF v_indnullsnotdistinct IS NULL OR v_indnullsnotdistinct != false THEN
                 RAISE EXCEPTION '[%] Assertion failed: canonical constraint missing, unvalidated, or not standard unique (got indnullsnotdistinct=%)', step_name, v_indnullsnotdistinct;
               END IF;
-            END;
-            $$ LANGUAGE plpgsql;
-          EOF
 
-          # Run assertions after Run 1
-          psql -X -v ON_ERROR_STOP=1 -c "SELECT verify_migration_invariants('Run 1');"
+              -- H. Operational Test: assert multiple pending challenges with bound_tx_hash IS NULL insert cleanly
+              INSERT INTO challenges (
+                id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash
+              ) VALUES (
+                'ch_op_null_a_' || step_name,
+                'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+                100000,
+                'XLM',
+                'mcp://tools/test',
+                'memo_op_a',
+                'testnet',
+                'PENDING',
+                clock_timestamp(),
+                clock_timestamp() + interval '5 minutes',
+                NULL
+              ), (
+                'ch_op_null_b_' || step_name,
+                'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+                200000,
+                'XLM',
+                'mcp://tools/test',
+                'memo_op_b',
+                'testnet',
+                'PENDING',
+                clock_timestamp(),
+                clock_timestamp() + interval '5 minutes',
+                NULL
+              );
 
-          # 5. Second migration run (Strict Idempotency Verification)
-          psql -X -v ON_ERROR_STOP=1 -f packages/gateway/migrations/001_initial.sql
-
-          # 6. Repeat identical assertions after Run 2
-          psql -X -v ON_ERROR_STOP=1 -c "SELECT verify_migration_invariants('Run 2 (Idempotency)');"
-
-          # 7. Operational Test: insert multiple pending challenges with bound_tx_hash IS NULL
-          psql -X -v ON_ERROR_STOP=1 << 'EOF'
-            INSERT INTO challenges (
-              id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash
-            ) VALUES (
-              'ch_op_pending_1',
-              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
-              100000,
-              'XLM',
-              'mcp://tools/test',
-              'memo_op_1',
-              'testnet',
-              'PENDING',
-              clock_timestamp(),
-              clock_timestamp() + interval '5 minutes',
-              NULL
-            ), (
-              'ch_op_pending_2',
-              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
-              200000,
-              'XLM',
-              'mcp://tools/test',
-              'memo_op_2',
-              'testnet',
-              'PENDING',
-              clock_timestamp(),
-              clock_timestamp() + interval '5 minutes',
-              NULL
-            );
-          EOF
-
-          # 8. Rejection test: assert duplicate non-null bound_tx_hash is strictly rejected
-          psql -X -v ON_ERROR_STOP=1 << 'EOF'
-            DO $$
-            BEGIN
+              -- I. Duplicate Non-Null Hash Rejection Test: assert exact constraint rejection diagnostic
               BEGIN
                 INSERT INTO challenges (
                   id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash
                 ) VALUES (
-                  'ch_op_duplicate_hash',
+                  'ch_op_duplicate_' || step_name,
                   'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
                   100000,
                   'XLM',
@@ -400,14 +427,25 @@ jobs:
                   clock_timestamp() + interval '5 minutes',
                   'tx_seed_hash_abc123' -- already used in ch_legacy_seed_1
                 );
-                RAISE EXCEPTION 'Assertion failed: duplicate non-null bound_tx_hash was not rejected';
+                RAISE EXCEPTION '[%] Assertion failed: duplicate non-null bound_tx_hash was not rejected', step_name;
               EXCEPTION WHEN unique_violation THEN
-                -- Expected behavior
-                NULL;
+                GET STACKED DIAGNOSTICS v_diag_constraint = CONSTRAINT_NAME;
+                IF v_diag_constraint IS DISTINCT FROM 'uq_challenges_bound_tx_hash' THEN
+                  RAISE EXCEPTION '[%] Assertion failed: unique violation triggered by % instead of uq_challenges_bound_tx_hash', step_name, v_diag_constraint;
+                END IF;
               END;
             END;
-            $$;
+            $$ LANGUAGE plpgsql;
           EOF
+
+          # Run shared suite after Run 1
+          psql -X -v ON_ERROR_STOP=1 -c "SELECT verify_migration_invariants('Run_1');"
+
+          # 5. Second migration run (Strict Idempotency Verification)
+          psql -X -v ON_ERROR_STOP=1 -f packages/gateway/migrations/001_initial.sql
+
+          # 6. Repeat identical shared suite after Run 2
+          psql -X -v ON_ERROR_STOP=1 -c "SELECT verify_migration_invariants('Run_2_Idempotency');"
 
       - name: Run Vitest Unit Tests
         run: pnpm test

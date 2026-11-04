@@ -110,6 +110,7 @@ DO $EVOLVE_DATA$
 BEGIN
   -- Populate amount_stroops with exact scale without 64-bit intermediate clamp.
   -- Safe cast: handles numeric or textual amounts that match Stellar decimal format (up to 7 decimal places).
+  -- If amount_stroops is unpopulated (NULL or legacy default 0) and amount is a valid positive number, convert it:
   IF EXISTS (
     SELECT 1 FROM information_schema.columns 
     WHERE table_schema = current_schema() AND table_name = 'challenges' AND column_name = 'amount'
@@ -117,7 +118,7 @@ BEGIN
     -- Convert valid positive numeric representations
     UPDATE challenges 
     SET amount_stroops = (amount::NUMERIC * 10000000)::NUMERIC(40, 0)
-    WHERE amount_stroops IS NULL AND amount IS NOT NULL 
+    WHERE (amount_stroops IS NULL OR amount_stroops <= 0) AND amount IS NOT NULL 
       AND (amount::TEXT ~ '^[0-9]+(\.[0-9]{1,7})?$')
       AND (amount::NUMERIC > 0);
   END IF;
@@ -125,16 +126,18 @@ BEGIN
   -- Normalize unmetered or non-positive legacy amounts:
   -- In canonical schema, amount_stroops must be NULL for quarantined rows (INCONCLUSIVE_MANUAL_REVIEW or PERMANENT_QUARANTINE),
   -- and strictly > 0 for operational rows.
-  -- 1. Rows with amount_stroops <= 0 or invalid:
-  UPDATE challenges
-  SET status = 'INCONCLUSIVE_MANUAL_REVIEW', amount_stroops = NULL
-  WHERE (amount_stroops IS NOT NULL AND amount_stroops <= 0)
-    AND (status IS NULL OR status NOT IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'));
-
-  -- 2. Rows already in PERMANENT_QUARANTINE with non-positive amount: ensure amount_stroops is NULL
+  -- 1. Rows already in ANY quarantine state (INCONCLUSIVE_MANUAL_REVIEW or PERMANENT_QUARANTINE) with non-positive amount:
+  -- Strictly normalize amount_stroops to NULL, preserving their respective quarantine status!
   UPDATE challenges
   SET amount_stroops = NULL
-  WHERE status = 'PERMANENT_QUARANTINE' AND amount_stroops IS NOT NULL AND amount_stroops <= 0;
+  WHERE status IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE')
+    AND amount_stroops IS NOT NULL AND amount_stroops <= 0;
+
+  -- 2. Operational rows with amount_stroops <= 0 or invalid (where amount could not be converted):
+  -- Safely isolate into INCONCLUSIVE_MANUAL_REVIEW with amount_stroops = NULL
+  UPDATE challenges
+  SET status = 'INCONCLUSIVE_MANUAL_REVIEW', amount_stroops = NULL
+  WHERE (amount_stroops IS NOT NULL AND amount_stroops <= 0);
 
   -- 3. Rows with amount_stroops IS NULL: isolate to INCONCLUSIVE_MANUAL_REVIEW if not already permanently quarantined
   UPDATE challenges 
@@ -332,7 +335,10 @@ BEGIN
     ALTER TABLE challenges ADD CONSTRAINT uq_challenges_bound_tx_hash UNIQUE (bound_tx_hash);
   END IF;
 
-  -- 3. Case D: Drop only standalone indexes whose structural definition matches the canonical constraint index identically
+  -- 3. Case D: Drop standalone duplicate or incompatible indexes covering bound_tx_hash:
+  -- Drops redundant btree single-column standard indexes AND drops any standalone unique index with indnullsnotdistinct = true
+  -- (which would reject multiple pending challenges with hash IS NULL), while strictly PRESERVING partial indexes,
+  -- specialized opclasses (text_pattern_ops), and multi-column/INCLUDE indexes.
   FOR r IN (
     SELECT idx.relname AS index_name
     FROM pg_index i
@@ -349,15 +355,15 @@ BEGIN
       AND i.indpred IS NULL -- Preserves partial indexes!
       AND am.amname = 'btree'
       AND opc.opcname = 'text_ops' AND opcnsp.nspname = 'pg_catalog' -- Canonical pg_catalog.text_ops: PRESERVES text_pattern_ops!
-      -- Match collation identical to the canonical constraint index backing uq_challenges_bound_tx_hash
       AND i.indcollation[0] = (
         SELECT ci.indcollation[0] FROM pg_index ci
         JOIN pg_constraint cc ON cc.conindid = ci.indexrelid
         WHERE cc.conrelid = 'challenges'::regclass AND cc.conname = 'uq_challenges_bound_tx_hash'
       )
       AND i.indoption[0] = 0 -- Default ASC/NULLS LAST
-      AND i.indnullsnotdistinct = false -- Strictly matches canonical standard unique nullability
       AND con.oid IS NULL -- Not backing a constraint
+      -- Matches redundant standard duplicate index OR incompatible standalone unique index with indnullsnotdistinct = true
+      AND (i.indnullsnotdistinct = false OR (i.indisunique = true AND i.indnullsnotdistinct = true))
   ) LOOP
     EXECUTE format('DROP INDEX IF EXISTS %I', r.index_name);
   END LOOP;
