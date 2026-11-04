@@ -258,7 +258,7 @@ export class BudgetManager {
 
     if (keepUntil !== undefined) {
       let targetEpochMs: number;
-      let rawMaxTimeSec: number;
+      let rawMaxTimeSec: number | undefined;
 
       if (typeof keepUntil === 'object') {
         if ('epochMs' in keepUntil) {
@@ -266,12 +266,9 @@ export class BudgetManager {
           rawMaxTimeSec = Math.floor(keepUntil.epochMs / 1000);
         } else {
           targetEpochMs = this.clock() + keepUntil.durationMs;
-          rawMaxTimeSec = Math.floor(targetEpochMs / 1000);
+          rawMaxTimeSec = undefined;
         }
       } else if (typeof keepUntil === 'number') {
-        // Explicit boundary: if > 1_000_000_000_000, epoch ms.
-        // If between 1_000_000_000 and 10_000_000_000, epoch seconds.
-        // If relative duration (< 100_000), interpret as delta seconds.
         if (keepUntil > 1_000_000_000_000) {
           targetEpochMs = keepUntil;
           rawMaxTimeSec = Math.floor(keepUntil / 1000);
@@ -280,20 +277,22 @@ export class BudgetManager {
           rawMaxTimeSec = keepUntil;
         } else if (keepUntil > 0 && keepUntil <= 600) {
           targetEpochMs = this.clock() + keepUntil * 1000;
-          rawMaxTimeSec = Math.floor(targetEpochMs / 1000);
+          rawMaxTimeSec = undefined;
         } else if (keepUntil > 600) {
           targetEpochMs = keepUntil;
           rawMaxTimeSec = Math.floor(keepUntil / 1000);
         } else {
           targetEpochMs = this.clock() + 60_000;
-          rawMaxTimeSec = Math.floor(targetEpochMs / 1000);
+          rawMaxTimeSec = undefined;
         }
       } else {
         targetEpochMs = this.clock() + 60_000;
-        rawMaxTimeSec = Math.floor(targetEpochMs / 1000);
+        rawMaxTimeSec = undefined;
       }
 
-      res.maxTimeSec = rawMaxTimeSec;
+      if (rawMaxTimeSec !== undefined && rawMaxTimeSec > 0) {
+        res.maxTimeSec = rawMaxTimeSec;
+      }
 
       // Add 15s ledger clock-skew buffer
       const effectiveKeepUntil = targetEpochMs + 15_000;
@@ -398,7 +397,7 @@ export class BudgetManager {
         return; // Ambiguous ledger time: maintain quarantine
       }
 
-      const maxTimeSec = res.maxTimeSec ?? (res.releaseAt ? Math.floor((res.releaseAt - 15_000) / 1000) : undefined);
+      const maxTimeSec = res.maxTimeSec;
       if (typeof maxTimeSec !== 'number' || !Number.isFinite(maxTimeSec) || maxTimeSec <= 0) {
         return; // Missing cryptographic bound: maintain quarantine
       }

@@ -153,7 +153,7 @@ BEGIN
     ALTER TABLE challenges ADD CONSTRAINT uq_challenges_bound_tx_hash UNIQUE (bound_tx_hash);
   END IF;
 
-  -- 3. Case D: Drop only proven identically redundant standalone indexes on bound_tx_hash (default opclass text_ops, default collation, no INCLUDE, no predicate)
+  -- 3. Case D: Drop only standalone indexes whose structural definition matches the canonical constraint index identically
   FOR r IN (
     SELECT idx.relname AS index_name
     FROM pg_index i
@@ -161,6 +161,7 @@ BEGIN
     JOIN pg_class tbl ON tbl.oid = i.indrelid
     JOIN pg_am am ON am.oid = idx.relam
     JOIN pg_opclass opc ON opc.oid = i.indclass[0]
+    JOIN pg_namespace opcnsp ON opcnsp.oid = opc.opcnamespace
     LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
     WHERE tbl.oid = 'challenges'::regclass
       AND i.indnkeyatts = 1
@@ -168,8 +169,13 @@ BEGIN
       AND i.indkey[0] = bound_attnum
       AND i.indpred IS NULL -- Preserves partial indexes!
       AND am.amname = 'btree'
-      AND opc.opcname = 'text_ops' -- Strictly standard text_ops: PRESERVES text_pattern_ops and custom opclasses!
-      AND i.indcollation[0] = 0 -- Default collation
+      AND opc.opcname = 'text_ops' AND opcnsp.nspname = 'pg_catalog' -- Canonical pg_catalog.text_ops: PRESERVES text_pattern_ops!
+      -- Match collation identical to the canonical constraint index backing uq_challenges_bound_tx_hash
+      AND i.indcollation[0] = (
+        SELECT ci.indcollation[0] FROM pg_index ci
+        JOIN pg_constraint cc ON cc.conindid = ci.indexrelid
+        WHERE cc.conrelid = 'challenges'::regclass AND cc.conname = 'uq_challenges_bound_tx_hash'
+      )
       AND i.indoption[0] = 0 -- Default ASC/NULLS LAST
       AND con.oid IS NULL -- Not backing a constraint
   ) LOOP
