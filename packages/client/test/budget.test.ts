@@ -370,4 +370,57 @@ describe('BudgetManager', () => {
       budget.resolveQuarantine(r, 'SUCCESS');
     }).toThrow('Cannot resolve reservation to SUCCESS without an authentic on-chain txHash');
   });
+  it('strictly preserves quarantine fail-closed when transaction has no authentic maxTime (e.g. TimeoutInfinite)', () => {
+    let mockTime = 100_000;
+    const budget = new BudgetManager(1.0, 5.0, 120_000, () => mockTime);
+    const r = budget.reserve(0.5);
+
+    // Simulated fetch.ts fallback: local wait timer = Date.now() + 75_000, but envelopeMaxTimeSec is undefined (TimeoutInfinite / 0)
+    budget.release(r, { epochMs: mockTime + 75_000 }, 'tx_unbounded_hash', 'GMERCHANT_UNBOUNDED', undefined, undefined);
+
+    // Fast-forward local clock past local wait timer (e.g. +80s)
+    mockTime += 95_000;
+
+    // Node reports NOT_FOUND with latest and oldest ledger close times
+    budget.resolveQuarantine(r, {
+      status: 'NOT_FOUND',
+      latestLedgerCloseTime: Math.floor(mockTime / 1000) + 100,
+      oldestLedgerCloseTime: Math.floor((mockTime - 80_000) / 1000) - 10,
+    });
+
+    // Verification: Because maxTimeSec was never assigned from the local wait timer,
+    // the reservation CANNOT be unquarantined and remains 100% reserved fail-closed!
+    expect(budget.getPendingReservedXlm()).toBe(0.5);
+  });
+
+  it('correctly frees quarantine on NOT_FOUND only when an authentic envelopeMaxTimeSec was provided and ledger advanced past it', () => {
+    let mockTime = 100_000;
+    const broadcastSec = Math.floor(mockTime / 1000);
+    const authenticEnvelopeMaxTimeSec = broadcastSec + 60; // 60s timeout signed in envelope
+
+    const budget = new BudgetManager(1.0, 5.0, 120_000, () => mockTime);
+    const r = budget.reserve(0.5);
+
+    // Authentic envelope maxTime passed explicitly
+    budget.release(r, { epochMs: mockTime + 75_000 }, 'tx_bounded_hash', 'GMERCHANT_BOUNDED', broadcastSec, authenticEnvelopeMaxTimeSec);
+
+    // Fast-forward local clock past local wait timer
+    mockTime += 95_000;
+
+    // Case A: Ledger has NOT advanced past authentic envelope maxTime -> Remains quarantined!
+    budget.resolveQuarantine(r, {
+      status: 'NOT_FOUND',
+      latestLedgerCloseTime: authenticEnvelopeMaxTimeSec - 5,
+      oldestLedgerCloseTime: broadcastSec - 10,
+    });
+    expect(budget.getPendingReservedXlm()).toBe(0.5);
+
+    // Case B: Ledger HAS advanced past authentic envelope maxTime AND history covers broadcast -> Safely freed!
+    budget.resolveQuarantine(r, {
+      status: 'NOT_FOUND',
+      latestLedgerCloseTime: authenticEnvelopeMaxTimeSec + 5,
+      oldestLedgerCloseTime: broadcastSec - 10,
+    });
+    expect(budget.getPendingReservedXlm()).toBe(0.0);
+  });
 });

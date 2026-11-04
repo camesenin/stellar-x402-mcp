@@ -130,6 +130,7 @@ BEGIN
       AND con.contype = 'u'
       AND con.conkey = ARRAY[bound_attnum]
       AND con.conname != 'uq_challenges_bound_tx_hash'
+      AND con.connullsnotdistinct = false -- Strictly preserves any non-standard NULLS NOT DISTINCT constraint
   ) LOOP
     EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
   END LOOP;
@@ -177,6 +178,7 @@ BEGIN
         WHERE cc.conrelid = 'challenges'::regclass AND cc.conname = 'uq_challenges_bound_tx_hash'
       )
       AND i.indoption[0] = 0 -- Default ASC/NULLS LAST
+      AND i.indnullsnotdistinct = false -- Strictly matches canonical standard unique nullability
       AND con.oid IS NULL -- Not backing a constraint
   ) LOOP
     EXECUTE format('DROP INDEX IF EXISTS %I', r.index_name);

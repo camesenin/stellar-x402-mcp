@@ -44,9 +44,10 @@ export function createX402Fetch(config: ClientConfig) {
       receipt = await payer.settleChallenge(challenge);
       budget.finalize(reservationId, challenge.destination, receipt.txHash);
     } catch (paymentErr: any) {
-      // Hold in quarantine if transaction had a time bound or in-flight timeout
-      const keepUntil = paymentErr?.maxTime ? paymentErr.maxTime : Date.now() + 75_000;
-      budget.release(reservationId, keepUntil, paymentErr?.txHash, challenge.destination);
+      // Hold in quarantine: local wait timer (75s) strictly separated from authentic envelope signed maxTime
+      const localWaitEpochMs = Date.now() + 75_000;
+      const authenticMaxTimeSec = typeof paymentErr?.maxTime === 'number' && paymentErr.maxTime > 0 ? paymentErr.maxTime : undefined;
+      budget.release(reservationId, { epochMs: localWaitEpochMs }, paymentErr?.txHash, challenge.destination, undefined, authenticMaxTimeSec);
       throw paymentErr;
     }
 

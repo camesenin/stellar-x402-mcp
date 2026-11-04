@@ -35,6 +35,20 @@ jobs:
   test-typescript:
     name: TypeScript Monorepo Build & Tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: stellar_x402_test
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -56,6 +70,14 @@ jobs:
 
       - name: Build TypeScript Packages
         run: pnpm build
+
+      - name: Verify PostgreSQL 16 Schema Migration
+        env:
+          DATABASE_URL: postgresql://testuser:testpassword@localhost:5432/stellar_x402_test
+        run: |
+          psql  -f packages/gateway/migrations/001_initial.sql
+          # Second execution to verify strict idempotency
+          psql  -f packages/gateway/migrations/001_initial.sql
 
       - name: Run Vitest Unit Tests
         run: pnpm test

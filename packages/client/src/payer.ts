@@ -267,9 +267,16 @@ export class StellarPayer {
     // Sign transaction with payer keypair
     prepared.sign(this.keypair);
 
-    // Cryptographic identity and bounds extracted locally prior to broadcast:
+    // Cryptographic identity and authentic signed timeBounds extracted from the prepared envelope
     const localTxHash = (prepared as any).hash().toString('hex');
-    const signedMaxTimeSec = (prepared as any).timeBounds?.maxTime ? Number((prepared as any).timeBounds.maxTime) : Math.floor(Date.now() / 1000) + 60;
+    const rawMaxTime = (prepared as any).timeBounds?.maxTime;
+    let signedMaxTimeSec: number | undefined;
+    if (rawMaxTime !== undefined && rawMaxTime !== null) {
+      const parsed = Number(rawMaxTime);
+      if (Number.isSafeInteger(parsed) && parsed > 0) {
+        signedMaxTimeSec = parsed;
+      }
+    }
 
     // Submit transaction to Soroban RPC with comprehensive post-broadcast error enrichment
     try {
@@ -391,7 +398,14 @@ export class StellarPayer {
     transaction.sign(this.keypair);
 
     const localTxHash = transaction.hash().toString('hex');
-    const signedMaxTimeSec = transaction.timeBounds?.maxTime ? Number(transaction.timeBounds.maxTime) : Math.floor(Date.now() / 1000) + 60;
+    const rawClassicMaxTime = transaction.timeBounds?.maxTime;
+    let signedMaxTimeSec: number | undefined;
+    if (rawClassicMaxTime !== undefined && rawClassicMaxTime !== null) {
+      const parsed = Number(rawClassicMaxTime);
+      if (Number.isSafeInteger(parsed) && parsed > 0) {
+        signedMaxTimeSec = parsed;
+      }
+    }
 
     try {
       const result: any = await this.horizonServer.submitTransaction(transaction);

@@ -75,9 +75,10 @@ export class StellarPaidMcpClient {
         receipt = await this.payer.settleChallenge(challenge);
         this.budget.finalize(reservationId, challenge.destination, receipt.txHash);
       } catch (paymentErr: any) {
-        const keepUntil = paymentErr?.maxTime ? paymentErr.maxTime : Date.now() + 75_000;
+        const localWaitEpochMs = Date.now() + 75_000;
+        const authenticMaxTimeSec = typeof paymentErr?.maxTime === 'number' && paymentErr.maxTime > 0 ? paymentErr.maxTime : undefined;
         const txHash = paymentErr?.txHash ?? undefined;
-        this.budget.release(reservationId, keepUntil, txHash, challenge.destination, attemptStartSec);
+        this.budget.release(reservationId, { epochMs: localWaitEpochMs }, txHash, challenge.destination, attemptStartSec, authenticMaxTimeSec);
         throw paymentErr;
       }
 

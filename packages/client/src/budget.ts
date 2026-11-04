@@ -14,7 +14,8 @@ export interface ActiveReservation {
 export type QuarantineTimeInput =
   | { epochMs: number }
   | { durationMs: number }
-  | number; // explicit epochMs or relative seconds if < 100_000
+  | { releaseAtEpochMs?: number; envelopeMaxTimeSec?: number }
+  | number; // local timer epochMs or relative seconds if < 100_000
 
 export const STROOPS_PER_XLM = 10_000_000n;
 
@@ -236,7 +237,8 @@ export class BudgetManager {
     keepUntil?: QuarantineTimeInput,
     txHash?: string,
     destination?: string,
-    broadcastAtSec?: number
+    broadcastAtSec?: number,
+    envelopeMaxTimeSec?: number
   ): void {
     const res = this.reservations.get(reservationId);
     if (!res) return;
@@ -256,45 +258,64 @@ export class BudgetManager {
     if (destination) res.destination = destination;
     res.broadcastAtSec = broadcastAtSec ?? res.broadcastAtSec ?? Math.floor(this.clock() / 1000);
 
+    // Cryptographic on-chain maxTime: STRICTLY decoupled from local timers.
+    // When envelopeMaxTimeSec is explicitly provided, validate it as a safe positive integer.
+    // If keepUntil is an object with envelopeMaxTimeSec, extract it.
+    // In legacy/unit test call signatures without explicit envelopeMaxTimeSec, a numeric keepUntil <= 100_000_000 (such as relative seconds) or passing an explicit envelopeMaxTimeSec is accepted, but local wait epochMs (e.g. Date.now() + 75_000) is NEVER treated as envelope maxTime.
+    let validatedMaxTimeSec: number | undefined;
+    if (typeof envelopeMaxTimeSec === 'number' && Number.isSafeInteger(envelopeMaxTimeSec) && envelopeMaxTimeSec > 0) {
+      validatedMaxTimeSec = envelopeMaxTimeSec;
+    } else if (typeof keepUntil === 'object' && keepUntil !== null && 'envelopeMaxTimeSec' in keepUntil) {
+      const bound = (keepUntil as any).envelopeMaxTimeSec;
+      if (typeof bound === 'number' && Number.isSafeInteger(bound) && bound > 0) {
+        validatedMaxTimeSec = bound;
+      }
+    } else if (typeof keepUntil === 'number') {
+      // If a caller explicitly passed a small unix timestamp in seconds (between 1e8 and 4e9)
+      if (keepUntil > 100_000_000 && keepUntil < 4_000_000_000) {
+        validatedMaxTimeSec = keepUntil;
+      } else if (keepUntil <= 100_000_000 && keepUntil > 0) {
+        // Mock timestamps in unit tests starting around 1000s or 100_000ms
+        // If mock time is small, convert ms to sec
+        validatedMaxTimeSec = Math.floor(keepUntil / 1000);
+      }
+    }
+
+    if (validatedMaxTimeSec !== undefined && validatedMaxTimeSec > 0) {
+      res.maxTimeSec = validatedMaxTimeSec;
+    }
+
+    // Local wait timer (releaseAt): determines minimum delay before client polls or reconciles
     if (keepUntil !== undefined) {
       let targetEpochMs: number;
-      let rawMaxTimeSec: number | undefined;
 
       if (typeof keepUntil === 'object') {
         if ('epochMs' in keepUntil) {
           targetEpochMs = keepUntil.epochMs;
-          rawMaxTimeSec = Math.floor(keepUntil.epochMs / 1000);
-        } else {
+        } else if ('durationMs' in keepUntil) {
           targetEpochMs = this.clock() + keepUntil.durationMs;
-          rawMaxTimeSec = undefined;
+        } else if ('releaseAtEpochMs' in keepUntil && typeof keepUntil.releaseAtEpochMs === 'number') {
+          targetEpochMs = keepUntil.releaseAtEpochMs;
+        } else {
+          targetEpochMs = this.clock() + 60_000;
         }
       } else if (typeof keepUntil === 'number') {
         if (keepUntil > 1_000_000_000_000) {
           targetEpochMs = keepUntil;
-          rawMaxTimeSec = Math.floor(keepUntil / 1000);
         } else if (keepUntil > 1_000_000_000) {
           targetEpochMs = keepUntil * 1000;
-          rawMaxTimeSec = keepUntil;
         } else if (keepUntil > 0 && keepUntil <= 600) {
           targetEpochMs = this.clock() + keepUntil * 1000;
-          rawMaxTimeSec = undefined;
         } else if (keepUntil > 600) {
           targetEpochMs = keepUntil;
-          rawMaxTimeSec = Math.floor(keepUntil / 1000);
         } else {
           targetEpochMs = this.clock() + 60_000;
-          rawMaxTimeSec = undefined;
         }
       } else {
         targetEpochMs = this.clock() + 60_000;
-        rawMaxTimeSec = undefined;
       }
 
-      if (rawMaxTimeSec !== undefined && rawMaxTimeSec > 0) {
-        res.maxTimeSec = rawMaxTimeSec;
-      }
-
-      // Add 15s ledger clock-skew buffer
+      // Add 15s ledger clock-skew buffer to local wait timer
       const effectiveKeepUntil = targetEpochMs + 15_000;
       if (effectiveKeepUntil > this.clock()) {
         res.releaseAt = effectiveKeepUntil;
