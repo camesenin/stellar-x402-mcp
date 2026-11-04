@@ -41,8 +41,15 @@ ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS max_valid_ledger BIGIN
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS envelope_xdr TEXT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_owner TEXT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
-ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_generation BIGINT NOT NULL DEFAULT 0;
-ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_generation BIGINT DEFAULT 0;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS version BIGINT DEFAULT 1;
+
+ALTER TABLE IF EXISTS challenges ALTER COLUMN lease_generation SET DEFAULT 0;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN version SET DEFAULT 1;
+UPDATE challenges SET lease_generation = 0 WHERE lease_generation IS NULL;
+UPDATE challenges SET version = 1 WHERE version IS NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN lease_generation SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN version SET NOT NULL;
 
 -- Type conversions and check constraint enforcement for existing installations
 ALTER TABLE IF EXISTS challenges ALTER COLUMN amount_stroops TYPE NUMERIC(40, 0);

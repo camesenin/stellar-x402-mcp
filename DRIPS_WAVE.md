@@ -132,7 +132,9 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 - **Tier:** High (200 pts)
 - **Target File:** `packages/gateway/src/stores/postgres.ts`, `packages/gateway/src/stores/types.ts`
 - **Prerequisites:** Issue 4
-- **Scope:** Implement the asynchronous `IChallengeStore` interface (`createChallenge`, `getChallenge`, `bindSubmissionTx`, `markRedeemed`, `isChallengeRedeemed`, `isTxRedeemed`, `getPendingChallenges`, `updateChallengeStatus`, `acquireLease`, `renewLease`, `releaseLease` defined in `packages/gateway/src/stores/types.ts`) against PostgreSQL. Enforce temporal and generational fencing: `markRedeemed` and `updateChallengeStatus` must verify `lease_generation = expectedGeneration AND lease_owner = workerId AND lease_expires_at > clock_timestamp()` within the SQL transaction. Adapt gateway consumers to await store calls.
+- **Scope:** Implement the asynchronous IChallengeStore interface (createChallenge, getChallenge, indSubmissionTx, markRedeemed, isChallengeRedeemed, isTxRedeemed, getPendingChallenges, updateChallengeStatus, cquireLease, 
+enewLease, 
+eleaseLease defined in packages/gateway/src/stores/types.ts) against PostgreSQL. Enforce temporal and generational fencing: markRedeemed and updateChallengeStatus must verify lease_generation = expectedGeneration AND lease_owner = workerId AND lease_expires_at > clock_timestamp() within the SQL transaction. In packages/client/src/payer.ts and gateway router, implement the pre-broadcast handshake: the client binds signed transaction envelope XDR and ledger bounds to the gateway store before network broadcast, ensuring immutable binding and idempotency across crashes and distributed reconciler workers.
 - **Verification Command:** `pnpm --filter @stellar-x402/gateway test`
 
 #### Issue 8: SEP-0041 SAC Deterministic Address Resolution & Asset Typing
@@ -153,7 +155,7 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 - **Tier:** Medium (150 pts)
 - **Target File:** `.github/actions/stellar-standalone/action.yml`
 - **Prerequisites:** None
-- **Scope:** Composite action that launches pinned `stellar/quickstart:v22.0.1` (Protocol 22/23 compatible), waits for initial ledger close, and executes an end-to-end payment test against container RPC.
+- **Scope:** Composite action that launches pinned `stellar/quickstart:v22.0.1` (Protocol 22/23 compatible), configures local Standalone network passphrase ('Standalone Network ; February 2017'), waits for initial ledger close, and executes an end-to-end payment test against container RPC.
 - **Verification Command:** GitHub Actions CI execution
 
 ---
