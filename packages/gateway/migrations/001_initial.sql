@@ -38,14 +38,31 @@ CREATE TABLE IF NOT EXISTS challenges (
 );
 
 -- Evolutionary schema migration support for existing deployments
-ALTER TABLE IF EXISTS challenges ALTER COLUMN destination SET NOT NULL;
-ALTER TABLE IF EXISTS challenges ALTER COLUMN status SET NOT NULL;
-ALTER TABLE IF EXISTS challenges ALTER COLUMN amount_stroops SET NOT NULL;
-ALTER TABLE IF EXISTS challenges ALTER COLUMN asset SET NOT NULL;
-ALTER TABLE IF EXISTS challenges ALTER COLUMN resource SET NOT NULL;
-ALTER TABLE IF EXISTS challenges ALTER COLUMN network SET NOT NULL;
-ALTER TABLE IF EXISTS challenges ALTER COLUMN created_at SET NOT NULL;
-ALTER TABLE IF EXISTS challenges ALTER COLUMN expires_at SET NOT NULL;
+-- 1. Identifier alignment: rename legacy 'challenge_id' to canonical 'id' if table used legacy PK name
+DO $
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'challenges' AND column_name = 'challenge_id'
+  ) AND NOT EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'challenges' AND column_name = 'id'
+  ) THEN
+    ALTER TABLE challenges RENAME COLUMN challenge_id TO id;
+  END IF;
+END;
+$;
+
+-- 2. Add any missing columns before enforcing constraints
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS id TEXT;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS resource TEXT DEFAULT 'mcp://tools/unknown';
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS amount_stroops NUMERIC(40, 0);
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING';
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS bound_tx_hash TEXT;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS paid_amount_stroops NUMERIC(40, 0);
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS redeemed_at TIMESTAMPTZ;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS payer TEXT;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS redeemed_ledger BIGINT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS created_ledger BIGINT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS min_valid_ledger BIGINT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS max_valid_ledger BIGINT;
@@ -55,10 +72,88 @@ ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_expires_at TIMES
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_generation BIGINT DEFAULT 0;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS version BIGINT DEFAULT 1;
 
-ALTER TABLE IF EXISTS challenges ALTER COLUMN lease_generation SET DEFAULT 0;
-ALTER TABLE IF EXISTS challenges ALTER COLUMN version SET DEFAULT 1;
+-- 3. Populate amount_stroops from legacy amount if present
+DO $
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'challenges' AND column_name = 'amount'
+  ) THEN
+    UPDATE challenges 
+    SET amount_stroops = (amount::NUMERIC * 10000000)::BIGINT 
+    WHERE amount_stroops IS NULL AND amount IS NOT NULL;
+  END IF;
+
+  -- Sync legacy is_redeemed boolean/int to status
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'challenges' AND column_name = 'is_redeemed'
+  ) THEN
+    UPDATE challenges 
+    SET status = 'REDEEMED' 
+    WHERE (status IS NULL OR status = 'PENDING') AND (is_redeemed::TEXT = '1' OR is_redeemed::TEXT = 'true');
+  END IF;
+END;
+$;
+
+-- 4. Temporal conversions: convert legacy BIGINT millisecond/second timestamps to TIMESTAMPTZ
+DO $
+BEGIN
+  -- created_at conversion
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'challenges' AND column_name = 'created_at' AND data_type LIKE '%int%'
+  ) THEN
+    ALTER TABLE challenges ALTER COLUMN created_at TYPE TIMESTAMPTZ USING 
+      CASE 
+        WHEN created_at > 1000000000000 THEN to_timestamp(created_at::DOUBLE PRECISION / 1000.0)
+        ELSE to_timestamp(created_at::DOUBLE PRECISION)
+      END;
+  END IF;
+
+  -- expires_at conversion
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'challenges' AND column_name = 'expires_at' AND data_type LIKE '%int%'
+  ) THEN
+    ALTER TABLE challenges ALTER COLUMN expires_at TYPE TIMESTAMPTZ USING 
+      CASE 
+        WHEN expires_at > 1000000000000 THEN to_timestamp(expires_at::DOUBLE PRECISION / 1000.0)
+        ELSE to_timestamp(expires_at::DOUBLE PRECISION)
+      END;
+  END IF;
+
+  -- redeemed_at conversion
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'challenges' AND column_name = 'redeemed_at' AND data_type LIKE '%int%'
+  ) THEN
+    ALTER TABLE challenges ALTER COLUMN redeemed_at TYPE TIMESTAMPTZ USING 
+      CASE 
+        WHEN redeemed_at > 1000000000000 THEN to_timestamp(redeemed_at::DOUBLE PRECISION / 1000.0)
+        ELSE to_timestamp(redeemed_at::DOUBLE PRECISION)
+      END;
+  END IF;
+END;
+$;
+
+-- 5. Set defaults and nullability on canonical columns
+UPDATE challenges SET resource = 'mcp://tools/default' WHERE resource IS NULL;
+UPDATE challenges SET amount_stroops = 100000 WHERE amount_stroops IS NULL;
+UPDATE challenges SET status = 'PENDING' WHERE status IS NULL;
 UPDATE challenges SET lease_generation = 0 WHERE lease_generation IS NULL;
 UPDATE challenges SET version = 1 WHERE version IS NULL;
+
+ALTER TABLE IF EXISTS challenges ALTER COLUMN destination SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN status SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN amount_stroops SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN asset SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN resource SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN network SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN created_at SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN expires_at SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN lease_generation SET DEFAULT 0;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN version SET DEFAULT 1;
 ALTER TABLE IF EXISTS challenges ALTER COLUMN lease_generation SET NOT NULL;
 ALTER TABLE IF EXISTS challenges ALTER COLUMN version SET NOT NULL;
 
