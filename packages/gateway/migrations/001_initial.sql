@@ -83,46 +83,39 @@ BEGIN
 
   -- B. Early handling of UNIQUE constraints and indexes covering bound_tx_hash
   IF bound_attnum IS NOT NULL THEN
-    -- Case A: Name collision where 'uq_challenges_bound_tx_hash' exists on different columns -> rename it
+    -- Case A: Name collision where 'uq_challenges_bound_tx_hash' exists covering other columns or with NULLS NOT DISTINCT
+    -- If 'uq_challenges_bound_tx_hash' exists but does not match canonical definition (single-column bound_tx_hash with standard uniqueness), drop it early!
     IF EXISTS (
-      SELECT 1 FROM pg_constraint
-      WHERE conrelid = 'challenges'::regclass
-        AND contype = 'u'
-        AND conname = 'uq_challenges_bound_tx_hash'
-        AND conkey != ARRAY[bound_attnum]
+      SELECT 1 FROM pg_constraint con
+      JOIN pg_index i ON i.indexrelid = con.conindid
+      WHERE con.conrelid = 'challenges'::regclass
+        AND con.contype = 'u'
+        AND con.conname = 'uq_challenges_bound_tx_hash'
+        AND (con.conkey != ARRAY[bound_attnum] OR i.indnullsnotdistinct = true)
     ) THEN
-      LOOP
-        target_rename := 'uq_challenges_legacy_composite_' || rename_suffix::text;
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint c
-          JOIN pg_class t ON t.oid = c.conrelid
-          WHERE t.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'challenges'::regclass)
-            AND c.conname = target_rename
-        ) AND NOT EXISTS (
-          SELECT 1 FROM pg_class
-          WHERE relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'challenges'::regclass)
-            AND relname = target_rename
-        ) THEN
-          EXECUTE format('ALTER TABLE challenges RENAME CONSTRAINT uq_challenges_bound_tx_hash TO %I', target_rename);
-          EXIT;
-        END IF;
-        rename_suffix := rename_suffix + 1;
-      END LOOP;
+      ALTER TABLE challenges DROP CONSTRAINT uq_challenges_bound_tx_hash;
     END IF;
 
-    -- Case B: Drop non-canonical single-column UNIQUE constraints covering bound_tx_hash
+    -- Case B: Drop ANY non-canonical UNIQUE constraint covering bound_tx_hash in ANY position
+    -- if it enforces NULLS NOT DISTINCT (which would reject multiple pending/reconciliation rows with hash NULL),
+    -- or if it is a duplicate single-column unique constraint covering bound_tx_hash.
     FOR r IN (
       SELECT con.conname
       FROM pg_constraint con
+      JOIN pg_index i ON i.indexrelid = con.conindid
       WHERE con.conrelid = 'challenges'::regclass
         AND con.contype = 'u'
-        AND con.conkey = ARRAY[bound_attnum]
-        AND con.conname != 'uq_challenges_bound_tx_hash'
+        AND (bound_attnum = ANY(con.conkey))
+        AND (
+          con.conname != 'uq_challenges_bound_tx_hash'
+          OR i.indnullsnotdistinct = true
+          OR con.conkey != ARRAY[bound_attnum]
+        )
     ) LOOP
       EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
     END LOOP;
 
-    -- Case C: If existing uq_challenges_bound_tx_hash has NULLS NOT DISTINCT = true, drop it early
+    -- Case C: If any lingering uq_challenges_bound_tx_hash has NULLS NOT DISTINCT = true, drop it
     IF EXISTS (
       SELECT 1 FROM pg_constraint con
       JOIN pg_index i ON i.indexrelid = con.conindid
@@ -134,9 +127,12 @@ BEGIN
       ALTER TABLE challenges DROP CONSTRAINT uq_challenges_bound_tx_hash;
     END IF;
 
-    -- Case D: Early purge of standalone incompatible indexes covering bound_tx_hash
-    -- Purge ANY unique index with indnullsnotdistinct = true covering bound_tx_hash in any position,
-    -- unless its predicate is strictly and solely bound_tx_hash IS NOT NULL without disjunctions (OR).
+    -- Case D: Early purge of standalone duplicate or incompatible indexes covering bound_tx_hash
+    -- A. Drop ANY standalone unique index covering bound_tx_hash in ANY position with indnullsnotdistinct = true,
+    --    UNLESS its predicate strictly and safely guarantees that bound_tx_hash IS NOT NULL
+    --    (i.e. contains bound_tx_hash IS NOT NULL without any OR disjunction).
+    -- B. Drop redundant identical single-column btree text_ops index matching canonical definition,
+    --    while strictly preserving partial indexes and specialized opclasses.
     FOR r IN (
       SELECT idx.relname AS index_name
       FROM pg_index i
@@ -156,7 +152,7 @@ BEGIN
             AND (
               i.indpred IS NULL 
               OR pg_get_expr(i.indpred, i.indrelid) ~* '\s+OR\s+'
-              OR pg_get_expr(i.indpred, i.indrelid) !~* '^\(?\s*bound_tx_hash\s+IS\s+NOT\s+NULL\s*\)?$'
+              OR pg_get_expr(i.indpred, i.indrelid) !~* 'bound_tx_hash\s+IS\s+NOT\s+NULL'
             )
           )
           OR

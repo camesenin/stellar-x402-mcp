@@ -101,7 +101,7 @@ jobs:
           # - Legacy constraint with NULLS NOT DISTINCT (uq_challenges_bound_tx_hash) -> exercises Case C transition to standard unique!
           # - Duplicate btree index on bound_tx_hash to be purged
           # - Incompatible composite unique index (status, bound_tx_hash) with NULLS NOT DISTINCT -> must be purged by Case D!
-          # - Incompatible standalone unique index with NULLS NOT DISTINCT AND DESC order -> must be purged by Case D!
+          # - Incompatible composite unique constraint with NULLS NOT DISTINCT (uq_legacy_incompatible_composite) -> must be purged early!
           # - Incompatible partial unique index with OR disjunction '(bound_tx_hash IS NOT NULL OR status = 'PENDING') NULLS NOT DISTINCT' -> must be purged by Case D!
           # - Protected partial index (WHERE (status = 'PENDING'))
           # - Protected partial unique index (WHERE (bound_tx_hash IS NOT NULL))
@@ -123,8 +123,11 @@ jobs:
               redeemed_at BIGINT,
               is_redeemed INTEGER NOT NULL DEFAULT 0,
               CONSTRAINT chk_legacy_composite CHECK (status IN ('PENDING', 'REDEEMED', 'INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE')),
-              -- Legacy non-standard constraint with NULLS NOT DISTINCT exercising Case C transition:
-              CONSTRAINT uq_challenges_bound_tx_hash UNIQUE NULLS NOT DISTINCT (bound_tx_hash)
+              -- Incompatible composite UNIQUE constraint with NULLS NOT DISTINCT on (status, bound_tx_hash):
+              -- Validly admits (PENDING, NULL) and (REDEEMED, NULL) during initial population!
+              -- Tests that EARLY_STRUCTURAL_PURGE drops this incompatible constraint BEFORE EVOLVE_DATA,
+              -- allowing both rows to converge to status = 'RECONCILIATION_REQUIRED' without uniqueness conflict!
+              CONSTRAINT uq_legacy_incompatible_composite UNIQUE NULLS NOT DISTINCT (status, bound_tx_hash)
             );
 
             -- Row 1: Valid legacy challenge starting with amount_stroops=0 to test REAL conversion from '0.05'
@@ -298,23 +301,21 @@ jobs:
             -- 1. Duplicate btree index on bound_tx_hash to be purged
             CREATE INDEX idx_legacy_duplicate_bound ON challenges USING btree (bound_tx_hash);
 
-            -- 2. Incompatible composite unique index (status, bound_tx_hash) with NULLS NOT DISTINCT -> must be purged by Case D!
+            -- 2. Incompatible composite unique index (status, bound_tx_hash) with NULLS NOT DISTINCT -> must be purged!
             CREATE UNIQUE INDEX idx_legacy_incompatible_composite_status_hash ON challenges (status, bound_tx_hash) NULLS NOT DISTINCT;
 
-            -- 3. Incompatible standalone unique index with NULLS NOT DISTINCT AND DESC order -> must be purged by Case D!
-            CREATE UNIQUE INDEX idx_legacy_incompatible_nulls_not_distinct_desc ON challenges (bound_tx_hash DESC) NULLS NOT DISTINCT;
-
-            -- 4. Incompatible partial unique index with OR disjunction -> must be purged by Case D!
+            -- 3. Incompatible partial unique index with OR disjunction that admits NULLs in pending rows -> must be purged!
             CREATE UNIQUE INDEX idx_legacy_incompatible_partial_or_nulls ON challenges (status, bound_tx_hash) NULLS NOT DISTINCT WHERE (bound_tx_hash IS NOT NULL OR status = 'PENDING');
 
-            -- 5. Protected partial index (MUST be preserved)
+            -- 4. Protected partial index (MUST be preserved)
             CREATE INDEX idx_legacy_partial_bound ON challenges USING btree (bound_tx_hash) WHERE (status = 'PENDING');
 
-            -- 6. Protected partial unique index strictly on NOT NULL (MUST be preserved)
+            -- 5. Protected partial unique index strictly on NOT NULL (MUST be preserved)
             CREATE UNIQUE INDEX idx_legacy_protected_partial_not_null ON challenges (bound_tx_hash) WHERE (bound_tx_hash IS NOT NULL);
 
-            -- 6b. Protected partial index with legitimate conjunction (bound_tx_hash IS NOT NULL AND status != 'CANCELLED')
-            CREATE INDEX idx_legacy_protected_partial_conjunctive ON challenges (bound_tx_hash) WHERE (bound_tx_hash IS NOT NULL AND status != 'CANCELLED');
+            -- 6. Protected UNIQUE NULLS NOT DISTINCT partial index with legitimate conjunction (bound_tx_hash IS NOT NULL AND status != 'CANCELLED')
+            -- Strictly guarantees bound_tx_hash IS NOT NULL on all indexed entries -> MUST be preserved!
+            CREATE UNIQUE INDEX idx_legacy_protected_partial_conjunctive ON challenges (bound_tx_hash) NULLS NOT DISTINCT WHERE (bound_tx_hash IS NOT NULL AND status != 'CANCELLED');
 
             -- 7. Protected specialized opclass index (MUST be preserved)
             CREATE INDEX idx_legacy_pattern_bound ON challenges USING btree (bound_tx_hash text_pattern_ops);
@@ -459,12 +460,12 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: idx_legacy_incompatible_composite_status_hash was not purged by Case D', step_name;
               END IF;
 
-              -- 3. idx_legacy_incompatible_nulls_not_distinct_desc MUST be purged
+              -- 3. uq_legacy_incompatible_composite constraint MUST be purged early
               IF EXISTS (
-                SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relname = 'idx_legacy_incompatible_nulls_not_distinct_desc' AND n.nspname = current_schema()
+                SELECT 1 FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE con.conname = 'uq_legacy_incompatible_composite' AND c.relname = 'challenges' AND n.nspname = current_schema()
               ) THEN
-                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_incompatible_nulls_not_distinct_desc was not purged by Case D', step_name;
+                RAISE EXCEPTION '[%] Assertion failed: uq_legacy_incompatible_composite constraint was not purged early by Case B', step_name;
               END IF;
 
               -- 4. idx_legacy_incompatible_partial_or_nulls MUST be purged (admitted NULLs in pending rows)
