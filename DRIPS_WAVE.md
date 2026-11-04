@@ -153,7 +153,7 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 - **Tier:** Medium (150 pts)
 - **Target File:** `.github/actions/stellar-standalone/action.yml`
 - **Prerequisites:** None
-- **Scope:** Composite action that launches pinned `stellar/quickstart:soroban-dev@sha256:pinned` (Protocol 22/23 compatible), waits for initial ledger close, and executes an end-to-end payment test against container RPC.
+- **Scope:** Composite action that launches pinned `stellar/quickstart:soroban-dev@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` (Protocol 22/23 compatible), waits for initial ledger close, and executes an end-to-end payment test against container RPC.
 - **Verification Command:** GitHub Actions CI execution
 
 ---
