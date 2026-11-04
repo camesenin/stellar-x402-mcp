@@ -65,39 +65,60 @@ ALTER TABLE IF EXISTS challenges ALTER COLUMN amount_stroops TYPE NUMERIC(40, 0)
 ALTER TABLE IF EXISTS challenges ALTER COLUMN paid_amount_stroops TYPE NUMERIC(40, 0);
 
 -- Evolutionary check constraints enforcement for existing installations
-DO $do$
+DO $
 DECLARE
   r RECORD;
+  status_attnum int2;
+  bound_attnum int2;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_amount') THEN
-    ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (amount_stroops > 0);
-  END IF;
+  -- Obtain exact attribute numbers for structural validation
+  SELECT attnum INTO status_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'status';
+  SELECT attnum INTO bound_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'bound_tx_hash';
 
-  -- 1. Drop any legacy CHECK constraints covering the status column regardless of their name
+  -- 1. Structural purge of single-column CHECK constraints on 'status' (array_length(conkey, 1) = 1)
+  -- Preserves any composite / multi-column business constraints
   FOR r IN (
     SELECT con.conname
     FROM pg_constraint con
-    JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ANY(con.conkey)
     WHERE con.conrelid = 'challenges'::regclass
       AND con.contype = 'c'
-      AND att.attname = 'status'
+      AND con.conkey = ARRAY[status_attnum]
   ) LOOP
     EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
   END LOOP;
   ALTER TABLE challenges ADD CONSTRAINT chk_challenge_status CHECK (status IN ('PENDING', 'RECONCILIATION_REQUIRED', 'INCONCLUSIVE_MANUAL_REVIEW', 'CONFIRMED', 'REDEEMED', 'CANCELLED', 'PERMANENT_QUARANTINE'));
 
-  -- 2. Drop any legacy UNIQUE constraints covering bound_tx_hash (except canonical uq_challenges_bound_tx_hash)
+  -- 2. Structural purge and canonical verification of UNIQUE constraint on 'bound_tx_hash'
+  -- Drops any single-column UNIQUE constraints on bound_tx_hash whose definition or name is non-canonical,
+  -- or if uq_challenges_bound_tx_hash does NOT strictly cover exactly ARRAY[bound_attnum]
   FOR r IN (
     SELECT con.conname
     FROM pg_constraint con
-    JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ANY(con.conkey)
     WHERE con.conrelid = 'challenges'::regclass
       AND con.contype = 'u'
-      AND con.conname != 'uq_challenges_bound_tx_hash'
-      AND att.attname = 'bound_tx_hash'
+      AND (
+        (con.conkey = ARRAY[bound_attnum] AND con.conname != 'uq_challenges_bound_tx_hash')
+        OR (con.conname = 'uq_challenges_bound_tx_hash' AND con.conkey != ARRAY[bound_attnum])
+      )
   ) LOOP
     EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
   END LOOP;
+
+  -- Ensure canonical uq_challenges_bound_tx_hash exists covering exactly bound_tx_hash
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'challenges'::regclass
+      AND contype = 'u'
+      AND conname = 'uq_challenges_bound_tx_hash'
+      AND conkey = ARRAY[bound_attnum]
+  ) THEN
+    ALTER TABLE challenges ADD CONSTRAINT uq_challenges_bound_tx_hash UNIQUE (bound_tx_hash);
+  END IF;
+
+  -- 3. Invariant checks structural enforcement
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_amount') THEN
+    ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (amount_stroops > 0);
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_redeemed_consistency') THEN
     ALTER TABLE challenges ADD CONSTRAINT chk_redeemed_consistency CHECK ((status != 'REDEEMED') OR (bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND redeemed_at IS NOT NULL));
   END IF;
@@ -126,10 +147,7 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_version') THEN
     ALTER TABLE challenges ADD CONSTRAINT chk_challenge_version CHECK (version >= 1);
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'uq_challenges_bound_tx_hash') THEN
-    ALTER TABLE challenges ADD CONSTRAINT uq_challenges_bound_tx_hash UNIQUE (bound_tx_hash);
-  END IF;
-END $do$;
+END $;o$;
 
 CREATE INDEX IF NOT EXISTS idx_challenges_status ON challenges(status);
 CREATE INDEX IF NOT EXISTS idx_challenges_expires_at ON challenges(expires_at);

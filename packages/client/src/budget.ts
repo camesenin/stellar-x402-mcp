@@ -63,12 +63,17 @@ export type StatusCheckerFn = (
  * BudgetManager: Process-local concurrency-safe budget meter and fail-closed quarantine engine.
  *
  * Operational Lifecycle & Scope Boundary:
- * - Scope: In-Memory / Live Process Instance. Guarantees fail-closed isolation and atomic accounting
- *   within the running Node.js process / MCP agent session.
- * - Non-Persistence Disclosure: Reservation maps and receipt logs are kept in-memory. If the process terminates,
- *   is killed, or restarted, the in-memory reservation ledger is re-initialized to zero. For multi-replica deployments
- *   or crash-recovery continuity across server reboots, persistent stores (e.g. PostgresStore / Redis challenge leases)
- *   must be used as the authoritative boundary before recreating instances.
+ * - Scope: Per-Instance In-Memory Isolation. Guarantees fail-closed isolation and atomic reservation tracking
+ *   strictly within a single live BudgetManager instance during its runtime.
+ * - Non-Persistence Disclosure: Reservations and settlement receipts are held entirely in memory in res/receipt maps.
+ *   Reconstructing the client, spawning independent fetch factories, or restarting the process initializes a brand new
+ *   empty reservation ledger.
+ * - Economic Metering Boundary: The budget manager accounts exclusively for transferred payment amounts (in stroops/XLM);
+ *   it does NOT incorporate network transaction fees (e.g. base inclusion fee), Soroban resource consumption fees,
+ *   rent, or state archival restoration costs.
+ * - Future Work / Non-Operational Caveat: Multi-replica coordination, crash-recovery continuity across server reboots,
+ *   and persistent cross-instance state are future architectural milestones (Issue 6 PostgresStore, Issue 13 Reconciler)
+ *   and are not currently operational in this client package.
  */
 export class BudgetManager {
   private totalSettledStroops: bigint = 0n;
