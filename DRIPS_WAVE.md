@@ -2,7 +2,7 @@
 
 **Repository:** `camesenin/stellar-x402-mcp`  
 **Network Program:** Drips Stellar Wave / Stellar Community Fund  
-**Audit Baseline Commit:** 422050f (422050f46dbb0620746898edfd04eb0d6184bb38 on main)  
+**Audit Baseline Commit:** 71d96c8 (71d96c8fb5fa0ee4736fdd0eea814b1205ecc462 on main)
 **QA Test Status:** 100% Green (55 Vitest automated test cases across packages + 8 Soroban Rust tests + simulated end-to-end agent MCP micropayment demo)  
 
 ---
@@ -86,7 +86,7 @@ The backlog features **10 standalone tasks** with zero prerequisites, and **6 de
 ### Breakdown of Independence & Parallelization:
 - **Standalone Tasks (10 issues):** Issues 1, 2, 3, 4, 5, 7, 9, 11, 15, 16.
   * In Tranche 1, **5 tasks (650 pts)** are standalone and immediately executable upon Wave opening.
-  * In Tranche 2, **5 tasks (550 pts)** are standalone.
+  * In Tranche 2, **5 tasks (600 pts)** are standalone.
 - **Dependent Tasks (6 issues):**
   * Issue 6 (PostgresStore) requires Issue 4 (DB Schema).
   * Issue 8 (SEP-41 SAC) requires Issue 2 (StrKey Validator).

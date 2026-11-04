@@ -242,4 +242,66 @@ describe('StellarPayer & Autonomous Soroban Execution', () => {
       expect(mockPreparedTx.sign).not.toHaveBeenCalled();
     });
   });
+
+  describe('Post-broadcast identity enrichment and adversarial error handling', () => {
+    it('enriches primitive string exceptions and null responses with localTxHash and signedMaxTimeSec in Classic settlement', async () => {
+      const payer = new StellarPayer({
+        secretKey: dummySecret,
+        network: 'testnet',
+      });
+
+      const { Account } = await import('@stellar/stellar-sdk');
+      vi.spyOn((payer as any).horizonServer, 'loadAccount').mockResolvedValue(
+        new Account(payer.getPublicKey(), '100')
+      );
+
+      // Adversarial scenario 1: Horizon submitTransaction returns null
+      vi.spyOn((payer as any).horizonServer, 'submitTransaction').mockResolvedValueOnce(null);
+
+      const challenge: ParsedChallenge = {
+        challengeId: 'test-challenge-classic-null',
+        destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        amount: '0.05',
+        asset: 'XLM',
+        network: 'testnet',
+      };
+
+      // Since result is null, receipt construction or post-broadcast handling should not escape without identity
+      // Actually result is null -> returnedHash is undefined, confirmedLedger is undefined, returns receipt with ledger: undefined
+      const receipt = await payer.settleClassicChallenge(challenge);
+      expect(receipt.txHash).toBeDefined();
+      expect(typeof receipt.txHash).toBe('string');
+      expect(receipt.ledger).toBeUndefined();
+
+      // Adversarial scenario 2: Horizon throws a primitive string
+      vi.spyOn((payer as any).horizonServer, 'submitTransaction').mockRejectedValueOnce('Horizon internal socket hangup');
+
+      try {
+        await payer.settleClassicChallenge(challenge);
+        expect.unreachable('Should have thrown');
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(Error);
+        expect(err.message).toContain('Horizon internal socket hangup');
+        expect(err.txHash).toBeDefined();
+        expect(err.maxTime).toBeGreaterThan(0);
+      }
+
+      // Adversarial scenario 3: Horizon throws a frozen Error object with conflicting txHash
+      const foreignErr = new Error('Foreign network error');
+      (foreignErr as any).txHash = 'FOREIGN_HASH';
+      (foreignErr as any).maxTime = 1;
+      const frozenErr = Object.freeze(foreignErr);
+      vi.spyOn((payer as any).horizonServer, 'submitTransaction').mockRejectedValueOnce(frozenErr);
+
+      try {
+        await payer.settleClassicChallenge(challenge);
+        expect.unreachable('Should have thrown');
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(Error);
+        expect(err.txHash).not.toBe('FOREIGN_HASH');
+        expect(err.txHash).toBeDefined();
+        expect(err.maxTime).toBeGreaterThan(100);
+      }
+    });
+  });
 });

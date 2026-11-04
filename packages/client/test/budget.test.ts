@@ -325,4 +325,44 @@ describe('BudgetManager', () => {
     await new Promise((resolve) => setTimeout(resolve, 80));
     expect(checkCalls).toBe(currentCalls);
   });
+
+  it('prevents shortening or tampering of maxTime / releaseAt via subsequent release calls', () => {
+    let mockTime = 100_000;
+    const budget = new BudgetManager(1.0, 5.0, 120_000, () => mockTime);
+
+    // Initial binding: hash A, validity until 160s (160_000ms), releaseAt = 175_000ms
+    const r = budget.reserve(0.1);
+    budget.release(r, 160_000, 'tx_hash_A', 'GMERCHANT_1');
+
+    // Adversarial second release attempt: trying to overwrite with hash B and shorter maxTime 101s (101_000ms)
+    budget.release(r, 101_000, 'tx_hash_B', 'GMERCHANT_2');
+
+    // Advance mock time to 117s (117_000ms)
+    mockTime = 117_000;
+
+    // Report NOT_FOUND with node latest = 102s, oldest = 100s
+    // If the boundary had been shortened to 101s, this would release the reservation.
+    // But original maxTime is 160s, and releaseAt is 175s!
+    expect(() => {
+      budget.resolveQuarantine(r, {
+        status: 'NOT_FOUND',
+        latestLedgerCloseTime: 102,
+        oldestLedgerCloseTime: 100,
+      });
+    }).toThrow('Cannot release quarantined reservation before in-flight timeout boundary has elapsed');
+
+    // Reservation MUST still be preserved fail-closed!
+    expect(budget.getPendingReservedXlm()).toBe(0.1);
+  });
+
+  it('rejects SUCCESS unquarantine without an authentic on-chain txHash', () => {
+    const budget = new BudgetManager(1.0, 5.0, 120_000, () => 100_000);
+    const r = budget.reserve(0.1);
+    // Quarantine with in-flight duration
+    budget.release(r, { durationMs: 60_000 });
+
+    expect(() => {
+      budget.resolveQuarantine(r, 'SUCCESS');
+    }).toThrow('Cannot resolve reservation to SUCCESS without an authentic on-chain txHash');
+  });
 });

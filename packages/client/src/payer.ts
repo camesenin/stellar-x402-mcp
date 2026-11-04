@@ -270,7 +270,6 @@ export class StellarPayer {
     // Cryptographic identity and bounds extracted locally prior to broadcast:
     const localTxHash = (prepared as any).hash().toString('hex');
     const signedMaxTimeSec = (prepared as any).timeBounds?.maxTime ? Number((prepared as any).timeBounds.maxTime) : Math.floor(Date.now() / 1000) + 60;
-    let ledger: number | undefined;
 
     // Submit transaction to Soroban RPC with comprehensive post-broadcast error enrichment
     try {
@@ -288,7 +287,7 @@ export class StellarPayer {
 
       // Poll for ledger inclusion safely using standard JSON-RPC 2.0 (protocol-version agnostic)
       let status: string = sendRes?.status;
-      let ledger: number | undefined;
+      let resolvedLedger: number | undefined;
       const maxPollAttempts = 30;
 
       for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
@@ -298,7 +297,7 @@ export class StellarPayer {
           const rawTx = await fetchSorobanTxJsonRpc(this.sorobanRpcUrl, txHash);
           if (rawTx) {
             status = rawTx.status;
-            ledger = rawTx.ledger || rawTx.latestLedger;
+            resolvedLedger = rawTx.ledger || rawTx.latestLedger;
             if (status === 'SUCCESS') {
               break;
             }
@@ -314,20 +313,23 @@ export class StellarPayer {
       if (status !== 'SUCCESS') {
         throw new Error('Soroban transaction timed out waiting for inclusion');
       }
-    } catch (postBroadcastErr: any) {
-      if (!postBroadcastErr.txHash) postBroadcastErr.txHash = localTxHash;
-      if (!postBroadcastErr.maxTime) postBroadcastErr.maxTime = signedMaxTimeSec;
-      throw postBroadcastErr;
+
+      return {
+        txHash: localTxHash,
+        challengeId: challenge.challengeId,
+        destination: challenge.destination,
+        amount: challenge.amount,
+        asset: challenge.asset,
+        ledger: resolvedLedger,
+        timestamp: Date.now(),
+      };
+    } catch (rawErr: any) {
+      const errMsg = rawErr instanceof Error ? rawErr.message : String(rawErr);
+      const enrichedErr: any = new Error(errMsg, { cause: rawErr });
+      enrichedErr.txHash = localTxHash;
+      enrichedErr.maxTime = signedMaxTimeSec;
+      throw enrichedErr;
     }
-    return {
-      txHash: localTxHash,
-      challengeId: challenge.challengeId,
-      destination: challenge.destination,
-      amount: challenge.amount,
-      asset: challenge.asset,
-      ledger,
-      timestamp: Date.now(),
-    };
   }
 
   /**
@@ -373,27 +375,30 @@ export class StellarPayer {
     const localTxHash = transaction.hash().toString('hex');
     const signedMaxTimeSec = transaction.timeBounds?.maxTime ? Number(transaction.timeBounds.maxTime) : Math.floor(Date.now() / 1000) + 60;
 
-    let result: any;
     try {
-      result = await this.horizonServer.submitTransaction(transaction);
+      const result: any = await this.horizonServer.submitTransaction(transaction);
       const returnedHash = typeof result?.hash === 'string' ? result.hash : undefined;
       if (returnedHash && returnedHash.toLowerCase() !== localTxHash.toLowerCase()) {
         throw new Error('Horizon returned mismatched transaction hash');
       }
-    } catch (submitErr: any) {
-      if (!submitErr.txHash) submitErr.txHash = localTxHash;
-      if (!submitErr.maxTime) submitErr.maxTime = signedMaxTimeSec;
-      throw submitErr;
-    }
 
-    return {
-      txHash: localTxHash,
-      challengeId: challenge.challengeId,
-      destination: challenge.destination,
-      amount: challenge.amount,
-      asset: challenge.asset,
-      ledger: result.ledger,
-      timestamp: Date.now(),
-    };
+      const confirmedLedger = typeof result?.ledger === 'number' ? result.ledger : undefined;
+
+      return {
+        txHash: localTxHash,
+        challengeId: challenge.challengeId,
+        destination: challenge.destination,
+        amount: challenge.amount,
+        asset: challenge.asset,
+        ledger: confirmedLedger,
+        timestamp: Date.now(),
+      };
+    } catch (rawErr: any) {
+      const errMsg = rawErr instanceof Error ? rawErr.message : String(rawErr);
+      const enrichedErr: any = new Error(errMsg, { cause: rawErr });
+      enrichedErr.txHash = localTxHash;
+      enrichedErr.maxTime = signedMaxTimeSec;
+      throw enrichedErr;
+    }
   }
 }

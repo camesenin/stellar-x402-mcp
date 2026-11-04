@@ -225,7 +225,18 @@ export class BudgetManager {
     const res = this.reservations.get(reservationId);
     if (!res) return;
 
-    if (txHash && !res.txHash) res.txHash = txHash;
+    // If this reservation already has a txHash bound to signed envelope boundaries,
+    // reject tampering or shortening of boundaries by conflicting or subsequent release calls.
+    if (res.txHash) {
+      if (txHash && res.txHash !== txHash) {
+        // Conflicting transaction identity: preserve original envelope binding fail-closed
+        return;
+      }
+      // Transaction already bound: cryptographic bounds are immutable
+      return;
+    }
+
+    if (txHash) res.txHash = txHash;
     if (destination) res.destination = destination;
     res.broadcastAtSec = broadcastAtSec ?? res.broadcastAtSec ?? Math.floor(this.clock() / 1000);
 
@@ -355,10 +366,12 @@ export class BudgetManager {
     }
 
     if (status === 'SUCCESS') {
-      // Re-use finalize logic to ensure strict deduplication by txHash and atomic bookkeeping
-      const targetHash = res.txHash || reservationId;
+      // A reservation without authentic cryptographic on-chain txHash cannot confirm SUCCESS
+      if (!res.txHash) {
+        throw new Error('Cannot resolve reservation to SUCCESS without an authentic on-chain txHash');
+      }
       const targetDest = res.destination || 'UNKNOWN';
-      this.finalize(reservationId, targetDest, targetHash, stroopsToXlmNumber(res.amountStroops));
+      this.finalize(reservationId, targetDest, res.txHash, stroopsToXlmNumber(res.amountStroops));
       return;
     }
 

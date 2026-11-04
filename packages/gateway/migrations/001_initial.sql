@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS challenges (
 
 -- Evolutionary schema migration support for existing deployments
 ALTER TABLE IF EXISTS challenges ALTER COLUMN destination SET NOT NULL;
+ALTER TABLE IF EXISTS challenges ALTER COLUMN status SET NOT NULL;
 ALTER TABLE IF EXISTS challenges ALTER COLUMN amount_stroops SET NOT NULL;
 ALTER TABLE IF EXISTS challenges ALTER COLUMN asset SET NOT NULL;
 ALTER TABLE IF EXISTS challenges ALTER COLUMN resource SET NOT NULL;
