@@ -2,7 +2,7 @@
 
 **Repository:** `camesenin/stellar-x402-mcp`  
 **Network Program:** Drips Stellar Wave / Stellar Community Fund  
-**Audit Baseline Commit:** `b7a685c` (v0.2.4-rc1)  
+**Audit Baseline Commit:** `bbb07ca` (v0.2.4-rc1)  
 **CI Status:** 100% Green (55 Vitest TS tests + 8 Soroban Rust tests)  
 
 ---

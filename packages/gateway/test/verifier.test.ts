@@ -94,6 +94,58 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
     expect(result.reason).toMatch(/already been redeemed/i);
   });
 
+  it('correctly aggregates payment operations across multiple Horizon paginated pages', async () => {
+    const challenge = store.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/resource'
+    );
+
+    const page1Records = [
+      {
+        type: 'payment',
+        to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        amount: '0.02',
+        asset_type: 'native',
+      },
+    ];
+
+    const page2Records = [
+      {
+        type: 'payment',
+        to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        amount: '0.03',
+        asset_type: 'native',
+      },
+    ];
+
+    const mockTx = {
+      id: 'multipage_tx_hash',
+      successful: true,
+      source_account: 'GAUTONOMOUS_TEST_PAYER_123456789012345678901234567890',
+      memo: challenge.memo,
+      ledger_attr: 123456,
+      operations: async () => ({
+        records: page1Records,
+        next: async () => ({
+          records: page2Records,
+          next: async () => ({ records: [] }),
+        }),
+      }),
+    };
+
+    vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+      transaction: () => ({
+        call: async () => mockTx,
+      }),
+    } as any);
+
+    const result = await verifier.verifyPayment('multipage_tx_hash', challenge, store);
+    expect(result.valid).toBe(true);
+    expect(result.amount).toBe('0.05');
+  });
+
   it('rejects verification if challenge has already been settled', async () => {
     const tx1 = '1111111111111111111111111111111111111111111111111111111111111111';
     const tx2 = '2222222222222222222222222222222222222222222222222222222222222222';
