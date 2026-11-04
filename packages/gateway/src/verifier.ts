@@ -177,6 +177,27 @@ export class StellarPaymentVerifier {
       };
     }
 
+    // Strict Challenge Expiration Defense: reject if challenge is already expired before querying ledger
+    if (Date.now() > challenge.expiresAt) {
+      return {
+        valid: false,
+        reason: `Challenge '${challenge.challengeId}' has expired (expired at ${challenge.expiresAt}, current time ${Date.now()})`,
+        txHash: cleanHash,
+      };
+    }
+
+    // Strict Contextual Binding Defense: If requesterAuth is supplied, verifier reconstructs expected canonical domain message and asserts exact match
+    if (requesterAuth) {
+      const expectedDomainMessage = `stellar-x402:v1:${this.networkPassphrase}:${challenge.resource}:${challenge.challengeId}:${cleanHash}:${challenge.expiresAt}`;
+      if (requesterAuth.message !== expectedDomainMessage) {
+        return {
+          valid: false,
+          reason: `Requester authentication failed: Domain-separated message mismatch. Expected '${expectedDomainMessage}', presented '${requesterAuth.message}'.`,
+          txHash: cleanHash,
+        };
+      }
+    }
+
     // 2. Branch A: Soroban Contract Verification
     if (challenge.contractId && this.sorobanServer) {
       return this.verifySorobanTransactionAndReceipt(cleanHash, challenge, store, requesterAuth);

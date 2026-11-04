@@ -244,8 +244,9 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
       timestamp: 1730000000,
     });
 
+    const domainMessage = `stellar-x402:v1:${verifier.getNetworkPassphrase()}:/resource:${challenge.challengeId}:dummy_tx:${challenge.expiresAt}`;
     const result = await verifier.verifyPayment('dummy_tx', challenge, store, {
-      message: 'test_domain_message',
+      message: domainMessage,
       signatureBase64: 'AAAA',
     });
 
@@ -602,6 +603,193 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
       expect(resValid.valid).toBe(true);
       expect(resValid.payer).toBe(payerKp.publicKey());
       expect(store.isTxRedeemed(cleanHash)).toBe(true);
+    });
+
+    it('correctly falls back to op.from when op.source_account is absent, and op.funder for create_account', async () => {
+      const challenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/resource'
+      );
+
+      const fromPayerKp = Keypair.random();
+      const mockTx = {
+        id: 'fallback_from_tx',
+        successful: true,
+        source_account: 'GRELAYER_SOURCE_1234567890',
+        memo: challenge.memo,
+        ledger_attr: 50010,
+        operations: async () => ({
+          records: [
+            {
+              type: 'payment',
+              to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+              from: fromPayerKp.publicKey(), // source_account undefined, relies on from
+              amount: '0.05',
+              asset_type: 'native',
+            },
+          ],
+          next: async () => ({ records: [] }),
+        }),
+      };
+
+      vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+        transaction: () => ({ call: async () => mockTx }),
+      } as any);
+
+      const cleanHash = 'fallback_from_tx';
+      const domainMsg = `stellar-x402:v1:${verifier.getNetworkPassphrase()}:/resource:${challenge.challengeId}:${cleanHash}:${challenge.expiresAt}`;
+      const validSig = fromPayerKp.sign(Buffer.from(domainMsg, 'utf-8')).toString('base64');
+
+      const result = await verifier.verifyPayment(cleanHash, challenge, store, {
+        message: domainMsg,
+        signatureBase64: validSig,
+      });
+      expect(result.valid).toBe(true);
+      expect(result.payer).toBe(fromPayerKp.publicKey());
+    });
+
+    it('correctly consolidates multiple payments from the SAME payer across multiple pages', async () => {
+      const challenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.10',
+        'XLM',
+        '/resource'
+      );
+
+      const singlePayerKp = Keypair.random();
+      const mockMultiPageSamePayerTx = {
+        id: 'multipage_same_payer_tx',
+        successful: true,
+        source_account: 'GRELAYER_SOURCE_9999999999',
+        memo: challenge.memo,
+        ledger_attr: 50011,
+        operations: async () => ({
+          records: [
+            {
+              type: 'payment',
+              to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+              source_account: singlePayerKp.publicKey(),
+              amount: '0.06',
+              asset_type: 'native',
+            },
+          ],
+          next: async () => ({
+            records: [
+              {
+                type: 'payment',
+                to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+                source_account: singlePayerKp.publicKey(),
+                amount: '0.04',
+                asset_type: 'native',
+              },
+            ],
+            next: async () => ({ records: [] }),
+          }),
+        }),
+      };
+
+      vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+        transaction: () => ({ call: async () => mockMultiPageSamePayerTx }),
+      } as any);
+
+      const cleanHash = 'multipage_same_payer_tx';
+      const domainMsg = `stellar-x402:v1:${verifier.getNetworkPassphrase()}:/resource:${challenge.challengeId}:${cleanHash}:${challenge.expiresAt}`;
+      const validSig = singlePayerKp.sign(Buffer.from(domainMsg, 'utf-8')).toString('base64');
+
+      const result = await verifier.verifyPayment(cleanHash, challenge, store, {
+        message: domainMsg,
+        signatureBase64: validSig,
+      });
+      expect(result.valid).toBe(true);
+      expect(result.amount).toBe('0.1');
+      expect(result.payer).toBe(singlePayerKp.publicKey());
+    });
+
+    it('rejects payment if challenge expires during Horizon network query and prevents redemption', async () => {
+      // Create challenge with very short TTL
+      const challenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/resource',
+        'testnet',
+        undefined,
+        50 // expires in 50ms
+      );
+
+      const payerKp = Keypair.random();
+      const cleanHash = 'expiry_race_tx';
+      const mockTx = {
+        id: cleanHash,
+        successful: true,
+        source_account: payerKp.publicKey(),
+        memo: challenge.memo,
+        ledger_attr: 50012,
+        operations: async () => {
+          // Simulate network delay causing challenge to expire during Horizon fetch
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          return {
+            records: [
+              {
+                type: 'payment',
+                to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+                source_account: payerKp.publicKey(),
+                amount: '0.05',
+                asset_type: 'native',
+              },
+            ],
+            next: async () => ({ records: [] }),
+          };
+        },
+      };
+
+      vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+        transaction: () => ({ call: async () => mockTx }),
+      } as any);
+
+      const domainMsg = `stellar-x402:v1:${verifier.getNetworkPassphrase()}:/resource:${challenge.challengeId}:${cleanHash}:${challenge.expiresAt}`;
+      const validSig = payerKp.sign(Buffer.from(domainMsg, 'utf-8')).toString('base64');
+
+      let caughtError: unknown = null;
+      try {
+        await verifier.verifyPayment(cleanHash, challenge, store, {
+          message: domainMsg,
+          signatureBase64: validSig,
+        });
+      } catch (err) {
+        caughtError = err;
+      }
+
+      // Either verifier returns valid: false or markRedeemed throws atomic redemption failure
+      // Crucial assertion: transaction hash must NOT be redeemed, and challenge is not consumed!
+      expect(store.isTxRedeemed(cleanHash)).toBe(false);
+    });
+
+    it('verifier isolates and rejects domain message presentation mismatch even when passed directly', async () => {
+      const challenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/resource'
+      );
+
+      const payerKp = Keypair.random();
+      const cleanHash = 'context_isolation_tx';
+      // Agent signs a message for /different_tool
+      const spoofedMessage = `stellar-x402:v1:${verifier.getNetworkPassphrase()}:/different_tool:${challenge.challengeId}:${cleanHash}:${challenge.expiresAt}`;
+      const spoofedSig = payerKp.sign(Buffer.from(spoofedMessage, 'utf-8')).toString('base64');
+
+      // Passing spoofed message directly to verifier.verifyPayment -> verifier detects expected domain mismatch!
+      const result = await verifier.verifyPayment(cleanHash, challenge, store, {
+        message: spoofedMessage,
+        signatureBase64: spoofedSig,
+      });
+
+      expect(result.valid).toBe(false);
+      expect(result.reason).toContain('Domain-separated message mismatch');
+      expect(store.isTxRedeemed(cleanHash)).toBe(false);
     });
   });
 });

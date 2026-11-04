@@ -183,14 +183,14 @@ export class ChallengeStore {
     const now = Date.now();
 
     const transaction = this.db.transaction(() => {
-      // 1. Enforce that challenge exists and is currently unredeemed
+      // 1. Enforce that challenge exists, is currently unredeemed, and has NOT expired
       const updateChallenge = this.db.prepare(`
-        UPDATE challenges SET is_redeemed = 1 WHERE challenge_id = ? AND is_redeemed = 0
+        UPDATE challenges SET is_redeemed = 1 WHERE challenge_id = ? AND is_redeemed = 0 AND expires_at > ?
       `);
-      const updateResult = updateChallenge.run(challengeId);
+      const updateResult = updateChallenge.run(challengeId, now);
       if (updateResult.changes === 0) {
         throw new Error(
-          `Atomic redemption failed: Challenge '${challengeId}' not found or already redeemed.`
+          `Atomic redemption failed: Challenge '${challengeId}' not found, already redeemed, or expired.`
         );
       }
 
