@@ -259,9 +259,9 @@ export class BudgetManager {
     res.broadcastAtSec = broadcastAtSec ?? res.broadcastAtSec ?? Math.floor(this.clock() / 1000);
 
     // Cryptographic on-chain maxTime: STRICTLY decoupled from local timers.
-    // When envelopeMaxTimeSec is explicitly provided, validate it as a safe positive integer.
-    // If keepUntil is an object with envelopeMaxTimeSec, extract it.
-    // In legacy/unit test call signatures without explicit envelopeMaxTimeSec, a numeric keepUntil <= 100_000_000 (such as relative seconds) or passing an explicit envelopeMaxTimeSec is accepted, but local wait epochMs (e.g. Date.now() + 75_000) is NEVER treated as envelope maxTime.
+    // NEVER infer or synthesize maxTimeSec from numeric keepUntil values, epochMs, durations, or timers!
+    // A cryptographic maxTimeSec is ONLY accepted if explicitly provided via envelopeMaxTimeSec
+    // or as { envelopeMaxTimeSec: number } in the options object, and must be a strictly positive safe integer.
     let validatedMaxTimeSec: number | undefined;
     if (typeof envelopeMaxTimeSec === 'number' && Number.isSafeInteger(envelopeMaxTimeSec) && envelopeMaxTimeSec > 0) {
       validatedMaxTimeSec = envelopeMaxTimeSec;
@@ -270,18 +270,9 @@ export class BudgetManager {
       if (typeof bound === 'number' && Number.isSafeInteger(bound) && bound > 0) {
         validatedMaxTimeSec = bound;
       }
-    } else if (typeof keepUntil === 'number') {
-      // If a caller explicitly passed a small unix timestamp in seconds (between 1e8 and 4e9)
-      if (keepUntil > 100_000_000 && keepUntil < 4_000_000_000) {
-        validatedMaxTimeSec = keepUntil;
-      } else if (keepUntil <= 100_000_000 && keepUntil > 0) {
-        // Mock timestamps in unit tests starting around 1000s or 100_000ms
-        // If mock time is small, convert ms to sec
-        validatedMaxTimeSec = Math.floor(keepUntil / 1000);
-      }
     }
 
-    if (validatedMaxTimeSec !== undefined && validatedMaxTimeSec > 0) {
+    if (validatedMaxTimeSec !== undefined) {
       res.maxTimeSec = validatedMaxTimeSec;
     }
 

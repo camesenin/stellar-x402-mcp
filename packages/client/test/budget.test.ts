@@ -128,7 +128,8 @@ describe('BudgetManager', () => {
 
     // Case 2: In-flight tx expired on ledger (NOT_FOUND / FAILED)
     const res2 = budget.reserve(0.8);
-    budget.release(res2, mockTime + 20_000, 'tx_dropped_never_landed', 'GMERCHANT_2');
+    const envelopeMaxTime2 = Math.floor((mockTime + 20_000) / 1000);
+    budget.release(res2, mockTime + 20_000, 'tx_dropped_never_landed', 'GMERCHANT_2', Math.floor(mockTime / 1000), envelopeMaxTime2);
     expect(budget.getPendingReservedXlm()).toBe(0.8);
 
     // Guard check: cannot unquarantine with NOT_FOUND before timeout boundary elapses
@@ -151,7 +152,8 @@ describe('BudgetManager', () => {
     const budget = new BudgetManager(1.0, 2.0, 120_000, () => mockTime);
 
     const res = budget.reserve(0.5);
-    budget.release(res, mockTime + 10_000, 'tx_broadcast_inflight', 'GMERCHANT_3');
+    const envelopeMaxTimeRes = Math.floor((mockTime + 10_000) / 1000);
+    budget.release(res, mockTime + 10_000, 'tx_broadcast_inflight', 'GMERCHANT_3', Math.floor(mockTime / 1000), envelopeMaxTimeRes);
 
     // Advance clock past releaseAt
     mockTime += 30_000;
@@ -185,7 +187,8 @@ describe('BudgetManager', () => {
     budget.release(r1, mockTime + 5000, 'tx_hash_confirmed', 'GMERCHANT_1');
 
     const r2 = budget.reserve(0.8);
-    budget.release(r2, mockTime + 5000, 'tx_hash_dropped', 'GMERCHANT_2');
+    const envelopeMaxTimeR2 = Math.floor((mockTime + 5000) / 1000);
+    budget.release(r2, mockTime + 5000, 'tx_hash_dropped', 'GMERCHANT_2', Math.floor(mockTime / 1000), envelopeMaxTimeR2);
 
     // Advance past timeout boundary
     mockTime += 25_000;
@@ -211,7 +214,7 @@ describe('BudgetManager', () => {
 
     // Reservation with maxTime = 110_000ms (110s) -> releaseAt = 125_000ms
     const r = budget.reserve(0.5);
-    budget.release(r, 110_000, 'tx_hash_window_check', 'GMERCHANT_1');
+    budget.release(r, 110_000, 'tx_hash_window_check', 'GMERCHANT_1', 100, 110);
 
     // Advance clock past releaseAt (e.g. 130_000ms)
     mockTime = 130_000;
@@ -334,13 +337,13 @@ describe('BudgetManager', () => {
 
     // Initial binding: hash A, validity until 160s (160_000ms), releaseAt = 175_000ms
     const r = budget.reserve(0.1);
-    budget.release(r, 160_000, 'tx_hash_A', 'GMERCHANT_1');
+    budget.release(r, 160_000, 'tx_hash_A', 'GMERCHANT_1', 100, 160);
 
     // Adversarial second release attempt A: trying to overwrite with DIFFERENT hash B and shorter maxTime 101s (101_000ms)
-    budget.release(r, 101_000, 'tx_hash_B', 'GMERCHANT_2');
+    budget.release(r, 101_000, 'tx_hash_B', 'GMERCHANT_2', 100, 101);
 
     // Adversarial second release attempt B: trying to shorten with the EXACT SAME hash A and shorter maxTime 101s (101_000ms)
-    budget.release(r, 101_000, 'tx_hash_A', 'GMERCHANT_1');
+    budget.release(r, 101_000, 'tx_hash_A', 'GMERCHANT_1', 100, 101);
 
     // Advance mock time to 117s (117_000ms)
     mockTime = 117_000;
@@ -372,24 +375,27 @@ describe('BudgetManager', () => {
   });
   it('strictly preserves quarantine fail-closed when transaction has no authentic maxTime (e.g. TimeoutInfinite)', () => {
     let mockTime = 100_000;
+    const broadcastSec = Math.floor(mockTime / 1000); // 100s
     const budget = new BudgetManager(1.0, 5.0, 120_000, () => mockTime);
     const r = budget.reserve(0.5);
 
-    // Simulated fetch.ts fallback: local wait timer = Date.now() + 75_000, but envelopeMaxTimeSec is undefined (TimeoutInfinite / 0)
-    budget.release(r, { epochMs: mockTime + 75_000 }, 'tx_unbounded_hash', 'GMERCHANT_UNBOUNDED', undefined, undefined);
+    // Envelope broadcast without signed maxTime (TimeoutInfinite / 0). Local wait timer is set to 75s.
+    budget.release(r, { epochMs: mockTime + 75_000 }, 'tx_unbounded_hash', 'GMERCHANT_UNBOUNDED', broadcastSec, undefined);
 
-    // Fast-forward local clock past local wait timer (e.g. +80s)
+    // Fast-forward local clock past local wait timer (+95s -> 195s)
     mockTime += 95_000;
 
-    // Node reports NOT_FOUND with latest and oldest ledger close times
+    // Node reports NOT_FOUND with COMPLETE ledger history covering the broadcast:
+    // oldestLedgerCloseTime = 50s (< broadcastSec 100s) -> Node retention window FULLY covers broadcast!
+    // latestLedgerCloseTime = 500s (> 195s) -> Node ledger is far in the future past any local timeout!
     budget.resolveQuarantine(r, {
       status: 'NOT_FOUND',
-      latestLedgerCloseTime: Math.floor(mockTime / 1000) + 100,
-      oldestLedgerCloseTime: Math.floor((mockTime - 80_000) / 1000) - 10,
+      latestLedgerCloseTime: 500,
+      oldestLedgerCloseTime: 50,
     });
 
-    // Verification: Because maxTimeSec was never assigned from the local wait timer,
-    // the reservation CANNOT be unquarantined and remains 100% reserved fail-closed!
+    // Verification: Despite complete history coverage and ledger advancing far into the future,
+    // because envelope has no finite cryptographic maxTime, it can NEVER be unquarantined and remains 100% fail-closed!
     expect(budget.getPendingReservedXlm()).toBe(0.5);
   });
 

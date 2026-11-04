@@ -71,13 +71,69 @@ jobs:
       - name: Build TypeScript Packages
         run: pnpm build
 
-      - name: Verify PostgreSQL 16 Schema Migration
+      - name: Verify PostgreSQL 16 Schema Migration & Idempotency
         env:
-          DATABASE_URL: postgresql://testuser:testpassword@localhost:5432/stellar_x402_test
+          PGHOST: localhost
+          PGPORT: 5432
+          PGDATABASE: stellar_x402_test
+          PGUSER: testuser
+          PGPASSWORD: testpassword
         run: |
-          psql  -f packages/gateway/migrations/001_initial.sql
-          # Second execution to verify strict idempotency
-          psql  -f packages/gateway/migrations/001_initial.sql
+          # 1. Setup legacy test fixtures (non-standard constraints, NULLS NOT DISTINCT, partial indexes, text_pattern_ops)
+          psql -X -v ON_ERROR_STOP=1 << 'EOF'
+            CREATE TABLE challenges (
+              challenge_id TEXT PRIMARY KEY,
+              destination TEXT NOT NULL,
+              amount TEXT NOT NULL,
+              amount_stroops BIGINT NOT NULL,
+              asset TEXT NOT NULL,
+              memo TEXT NOT NULL,
+              network TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'PENDING',
+              expires_at BIGINT NOT NULL,
+              created_at BIGINT NOT NULL,
+              bound_tx_hash TEXT,
+              paid_amount_stroops BIGINT,
+              redeemed_at BIGINT,
+              payer_address TEXT,
+              created_ledger BIGINT,
+              min_valid_ledger BIGINT,
+              max_valid_ledger BIGINT
+            );
+            CREATE INDEX idx_legacy_duplicate_bound ON challenges USING btree (bound_tx_hash);
+            CREATE INDEX idx_legacy_partial_bound ON challenges USING btree (bound_tx_hash) WHERE status = 'PENDING';
+            CREATE INDEX idx_legacy_pattern_bound ON challenges USING btree (bound_tx_hash text_pattern_ops);
+            CREATE UNIQUE INDEX idx_legacy_nulls_not_distinct ON challenges USING btree (bound_tx_hash) NULLS NOT DISTINCT;
+          EOF
+
+          # 2. First migration run
+          psql -X -v ON_ERROR_STOP=1 -f packages/gateway/migrations/001_initial.sql
+
+          # 3. Assertions: verify duplicate index purged, while protected indexes and constraints are strictly preserved
+          psql -X -v ON_ERROR_STOP=1 << 'EOF'
+            DO $$
+            BEGIN
+              IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'idx_legacy_duplicate_bound') THEN
+                RAISE EXCEPTION 'Assertion failed: idx_legacy_duplicate_bound was not purged';
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'idx_legacy_partial_bound') THEN
+                RAISE EXCEPTION 'Assertion failed: idx_legacy_partial_bound was unexpectedly dropped';
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'idx_legacy_pattern_bound') THEN
+                RAISE EXCEPTION 'Assertion failed: idx_legacy_pattern_bound was unexpectedly dropped';
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'idx_legacy_nulls_not_distinct') THEN
+                RAISE EXCEPTION 'Assertion failed: idx_legacy_nulls_not_distinct was unexpectedly dropped';
+              END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_challenges_bound_tx_hash') THEN
+                RAISE EXCEPTION 'Assertion failed: uq_challenges_bound_tx_hash missing';
+              END IF;
+            END;
+            $$;
+          EOF
+
+          # 4. Second migration run (Strict Idempotency Verification)
+          psql -X -v ON_ERROR_STOP=1 -f packages/gateway/migrations/001_initial.sql
 
       - name: Run Vitest Unit Tests
         run: pnpm test

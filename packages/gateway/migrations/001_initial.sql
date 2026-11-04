@@ -126,11 +126,12 @@ BEGIN
   FOR r IN (
     SELECT con.conname
     FROM pg_constraint con
+    LEFT JOIN pg_index i ON i.indexrelid = con.conindid
     WHERE con.conrelid = 'challenges'::regclass
       AND con.contype = 'u'
       AND con.conkey = ARRAY[bound_attnum]
       AND con.conname != 'uq_challenges_bound_tx_hash'
-      AND con.connullsnotdistinct = false -- Strictly preserves any non-standard NULLS NOT DISTINCT constraint
+      AND (i.indnullsnotdistinct IS NULL OR i.indnullsnotdistinct = false) -- Strictly preserves any non-standard NULLS NOT DISTINCT constraint via pg_index
   ) LOOP
     EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
   END LOOP;
