@@ -58,7 +58,7 @@ BEGIN
       FROM pg_constraint con
       WHERE con.conrelid = 'challenges'::regclass
         AND con.contype = 'c'
-        AND con.conkey = ARRAY[status_attnum]
+        AND (status_attnum = ANY(con.conkey) OR con.conkey = ARRAY[status_attnum])
     ) LOOP
       EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
     END LOOP;
@@ -85,6 +85,8 @@ $EVOLVE_ID$;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS id TEXT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS resource TEXT DEFAULT 'mcp://tools/unknown';
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS amount_stroops NUMERIC(40, 0);
+-- Drop legacy NOT NULL on amount_stroops so quarantined rows can hold NULL
+ALTER TABLE IF EXISTS challenges ALTER COLUMN amount_stroops DROP NOT NULL;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS contract_id TEXT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS token_address TEXT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS beneficiary TEXT;
@@ -121,9 +123,10 @@ BEGIN
 
     -- Unmetered, negative, or invalid amounts: do NOT fabricate currency!
     -- Safely isolate into INCONCLUSIVE_MANUAL_REVIEW while preserving amount_stroops as NULL
+    -- Preserve rows that already have status = 'PERMANENT_QUARANTINE' or 'INCONCLUSIVE_MANUAL_REVIEW'
     UPDATE challenges 
     SET status = 'INCONCLUSIVE_MANUAL_REVIEW'
-    WHERE amount_stroops IS NULL;
+    WHERE amount_stroops IS NULL AND (status IS NULL OR status NOT IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'));
   END IF;
 
   -- Sync legacy is_redeemed boolean/int to status:
@@ -196,7 +199,8 @@ $EVOLVE_TIMESTAMPS$;
 -- 5. Set defaults and nullability on canonical columns
 UPDATE challenges SET resource = 'mcp://tools/default' WHERE resource IS NULL;
 -- Reconcile or quarantine unmetered rows without fabricating currency
-UPDATE challenges SET status = 'INCONCLUSIVE_MANUAL_REVIEW' WHERE amount_stroops IS NULL;
+UPDATE challenges SET status = 'INCONCLUSIVE_MANUAL_REVIEW' 
+WHERE amount_stroops IS NULL AND (status IS NULL OR status NOT IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'));
 UPDATE challenges SET status = 'PENDING' WHERE status IS NULL;
 UPDATE challenges SET lease_generation = 0 WHERE lease_generation IS NULL;
 UPDATE challenges SET version = 1 WHERE version IS NULL;
@@ -238,7 +242,7 @@ BEGIN
     FROM pg_constraint con
     WHERE con.conrelid = 'challenges'::regclass
       AND con.contype = 'c'
-      AND con.conkey = ARRAY[status_attnum]
+      AND (status_attnum = ANY(con.conkey) OR con.conkey = ARRAY[status_attnum])
   ) LOOP
     EXECUTE format('ALTER TABLE challenges DROP CONSTRAINT IF EXISTS %I', r.conname);
   END LOOP;
