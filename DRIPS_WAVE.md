@@ -118,7 +118,7 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 - **Tier:** Medium (150 pts)
 - **Target Files:** `packages/gateway/migrations/001_initial.sql`, `packages/gateway/src/scripts/migrate.ts`
 - **Prerequisites:** None
-- **Scope:** Provide SQL schema preserving 100% of fields from `ChallengeStore` (26 columns including `envelope_xdr TEXT`): `id TEXT PRIMARY KEY`, `destination TEXT NOT NULL`, `amount_stroops NUMERIC(38, 0) NOT NULL`, `asset TEXT NOT NULL`, `resource TEXT NOT NULL`, `memo TEXT`, `network TEXT NOT NULL`, `contract_id TEXT`, `token_address TEXT`, `beneficiary TEXT`, `status TEXT NOT NULL DEFAULT 'PENDING'`, `created_at TIMESTAMPTZ NOT NULL`, `created_ledger BIGINT`, `expires_at TIMESTAMPTZ NOT NULL`, `bound_tx_hash TEXT UNIQUE`, `redeemed_at TIMESTAMPTZ`, `payer TEXT`, `paid_amount_stroops NUMERIC(38, 0)`, `redeemed_ledger BIGINT`, `min_valid_ledger BIGINT`, `max_valid_ledger BIGINT`, `lease_owner TEXT`, `lease_expires_at TIMESTAMPTZ`, `lease_generation BIGINT DEFAULT 0`, `version BIGINT DEFAULT 1`. Includes `redeemed_transactions` table with foreign key. Migration script must run idempotently (`IF NOT EXISTS`).
+- **Scope:** Provide SQL schema preserving 100% of fields from `ChallengeStore` (26 columns including `envelope_xdr TEXT`): `id TEXT PRIMARY KEY`, `destination TEXT NOT NULL`, `amount_stroops NUMERIC(40, 0) NOT NULL`, `asset TEXT NOT NULL`, `resource TEXT NOT NULL`, `memo TEXT`, `network TEXT NOT NULL`, `contract_id TEXT`, `token_address TEXT`, `beneficiary TEXT`, `status TEXT NOT NULL DEFAULT 'PENDING'`, `created_at TIMESTAMPTZ NOT NULL`, `created_ledger BIGINT`, `expires_at TIMESTAMPTZ NOT NULL`, `bound_tx_hash TEXT UNIQUE`, `redeemed_at TIMESTAMPTZ`, `payer TEXT`, `paid_amount_stroops NUMERIC(40, 0)`, `redeemed_ledger BIGINT`, `min_valid_ledger BIGINT`, `max_valid_ledger BIGINT`, `lease_owner TEXT`, `lease_expires_at TIMESTAMPTZ`, `lease_generation BIGINT DEFAULT 0`, `version BIGINT DEFAULT 1`. Includes `redeemed_transactions` table with foreign key. Migration script must run idempotently (`IF NOT EXISTS`).
 - **Verification Command:** `pnpm --filter @stellar-x402/gateway test`
 
 #### Issue 5: Contract Settlement Semantic Assertions & Event Parsing
@@ -153,7 +153,7 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 - **Tier:** Medium (150 pts)
 - **Target File:** `.github/actions/stellar-standalone/action.yml`
 - **Prerequisites:** None
-- **Scope:** Composite action that launches pinned `stellar/quickstart:soroban-dev` (Protocol 22/23 compatible), waits for initial ledger close, and executes an end-to-end payment test against container RPC.
+- **Scope:** Composite action that launches pinned `stellar/quickstart:soroban-dev@sha256:pinned` (Protocol 22/23 compatible), waits for initial ledger close, and executes an end-to-end payment test against container RPC.
 - **Verification Command:** GitHub Actions CI execution
 
 ---

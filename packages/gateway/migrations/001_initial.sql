@@ -4,7 +4,7 @@
 CREATE TABLE IF NOT EXISTS challenges (
   id TEXT PRIMARY KEY,
   destination TEXT NOT NULL,
-  amount_stroops NUMERIC(38, 0) NOT NULL CHECK (amount_stroops > 0),
+  amount_stroops NUMERIC(40, 0) NOT NULL CHECK (amount_stroops > 0),
   asset TEXT NOT NULL,
   resource TEXT NOT NULL,
   memo TEXT,
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS challenges (
   bound_tx_hash TEXT UNIQUE,
   redeemed_at TIMESTAMPTZ,
   payer TEXT,
-  paid_amount_stroops NUMERIC(38, 0) CHECK (paid_amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops),
+  paid_amount_stroops NUMERIC(40, 0) CHECK (paid_amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops),
   redeemed_ledger BIGINT CHECK (redeemed_ledger IS NULL OR redeemed_ledger >= 0),
   min_valid_ledger BIGINT CHECK (min_valid_ledger IS NULL OR min_valid_ledger >= 0),
   max_valid_ledger BIGINT CHECK (max_valid_ledger IS NULL OR (max_valid_ledger >= 0 AND (min_valid_ledger IS NULL OR max_valid_ledger >= min_valid_ledger))),
@@ -43,3 +43,12 @@ CREATE TABLE IF NOT EXISTS redeemed_transactions (
   challenge_id TEXT NOT NULL REFERENCES challenges(id),
   redeemed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
+-- Evolutionary schema migration support for existing deployments
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS created_ledger BIGINT;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS min_valid_ledger BIGINT;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS max_valid_ledger BIGINT;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS envelope_xdr TEXT;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_owner TEXT;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_generation BIGINT DEFAULT 0;
+ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS version BIGINT DEFAULT 1;
