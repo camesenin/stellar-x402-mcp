@@ -9,35 +9,36 @@
 
 ## 1. Program Structure & Budget Caps (Exact Arithmetic Match)
 
-Drips allocates point budgets per repository and per organization per Wave. To prevent quota exhaustion or contributor starvation, this backlog is organized into two disciplined tranches of exactly **1,200 points each**:
+To accommodate evaluator readiness criteria (curated backlog of 15–20 tasks) while strictly adhering to Drips Network budget caps per repository/organization:
 
 - **Tranche 1 (Committed Wave 11 Allocation — Exactly 1,200 Points, 8 Issues):** Primary wave allocation fitting standard single-repository budget limits.
-- **Tranche 2 (Expansion / Wave 12 Pipeline — Exactly 1,200 Points, 8 Issues):** Unlocked strictly upon Wave Hub budget expansion or carried over to Wave 12.
+- **Tranche 2 (Expansion / Wave 12 Pipeline — Exactly 1,200 Points, 8 Issues):** Secondary queue unlocked strictly upon Wave Hub budget expansion or carried over to Wave 12.
 
 ### Reconciled Complexity Tier Breakdown
-| Tier | Points | Count (Tranche 1) | Count (Tranche 2) | Total Issues | Total Points |
+| Tier | Points | Tranche 1 (Committed) | Tranche 2 (Pipeline) | Total Issues | Total Points |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Trivial** | 100 | 2 (Issues 1, 2) | 3 (Issues 3, 7, 16) | 5 | 500 pts |
 | **Medium** | 150 | 4 (Issues 4, 5, 9, 10) | 2 (Issues 11, 15) | 6 | 900 pts |
 | **High** | 200 | 2 (Issues 6, 8) | 3 (Issues 12, 13, 14) | 5 | 1,000 pts |
 | **Total** | — | **8 issues (1,200 pts)** | **8 issues (1,200 pts)** | **16 issues** | **2,400 pts** |
 
-*Verification:*  
-- Tranche 1: `2 × 100 (200) + 4 × 150 (600) + 2 × 200 (400) = 1,200 pts`  
-- Tranche 2: `3 × 100 (300) + 2 × 150 (300) + 3 × 200 (600) = 1,200 pts`  
-- Grand Total: `5 × 100 (500) + 6 × 150 (900) + 5 × 200 (1,000) = 2,400 pts` across 16 issues.
+*Arithmetical Verification:*  
+- Tranche 1: `2 × 100 (200) + 4 × 150 (600) + 2 × 200 (400) = 1,200 pts` across 8 issues.  
+- Tranche 2: `3 × 100 (300) + 2 × 150 (300) + 3 × 200 (600) = 1,200 pts` across 8 issues.  
+- Grand Total: `5 × 100 (500) + 6 × 150 (900) + 5 × 200 (1,000) = 2,400 pts` across exactly 16 issues.
 
 ---
 
 ## 2. Contributor Onboarding, Capacity & Operational SLA
 
 ### Maintainer Roles & SLA
-- **Primary Maintainer:** Lead Architect (`@camesenin`)
-- **Secondary Maintainer:** Protocol Reviewer (`@co-maintainer`)
+- **Primary Maintainer:** Camilo Mesen (`@camesenin`, Lead Architect)
+- **Secondary Maintainer:** Stellar Technical Reviewer (`@camesenin-review`, Protocol QA)
 - **Triage & Assignment:** Issues assigned to contributors within **< 24 hours** of application.
 - **Code Review:** PRs reviewed and commented within **< 48 hours**.
 - **Max Work-in-Progress (WIP):** Maximum 2 active issues per contributor to prevent hoarding.
-- **Stale Assignment Timeout:** If a contributor shows no activity (no draft PR or commit) within **48 hours**, the assignment is revoked and re-opened to community developers.
+- **Fair Inactivity Timeout:** If an assigned contributor produces zero commits, zero draft PRs, and no communication for **48 hours**, the assignment is revoked. Contributor wait time due to maintainer review or CI infrastructure is explicitly excluded from this timeout.
+- **Resolution of Inconclusive Challenges:** If a reconciliation worker flags `INCONCLUSIVE_MANUAL_REVIEW`, maintainers investigate within 24h using Horizon transaction archive and resolve the challenge state without allowing duplicate settlements.
 
 ### Local Development Environment
 ```bash
@@ -59,24 +60,33 @@ cargo test --package receipt-vault
 
 ## 3. Directed Acyclic Graph (DAG) of Dependencies
 
-The backlog features **12 standalone tasks** with zero blockers, and **4 dependent tasks** with direct technical prerequisites:
+The backlog features **11 standalone tasks** with zero prerequisites, and **5 dependent tasks** with direct technical requirements:
 
 ```
 [Issue 1: CLI Format (100)] -------- (Standalone, 0 deps)
 [Issue 2: StrKey Val (100)] -------- (Standalone, 0 deps) --------> [Issue 8: SEP-41 SAC (200)]
 [Issue 3: Doctor CLI (100)] -------- (Standalone, 0 deps)
-[Issue 4: DB Schema (150)] --------- (Standalone, 0 deps) --------> [Issue 6: PG Store (200)] --------> [Issue 13: Reconciler (200)]
+[Issue 4: DB Schema (150)] --------- (Standalone, 0 deps) --------> [Issue 6: PG Store (200)] --------+---> [Issue 13: Reconciler (200)]
+                                                                                                        +---> [Issue 14: MCP Stream (200)]
 [Issue 5: Settle Tests (150)] ------ (Standalone, 0 deps) --------> [Issue 12: Beneficiary C.. (200)]
 [Issue 7: Nanoid/CorrId (100)] ----- (Standalone, 0 deps)
 [Issue 9: LangGraph Ex (150)] ------ (Standalone, 0 deps)
 [Issue 10: Standalone CI (150)] ---- (Standalone, 0 deps)
 [Issue 11: Rate Limiter (150)] ----- (Standalone, 0 deps)
-[Issue 14: MCP Stream (200)] ------- (Standalone, 0 deps)
 [Issue 15: Prometheus (150)] ------- (Standalone, 0 deps)
 [Issue 16: Fast-Check Fuzz (100)] -- (Standalone, 0 deps)
 ```
-- Standalone issues (12 tasks): 1, 2, 3, 4, 5, 7, 9, 10, 11, 14, 15, 16.
-- Dependent issues (4 tasks): 6 (requires 4), 8 (requires 2), 12 (requires 5), 13 (requires 6).
+
+### Breakdown of Independence & Parallelization:
+- **Standalone Tasks (11 issues):** Issues 1, 2, 3, 4, 5, 7, 9, 10, 11, 15, 16.
+  * In Tranche 1, **6 tasks (800 pts)** are standalone and immediately executable upon Wave opening.
+  * In Tranche 2, **5 tasks (600 pts)** are standalone.
+- **Dependent Tasks (5 issues):**
+  * Issue 6 (`PostgresStore`) requires Issue 4 (DB Schema).
+  * Issue 8 (`SEP-41 SAC`) requires Issue 2 (StrKey Validator).
+  * Issue 12 (`Beneficiary C...`) requires Issue 5 (Settlement Semantic Tests).
+  * Issue 13 (`Reconciler Worker`) requires Issue 6 (`PostgresStore`).
+  * Issue 14 (`MCP Streamable HTTP`) requires Issue 6 (`PostgresStore` for persistent session state).
 
 ---
 
@@ -123,7 +133,7 @@ The backlog features **12 standalone tasks** with zero blockers, and **4 depende
 - **Tier:** High (200 pts)
 - **Target File:** `packages/client/src/tokens/sac.ts`
 - **Prerequisites:** Issue 2
-- **Scope:** Resolve Stellar Asset Contract (SAC) address deterministically for Classic assets (`AssetCode:IssuerAccount`). Distinguish between native XLM, issued Classic SAC assets (checking trustlines and issuer), and standalone custom Soroban token contracts.
+- **Scope:** Resolve Stellar Asset Contract (SAC) address deterministically for Classic assets (`AssetCode:IssuerAccount`). Distinguish between native XLM (no trustline needed), issued Classic SAC assets (checking trustlines and issuer), and standalone custom Soroban token contracts (admitted via whitelist).
 - **Verification Command:** `pnpm --filter @stellar-x402/client test`
 
 #### Issue 9: LangGraph / LangChain Agent Integration Example
@@ -182,8 +192,8 @@ The backlog features **12 standalone tasks** with zero blockers, and **4 depende
 #### Issue 14: MCP Streamable HTTP Transport (Spec 2025-11-25)
 - **Tier:** High (200 pts)
 - **Target File:** `packages/gateway/src/transports/streamable-http.ts`
-- **Prerequisites:** None
-- **Scope:** Support Streamable HTTP transport conforming to MCP 2025-11-25. Validates `Origin` header (HTTP 403 on invalid origin if present) to protect against DNS rebinding. HTTP 405 on GET if stream is not offered. Enforces durable challenge idempotency across reconnections.
+- **Prerequisites:** Issue 6 (`PostgresStore` for persistent challenge state across reconnections)
+- **Scope:** Support Streamable HTTP transport conforming to MCP 2025-11-25. Validates `Origin` header (HTTP 403 on invalid origin if present) to protect against DNS rebinding. HTTP 405 on GET if stream is not offered. Enforces durable challenge idempotency across reconnections backed by Postgres store.
 - **Verification Command:** `pnpm --filter @stellar-x402/gateway test`
 
 #### Issue 15: Prometheus Operational Metrics Exporter (`/metrics`)
