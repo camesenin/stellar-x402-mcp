@@ -4,7 +4,7 @@
 CREATE TABLE IF NOT EXISTS challenges (
   id TEXT PRIMARY KEY,
   destination TEXT NOT NULL,
-  amount_stroops NUMERIC(38, 0) NOT NULL,
+  amount_stroops NUMERIC(38, 0) NOT NULL CHECK (amount_stroops > 0),
   asset TEXT NOT NULL,
   resource TEXT NOT NULL,
   memo TEXT,
@@ -12,21 +12,22 @@ CREATE TABLE IF NOT EXISTS challenges (
   contract_id TEXT,
   token_address TEXT,
   beneficiary TEXT,
-  status TEXT NOT NULL DEFAULT 'PENDING',
+  status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'RECONCILIATION_REQUIRED', 'INCONCLUSIVE_MANUAL_REVIEW', 'CONFIRMED', 'REDEEMED', 'CANCELLED', 'PERMANENT_QUARANTINE')),
   created_at TIMESTAMPTZ NOT NULL,
-  created_ledger BIGINT,
+  created_ledger BIGINT CHECK (created_ledger IS NULL OR created_ledger >= 0),
   expires_at TIMESTAMPTZ NOT NULL,
   bound_tx_hash TEXT UNIQUE,
   redeemed_at TIMESTAMPTZ,
   payer TEXT,
-  paid_amount_stroops NUMERIC(38, 0),
-  redeemed_ledger BIGINT,
-  min_valid_ledger BIGINT,
-  max_valid_ledger BIGINT,
+  paid_amount_stroops NUMERIC(38, 0) CHECK (paid_amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops),
+  redeemed_ledger BIGINT CHECK (redeemed_ledger IS NULL OR redeemed_ledger >= 0),
+  min_valid_ledger BIGINT CHECK (min_valid_ledger IS NULL OR min_valid_ledger >= 0),
+  max_valid_ledger BIGINT CHECK (max_valid_ledger IS NULL OR (min_valid_ledger IS NULL OR max_valid_ledger >= min_valid_ledger)),
   lease_owner TEXT,
   lease_expires_at TIMESTAMPTZ,
-  lease_generation BIGINT DEFAULT 0,
-  version BIGINT DEFAULT 1
+  lease_generation BIGINT NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
+  version BIGINT NOT NULL DEFAULT 1 CHECK (version >= 1),
+  CONSTRAINT chk_challenge_expiry CHECK (expires_at >= created_at)
 );
 
 CREATE INDEX IF NOT EXISTS idx_challenges_status ON challenges(status);

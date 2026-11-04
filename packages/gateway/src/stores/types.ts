@@ -12,6 +12,7 @@ export type ChallengeStatus =
 export interface StoredChallengeRecord extends X402Challenge {
   status: ChallengeStatus;
   boundTxHash?: string;
+  createdLedger?: number;
   minValidLedger?: number;
   maxValidLedger?: number;
   leaseOwner?: string;
@@ -37,10 +38,20 @@ export interface IChallengeStore {
       beneficiary?: string;
       memo?: string;
       ttlSeconds?: number;
+      createdLedger?: number;
     }
   ): Promise<X402Challenge>;
 
-  getChallenge(challengeId: string): Promise<X402Challenge | null>;
+  getChallenge(challengeId: string): Promise<StoredChallengeRecord | null>;
+
+  bindSubmissionTx(
+    challengeId: string,
+    txHash: string,
+    bounds: {
+      minValidLedger?: number;
+      maxValidLedger?: number;
+    }
+  ): Promise<boolean>;
 
   markRedeemed(
     challengeId: string,

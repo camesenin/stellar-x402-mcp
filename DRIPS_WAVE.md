@@ -2,8 +2,8 @@
 
 **Repository:** `camesenin/stellar-x402-mcp`  
 **Network Program:** Drips Stellar Wave / Stellar Community Fund  
-**Audit Baseline Commit:** `caf9fdf` (v0.2.4-rc1)  
-**CI Status:** 100% Green (56 Vitest TS tests + 8 Soroban Rust tests)  
+**Audit Baseline Commit:** ddde94e (aligned on main, tracking all schema constraints and store contracts)  
+**QA Test Status:** 100% Green (55 Vitest automated test cases across packages + 8 Soroban Rust tests + simulated end-to-end agent MCP micropayment demo)  
 
 ---
 
@@ -40,13 +40,11 @@ The repository provides a complete curated catalog of **16 issues totaling 2,400
 - **Code Review:** PRs reviewed and commented within **< 48 hours**.
 - **Max Work-in-Progress (WIP):** Maximum 2 active issues per contributor to prevent hoarding.
 - **Fair Inactivity Timeout:** If an assigned contributor produces zero commits, zero draft PRs, and no communication for **48 hours**, the assignment is revoked. Contributor wait time due to maintainer review or CI infrastructure is explicitly excluded from this timeout.
-- **Resolution of Inconclusive Challenges (Dual-Proof Invariant against Double Charge):** If a reconciliation worker flags `INCONCLUSIVE_MANUAL_REVIEW`, a second charge or retry is strictly forbidden until the prior execution history is definitively proven. The maintainer or reconciler must execute the following deterministic protocol:
-  1. **Historical Ledger Lookup:** Query `bound_tx_hash` against Soroban RPC `getTransaction` and Horizon `/transactions/{hash}` across the entire ledger range spanning `[created_ledger, max_valid_ledger]`.
-  2. **Case A (Prior Execution Detected):** If the transaction was successfully mined, the challenge is immediately promoted to `CONFIRMED` and the protected resource/token is released. No second payment is ever requested.
-  3. **Case B (Proof of Non-Execution + Future Impossibility):** A challenge may ONLY be marked `CANCELLED` or released for a client retry if BOTH conditions are met:
-     - *Past Non-Execution:* The transaction is proven to have never executed or failed irrevocably on-chain (`tx_failed`, `tx_bad_auth`).
-     - *Future Cryptographic Impossibility:* The envelope's `timeBounds.maxTime` (or `ledgerBounds.maxLedger`) has definitively elapsed past the latest closed ledger timestamp, ensuring it can never be mined subsequently.
-  4. **Case C (Ambiguous Ledger History / Pruned RPC):** If ledger history within the validity window cannot be verified with 100% certainty, the challenge transitions to `PERMANENT_QUARANTINE`. Retries and refunds are locked until manual node ledger inspection, guaranteeing zero double-spend or double-fulfillment.
+- **Resolution of Inconclusive Challenges (Dual-Proof Invariant against Double Charge):** If a reconciliation worker flags INCONCLUSIVE_MANUAL_REVIEW, a second charge or retry is strictly forbidden until the prior execution history is definitively proven. The maintainer or reconciler must execute the following deterministic protocol:
+  1. **Historical Ledger Lookup:** Query ound_tx_hash against Soroban RPC getTransaction and Horizon /transactions/{hash} across the entire ledger range spanning [created_ledger, max_valid_ledger]. Reconciler must verify that the RPC/Horizon node retention window fully covers created_ledger; if the node retention has pruned that ledger range (NOT_FOUND due to retention horizon), the transaction cannot be assumed non-executed and must proceed directly to Case C.
+  2. **Case A (Prior Execution Detected & Semantically Validated):** If the transaction is discovered mined, it is NOT sufficient to check successful: true. The reconciler strictly parses operation payloads / contract events to verify: target contract/destination matches challenge contractId or destination, function name is settle and recipient matches destination, asset/token matches challenge token address, paid stroops is >= amount_stroops, and challenge ID/memo matches exactly. Once all semantic assertions pass, the challenge is promoted to CONFIRMED and the protected resource/token is released.
+  3. **Case B (Proof of Non-Execution + Future Impossibility):** A challenge may ONLY be marked CANCELLED or released for a client retry if BOTH conditions are met: (a) *Past Non-Execution:* The transaction is proven to have never executed or failed irrevocably on-chain (	x_failed, 	x_bad_auth) within a verified non-pruned ledger range, and (b) *Future Cryptographic Impossibility:* The envelope's 	imeBounds.maxTime (or ledgerBounds.maxLedger) has definitively elapsed past the latest closed ledger timestamp/sequence, guaranteeing it can never be mined subsequently.
+  4. **Case C (Ambiguous Ledger History / Pruned RPC):** If ledger history within the validity window cannot be verified with 100% certainty, the challenge transitions to PERMANENT_QUARANTINE. Retries and refunds are locked until manual node ledger inspection, guaranteeing zero double-spend or double-fulfillment.
 
 ### Local Development Environment
 ```bash
