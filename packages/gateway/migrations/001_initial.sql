@@ -219,6 +219,19 @@ ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_expires_at TIMES
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_generation BIGINT DEFAULT 0;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS version BIGINT DEFAULT 1;
 
+-- Evidence preservation audit table (created early to capture all pre-sanitization values)
+CREATE TABLE IF NOT EXISTS migration_audit_log (
+  id BIGSERIAL PRIMARY KEY,
+  challenge_id TEXT NOT NULL,
+  migration_step TEXT NOT NULL,
+  pre_status TEXT,
+  pre_amount_stroops NUMERIC(40, 0),
+  pre_paid_amount_stroops NUMERIC(40, 0),
+  sanitization_reason TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX IF NOT EXISTS idx_migration_audit_challenge ON migration_audit_log(challenge_id);
+
 -- 3. Populate amount_stroops and reconcile legacy statuses
 DO $EVOLVE_DATA$
 BEGIN
@@ -248,25 +261,68 @@ BEGIN
       );
   END IF;
 
-  -- B. Sanitize paid_amount_stroops across all rows:
-  -- If paid_amount_stroops is NaN, non-positive, or corrupt, normalize it to NULL.
+  -- B. Evidence Preservation & Sanitization of paid_amount_stroops across all rows:
+  -- If paid_amount_stroops is NaN, non-positive, or corrupt, record evidence and normalize to NULL.
+  -- STRICT INVARIANT: Status is NEVER changed here, preserving PERMANENT_QUARANTINE and INCONCLUSIVE_MANUAL_REVIEW!
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, sanitization_reason)
+  SELECT COALESCE(id, challenge_id), 'SANITIZE_PAID_AMOUNT', status, amount_stroops, paid_amount_stroops, 'INVALID_NON_POSITIVE_OR_NAN_PAID_AMOUNT'
+  FROM challenges
+  WHERE paid_amount_stroops IS NOT NULL AND (paid_amount_stroops = 'NaN'::numeric OR paid_amount_stroops <= 0)
+    AND NOT EXISTS (
+      SELECT 1 FROM migration_audit_log mal 
+      WHERE mal.challenge_id = COALESCE(challenges.id, challenges.challenge_id) AND mal.migration_step = 'SANITIZE_PAID_AMOUNT'
+    );
+
   UPDATE challenges
   SET paid_amount_stroops = NULL
   WHERE paid_amount_stroops IS NOT NULL 
     AND (paid_amount_stroops = 'NaN'::numeric OR paid_amount_stroops <= 0);
 
   -- C. Handle legacy amounts exceeding i128::MAX (170141183460469231731687303715884105727):
-  -- 1. If paid_amount_stroops > i128::MAX, normalize to NULL and transition to RECONCILIATION_REQUIRED
+  -- 1. If paid_amount_stroops > i128::MAX:
+  -- Record evidence. Normalize paid_amount_stroops to NULL.
+  -- STRICT INVARIANT: If status IN ('PERMANENT_QUARANTINE', 'INCONCLUSIVE_MANUAL_REVIEW'), PRESERVE status!
+  -- Only operational rows transition to RECONCILIATION_REQUIRED.
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, sanitization_reason)
+  SELECT COALESCE(id, challenge_id), 'OVERFLOW_PAID_AMOUNT_I128', status, amount_stroops, paid_amount_stroops, 'PAID_AMOUNT_EXCEEDS_I128_MAX'
+  FROM challenges
+  WHERE paid_amount_stroops IS NOT NULL AND paid_amount_stroops != 'NaN'::numeric AND paid_amount_stroops > 170141183460469231731687303715884105727
+    AND NOT EXISTS (
+      SELECT 1 FROM migration_audit_log mal 
+      WHERE mal.challenge_id = COALESCE(challenges.id, challenges.challenge_id) AND mal.migration_step = 'OVERFLOW_PAID_AMOUNT_I128'
+    );
+
   UPDATE challenges
-  SET paid_amount_stroops = NULL, status = 'RECONCILIATION_REQUIRED'
+  SET paid_amount_stroops = NULL,
+      status = CASE 
+        WHEN status IN ('PERMANENT_QUARANTINE', 'INCONCLUSIVE_MANUAL_REVIEW') THEN status 
+        ELSE 'RECONCILIATION_REQUIRED' 
+      END
   WHERE paid_amount_stroops IS NOT NULL 
+    AND paid_amount_stroops != 'NaN'::numeric 
     AND paid_amount_stroops > 170141183460469231731687303715884105727;
 
-  -- 2. If amount_stroops > i128::MAX, safely isolate into INCONCLUSIVE_MANUAL_REVIEW with amount_stroops = NULL
-  -- preserving evidence without aborting migration or violating chk_challenge_z_i128_max!
+  -- 2. If amount_stroops > i128::MAX:
+  -- Record evidence. Normalize amount_stroops to NULL.
+  -- STRICT INVARIANT: If status = 'PERMANENT_QUARANTINE', status is PRESERVED!
+  -- Operational rows transition to INCONCLUSIVE_MANUAL_REVIEW.
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, sanitization_reason)
+  SELECT COALESCE(id, challenge_id), 'OVERFLOW_AMOUNT_I128', status, amount_stroops, paid_amount_stroops, 'REQUESTED_AMOUNT_EXCEEDS_I128_MAX'
+  FROM challenges
+  WHERE amount_stroops IS NOT NULL AND amount_stroops != 'NaN'::numeric AND amount_stroops > 170141183460469231731687303715884105727
+    AND NOT EXISTS (
+      SELECT 1 FROM migration_audit_log mal 
+      WHERE mal.challenge_id = COALESCE(challenges.id, challenges.challenge_id) AND mal.migration_step = 'OVERFLOW_AMOUNT_I128'
+    );
+
   UPDATE challenges
-  SET status = 'INCONCLUSIVE_MANUAL_REVIEW', amount_stroops = NULL
+  SET amount_stroops = NULL,
+      status = CASE 
+        WHEN status = 'PERMANENT_QUARANTINE' THEN 'PERMANENT_QUARANTINE'
+        ELSE 'INCONCLUSIVE_MANUAL_REVIEW'
+      END
   WHERE amount_stroops IS NOT NULL 
+    AND amount_stroops != 'NaN'::numeric 
     AND amount_stroops > 170141183460469231731687303715884105727;
 
   -- D. Normalize unmetered, non-positive, or NaN legacy amounts:
@@ -293,11 +349,24 @@ BEGIN
 
   -- E. Handle legacy underpaid rows (paid_amount_stroops < amount_stroops):
   -- In canonical schema, chk_challenge_paid_amount requires paid_amount_stroops >= amount_stroops.
-  -- If a legacy row has a positive payment that is less than requested amount:
-  -- Transition row to 'RECONCILIATION_REQUIRED' and normalize paid_amount_stroops to NULL
-  -- so the underpayment is audited rather than aborting migration!
+  -- Record evidence in migration_audit_log.
+  -- STRICT INVARIANT: If row is in PERMANENT_QUARANTINE or INCONCLUSIVE_MANUAL_REVIEW, PRESERVE its status!
+  -- Only operational rows transition to RECONCILIATION_REQUIRED.
+  INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, sanitization_reason)
+  SELECT COALESCE(id, challenge_id), 'UNDERPAID_CHALLENGE', status, amount_stroops, paid_amount_stroops, 'PAID_AMOUNT_LESS_THAN_REQUESTED_AMOUNT'
+  FROM challenges
+  WHERE amount_stroops IS NOT NULL AND paid_amount_stroops IS NOT NULL AND paid_amount_stroops < amount_stroops
+    AND NOT EXISTS (
+      SELECT 1 FROM migration_audit_log mal 
+      WHERE mal.challenge_id = COALESCE(challenges.id, challenges.challenge_id) AND mal.migration_step = 'UNDERPAID_CHALLENGE'
+    );
+
   UPDATE challenges
-  SET status = 'RECONCILIATION_REQUIRED', paid_amount_stroops = NULL
+  SET paid_amount_stroops = NULL,
+      status = CASE 
+        WHEN status IN ('PERMANENT_QUARANTINE', 'INCONCLUSIVE_MANUAL_REVIEW') THEN status 
+        ELSE 'RECONCILIATION_REQUIRED' 
+      END
   WHERE amount_stroops IS NOT NULL 
     AND paid_amount_stroops IS NOT NULL 
     AND paid_amount_stroops < amount_stroops;
@@ -476,5 +545,18 @@ CREATE TABLE IF NOT EXISTS redeemed_transactions (
   challenge_id TEXT NOT NULL REFERENCES challenges(id),
   redeemed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
+
+-- Migration evidence preservation table: records pre-sanitization values
+CREATE TABLE IF NOT EXISTS migration_audit_log (
+  id BIGSERIAL PRIMARY KEY,
+  challenge_id TEXT NOT NULL,
+  migration_step TEXT NOT NULL,
+  pre_status TEXT,
+  pre_amount_stroops NUMERIC(40, 0),
+  pre_paid_amount_stroops NUMERIC(40, 0),
+  sanitization_reason TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX IF NOT EXISTS idx_migration_audit_challenge ON migration_audit_log(challenge_id);
 
 COMMIT;

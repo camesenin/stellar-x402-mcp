@@ -338,6 +338,67 @@ jobs:
               0
             );
 
+            -- Row 12: QUARANTINE PRESERVATION TEST (UNDERPAID): starts in PERMANENT_QUARANTINE with paid_amount_stroops < amount_stroops
+            -- Status MUST NOT degrade to RECONCILIATION_REQUIRED! Must strictly PRESERVE PERMANENT_QUARANTINE.
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, paid_amount_stroops, redeemed_at, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_12',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              '0.0000100',
+              100,
+              'XLM',
+              'memo_seed_12',
+              'testnet',
+              'PERMANENT_QUARANTINE',
+              1793815821820,
+              1793815521820,
+              'tx_quarantined_hash_12',
+              50,
+              1793815621820,
+              0
+            );
+
+            -- Row 13: QUARANTINE PRESERVATION TEST (I128 OVERFLOW): starts in PERMANENT_QUARANTINE with amount_stroops > i128::MAX
+            -- Status MUST NOT degrade to INCONCLUSIVE_MANUAL_REVIEW! Must strictly PRESERVE PERMANENT_QUARANTINE.
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_13',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              NULL,
+              170141183460469231731687303715884105728,
+              'XLM',
+              'memo_seed_13',
+              'testnet',
+              'PERMANENT_QUARANTINE',
+              1793815821820,
+              1793815521820,
+              'tx_quarantined_hash_13',
+              0
+            );
+
+            -- Row 14: I128 PAID OVERFLOW TEST: operational row with paid_amount_stroops > i128::MAX
+            -- Must transition to RECONCILIATION_REQUIRED with paid_amount normalized to NULL!
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, paid_amount_stroops, redeemed_at, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_14',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              '1.00',
+              10000000,
+              'XLM',
+              'memo_seed_14',
+              'testnet',
+              'REDEEMED',
+              1793815821820,
+              1793815521820,
+              'tx_overflow_paid_hash_14',
+              170141183460469231731687303715884105728,
+              1793815621820,
+              1
+            );
+
             -- 1. Duplicate btree index on bound_tx_hash to be purged
             CREATE INDEX idx_legacy_duplicate_bound ON challenges USING btree (bound_tx_hash);
 
@@ -385,6 +446,10 @@ jobs:
               rec9 RECORD;
               rec10 RECORD;
               rec11 RECORD;
+              rec12 RECORD;
+              rec13 RECORD;
+              rec14 RECORD;
+              v_audit_count BIGINT;
               v_is_nullable TEXT;
               v_indnullsnotdistinct BOOLEAN;
               v_pred TEXT;
@@ -514,6 +579,41 @@ jobs:
               END IF;
               IF rec11.amount_stroops IS NOT NULL THEN
                 RAISE EXCEPTION '[%] Assertion failed: i128 overflow row amount_stroops must be normalized to NULL (got %)', step_name, rec11.amount_stroops;
+              END IF;
+
+              -- H4. Monotonic quarantine test: rec12 started in PERMANENT_QUARANTINE with paid_amount < amount
+              -- Must PRESERVE PERMANENT_QUARANTINE, paid_amount_stroops must be normalized to NULL, amount_stroops = NULL
+              SELECT * INTO rec12 FROM challenges WHERE id = 'ch_legacy_seed_12';
+              IF rec12.status IS DISTINCT FROM 'PERMANENT_QUARANTINE' THEN
+                RAISE EXCEPTION '[%] Assertion failed: PERMANENT_QUARANTINE degraded on underpayment to %', step_name, rec12.status;
+              END IF;
+              IF rec12.paid_amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: rec12 paid_amount_stroops must be NULL (got %)', step_name, rec12.paid_amount_stroops;
+              END IF;
+
+              -- H5. Monotonic quarantine test: rec13 started in PERMANENT_QUARANTINE with amount > i128::MAX
+              -- Must PRESERVE PERMANENT_QUARANTINE, amount_stroops must be normalized to NULL
+              SELECT * INTO rec13 FROM challenges WHERE id = 'ch_legacy_seed_13';
+              IF rec13.status IS DISTINCT FROM 'PERMANENT_QUARANTINE' THEN
+                RAISE EXCEPTION '[%] Assertion failed: PERMANENT_QUARANTINE degraded on i128 overflow to %', step_name, rec13.status;
+              END IF;
+              IF rec13.amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: rec13 amount_stroops must be NULL (got %)', step_name, rec13.amount_stroops;
+              END IF;
+
+              -- H6. Paid amount overflow test: rec14 had paid_amount > i128::MAX
+              SELECT * INTO rec14 FROM challenges WHERE id = 'ch_legacy_seed_14';
+              IF rec14.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
+                RAISE EXCEPTION '[%] Assertion failed: paid overflow row rec14 not isolated to RECONCILIATION_REQUIRED (got %)', step_name, rec14.status;
+              END IF;
+              IF rec14.paid_amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: rec14 paid_amount_stroops must be NULL (got %)', step_name, rec14.paid_amount_stroops;
+              END IF;
+
+              -- H7. Audit log verification: assert migration_audit_log captured evidence for sanitized rows
+              SELECT count(*) INTO v_audit_count FROM migration_audit_log WHERE challenge_id IN ('ch_legacy_seed_10', 'ch_legacy_seed_11', 'ch_legacy_seed_12', 'ch_legacy_seed_13', 'ch_legacy_seed_14');
+              IF v_audit_count < 5 THEN
+                RAISE EXCEPTION '[%] Assertion failed: migration_audit_log missing evidence records (expected at least 5, got %)', step_name, v_audit_count;
               END IF;
 
               -- I. Purge & Structural Preservation Assertions
@@ -758,6 +858,49 @@ jobs:
                 GET STACKED DIAGNOSTICS v_diag_constraint = CONSTRAINT_NAME;
                 IF v_diag_constraint IS DISTINCT FROM 'chk_challenge_paid_amount' THEN
                   RAISE EXCEPTION '[%] Assertion failed: check violation triggered by % instead of chk_challenge_paid_amount', step_name, v_diag_constraint;
+                END IF;
+              END;
+
+              -- O. Acceptance of exact i128::MAX boundary: 170141183460469231731687303715884105727
+              INSERT INTO challenges (
+                id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash, paid_amount_stroops
+              ) VALUES (
+                'ch_op_i128_max_' || step_name,
+                'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+                170141183460469231731687303715884105727,
+                'XLM',
+                'mcp://tools/test',
+                'memo_max',
+                'testnet',
+                'PENDING',
+                clock_timestamp(),
+                clock_timestamp() + interval '5 minutes',
+                NULL,
+                170141183460469231731687303715884105727
+              );
+
+              -- P. Strict Rejection of i128::MAX + 1: 170141183460469231731687303715884105728
+              BEGIN
+                INSERT INTO challenges (
+                  id, destination, amount_stroops, asset, resource, memo, network, status, created_at, expires_at, bound_tx_hash
+                ) VALUES (
+                  'ch_op_i128_overflow_' || step_name,
+                  'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+                  170141183460469231731687303715884105728,
+                  'XLM',
+                  'mcp://tools/test',
+                  'memo_overflow',
+                  'testnet',
+                  'PENDING',
+                  clock_timestamp(),
+                  clock_timestamp() + interval '5 minutes',
+                  NULL
+                );
+                RAISE EXCEPTION '[%] Assertion failed: i128::MAX + 1 was not rejected', step_name;
+              EXCEPTION WHEN check_violation THEN
+                GET STACKED DIAGNOSTICS v_diag_constraint = CONSTRAINT_NAME;
+                IF v_diag_constraint IS DISTINCT FROM 'chk_challenge_z_i128_max' THEN
+                  RAISE EXCEPTION '[%] Assertion failed: check violation triggered by % instead of chk_challenge_z_i128_max', step_name, v_diag_constraint;
                 END IF;
               END;
             END;
