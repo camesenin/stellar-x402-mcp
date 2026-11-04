@@ -316,41 +316,8 @@ export class BudgetManager {
     // SEC-06 Guard: reject premature unquarantine of in-flight transaction
     if (status !== 'SUCCESS' && res.releaseAt && now < res.releaseAt) {
       throw new Error(
-        `Cannot release quarantined reservation '${reservationId}' before in-flight timeout boundary has elapsed (releaseAt: ${res.releaseAt}, current: ${now})`
+        'Cannot release quarantined reservation before in-flight timeout boundary has elapsed'
       );
-    }
-
-    // Soroban RPC Retention Window Guard for NOT_FOUND:
-    if (status === 'NOT_FOUND' && res.releaseAt) {
-      const maxTimeSec = res.maxTimeSec ?? Math.floor((res.releaseAt - 15_000) / 1000);
-      const broadcastSec = res.broadcastAtSec ?? (maxTimeSec - 60);
-
-      // Definite proof via On-Chain Receipt absence after maxTime:
-      // If contract receipt was queried and does NOT exist, and current ledger time > maxTime,
-      // the payment is definitively unexecuted regardless of RPC transaction history pruning!
-      if (onChainReceiptExists === false) {
-        // Fail-closed: Must strictly prove latestLedgerCloseTime > maxTimeSec. If latestLedgerCloseTime is undefined, maintain quarantine!
-        if (latestLedgerCloseTime === undefined || latestLedgerCloseTime <= maxTimeSec) {
-          return; // Network has not verified ledger advancement past maxTime; maintain quarantine
-        }
-        // Receipt absent and ledger passed maxTime -> definitively never landed, safe to free!
-      } else {
-        // Receipt was not directly checked; rely on RPC transaction retention window.
-        // FAIL-CLOSED: If either retention boundary is missing, do NOT free!
-        if (latestLedgerCloseTime === undefined || oldestLedgerCloseTime === undefined) {
-          return; // Maintain quarantine fail-closed
-        }
-
-        // 1) Network must have advanced beyond transaction maxTime
-        if (latestLedgerCloseTime <= maxTimeSec) {
-          return; // Still pending: tx could be mined before maxTime
-        }
-
-        // 2) RPC retention window must cover the moment of broadcast
-        if (oldestLedgerCloseTime > broadcastSec) {
-          return; // Transaction fell outside RPC retention window; maintain quarantine to avoid leak
-        }
-      }
     }
 
     if (status === 'SUCCESS') {
@@ -365,15 +332,39 @@ export class BudgetManager {
           txHash: res.txHash,
         });
       }
+      this.reservations.delete(reservationId);
+      return;
     }
 
+    // For non-success outcomes (NOT_FOUND, FAILED): enforce fail-closed cryptographic proof
+    if (res.txHash) {
+      if (latestLedgerCloseTime === undefined || isNaN(latestLedgerCloseTime)) {
+        return; // Ambiguous ledger time: maintain quarantine
+      }
+
+      const maxTimeSec = res.maxTimeSec ?? (res.releaseAt ? Math.floor((res.releaseAt - 15_000) / 1000) : undefined);
+      if (maxTimeSec === undefined || isNaN(maxTimeSec)) {
+        return; // Missing cryptographic bound: maintain quarantine
+      }
+
+      if (latestLedgerCloseTime <= maxTimeSec) {
+        return; // Transaction could still land before maxTime: maintain quarantine
+      }
+
+      if (onChainReceiptExists === false) {
+        // Receipt definitively absent past expiration bound
+      } else {
+        const broadcastSec = res.broadcastAtSec ?? (maxTimeSec - 60);
+        if (oldestLedgerCloseTime === undefined || isNaN(oldestLedgerCloseTime) || oldestLedgerCloseTime > broadcastSec) {
+          return; // RPC retention window pruned or missing: maintain quarantine
+        }
+      }
+    }
+
+    // Definitively proven unexecuted and impossible to land
     this.reservations.delete(reservationId);
   }
 
-  /**
-   * Active pool reconciler: queries an asynchronous transaction status checker for all
-   * quarantined in-flight reservations and resolves them to prevent memory/budget leaks.
-   */
   public async reconcileQuarantinedPool(
     statusChecker: StatusCheckerFn
   ): Promise<{ resolved: number; pending: number }> {

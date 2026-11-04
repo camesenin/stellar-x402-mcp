@@ -2,7 +2,7 @@
 
 **Repository:** `camesenin/stellar-x402-mcp`  
 **Network Program:** Drips Stellar Wave / Stellar Community Fund  
-**Audit Baseline Commit:** c7e9928 (c7e9928298f0f5ecc712a3ab75b9d6e4359947ba on main)  
+**Audit Baseline Commit:** 02946d9 (02946d92b7bd3951b0ea9c468598178bd42be000 on main)  
 **QA Test Status:** 100% Green (55 Vitest automated test cases across packages + 8 Soroban Rust tests + simulated end-to-end agent MCP micropayment demo)  
 
 ---
@@ -87,12 +87,13 @@ The backlog features **10 standalone tasks** with zero prerequisites, and **6 de
 - **Standalone Tasks (10 issues):** Issues 1, 2, 3, 4, 5, 7, 9, 11, 15, 16.
   * In Tranche 1, **5 tasks (650 pts)** are standalone and immediately executable upon Wave opening.
   * In Tranche 2, **5 tasks (600 pts)** are standalone.
-- **Dependent Tasks (5 issues):**
-  * Issue 6 (`PostgresStore`) requires Issue 4 (DB Schema).
-  * Issue 8 (`SEP-41 SAC`) requires Issue 2 (StrKey Validator).
-  * Issue 12 (`Beneficiary C...`) requires Issue 5 (Settlement Semantic Tests).
-  * Issue 13 (`Reconciler Worker`) requires Issue 6 (`PostgresStore`).
-  * Issue 14 (`MCP Streamable HTTP`) requires Issue 6 (`PostgresStore` for persistent session state).
+- **Dependent Tasks (6 issues):**
+  * Issue 6 (PostgresStore) requires Issue 4 (DB Schema).
+  * Issue 8 (SEP-41 SAC) requires Issue 2 (StrKey Validator).
+  * Issue 10 (Reusable GitHub Composite Action) requires Issue 8 (SEP-41 SAC test vectors).
+  * Issue 12 (Beneficiary Claims) requires Issue 5 (Settlement Semantic Tests).
+  * Issue 13 (Reconciler Worker) requires Issue 6 (PostgresStore).
+  * Issue 14 (MCP Streamable HTTP) requires Issue 6 (PostgresStore for persistent session state).
 
 ---
 
@@ -128,14 +129,18 @@ The backlog features **10 standalone tasks** with zero prerequisites, and **6 de
 - **Scope:** Add integration unit tests asserting exact event topics `("settle", payer, recipient)` and data fields `(token, amount, challenge_hash)` emitted by `X402PaymentVault`. Verify that unauthorized invocations fail and that `Persistent` storage entry TTL is respected.
 - **Verification Command:** `cargo test --manifest-path packages/contracts/Cargo.toml`
 
-#### Issue 6: `PostgresChallengeStore` Implementation with Fencing Tokens
+#### Issue 6: PostgresChallengeStore Implementation with Fencing Tokens
 - **Tier:** High (200 pts)
-- **Target File:** `packages/gateway/src/stores/postgres.ts`, `packages/gateway/src/stores/types.ts`
+- **Target Files:** packages/gateway/src/stores/postgres.ts, packages/gateway/src/stores/types.ts, packages/gateway/src/verifier.ts, packages/gateway/src/middleware.ts, packages/client/src/payer.ts
 - **Prerequisites:** Issue 4
-- **Scope:** Implement the asynchronous IChallengeStore interface (createChallenge, getChallenge, indSubmissionTx, markRedeemed, isChallengeRedeemed, isTxRedeemed, getPendingChallenges, updateChallengeStatus, cquireLease, 
+- **Scope:**
+  1. **Asynchronous Interface Implementation:** Implement IChallengeStore against PostgreSQL 16 (pg connection pool) supporting all 11 core operations (createChallenge, getChallenge, indSubmissionTx, markRedeemed, isChallengeRedeemed, isTxRedeemed, getPendingChallenges, updateChallengeStatus, cquireLease, 
 enewLease, 
-eleaseLease defined in packages/gateway/src/stores/types.ts) against PostgreSQL. Enforce temporal and generational fencing: markRedeemed and updateChallengeStatus must verify lease_generation = expectedGeneration AND lease_owner = workerId AND lease_expires_at > clock_timestamp() within the SQL transaction. In packages/client/src/payer.ts and gateway router, implement the pre-broadcast handshake: the client binds signed transaction envelope XDR and ledger bounds to the gateway store before network broadcast, ensuring immutable binding and idempotency across crashes and distributed reconciler workers.
-- **Verification Command:** `pnpm --filter @stellar-x402/gateway test`
+eleaseLease).
+  2. **Verifier & Middleware Async Adaptation:** Upgrade StellarPaymentVerifier.verifyPayment and gateway middleware (middleware.ts) to fully wait store operations (wait store.isChallengeRedeemed(...), wait store.isTxRedeemed(...), and const committed = await store.markRedeemed(...)). Reject redemptions with 500/503 and do NOT grant resource access if database commit fails or is fenced out.
+  3. **Temporal & Generational Fencing:** In markRedeemed and updateChallengeStatus, enforce atomic CAS in SQL: WHERE id =  AND (lease_generation IS NULL OR lease_generation = ) AND (lease_owner IS NULL OR lease_owner = ) AND (lease_expires_at IS NULL OR lease_expires_at > clock_timestamp()).
+  4. **Pre-Broadcast Binding Handshake:** In packages/client/src/payer.ts and gateway router (POST /x402/bind), compute transaction hash locally from signed envelope XDR before RPC dispatch, and invoke binding handshake to register (challengeId, bound_tx_hash, envelope_xdr, min_valid_ledger, max_valid_ledger). Gateway enforces immutable 1:1 binding to prevent transaction substitution or front-running across distributed reconcilers.
+- **Verification Command:** pnpm --filter @stellar-x402/gateway test && pnpm --filter @stellar-x402/client test
 
 #### Issue 8: SEP-0041 SAC Deterministic Address Resolution & Asset Typing
 - **Tier:** High (200 pts)
@@ -154,7 +159,7 @@ eleaseLease defined in packages/gateway/src/stores/types.ts) against PostgreSQL.
 #### Issue 10: Reusable GitHub Composite Action for Stellar Standalone Testing
 - **Tier:** Medium (150 pts)
 - **Target File:** `.github/actions/stellar-standalone/action.yml`
-- **Prerequisites:** None
+- **Prerequisites:** Issue 8
 - **Scope:** Composite action that launches pinned `stellar/quickstart:v22.0.1` (Protocol 22/23 compatible), configures local Standalone network passphrase ('Standalone Network ; February 2017'), waits for initial ledger close, and executes an end-to-end payment test against container RPC.
 - **Verification Command:** GitHub Actions CI execution
 
