@@ -80,11 +80,11 @@ export class StellarPaidMcpServer {
         }
 
         // Strict resource binding: prevent cross-tool challenge reuse (e.g. paying for cheap tool and invoking expensive tool)
-        const expectedResource = mcp://;
+        const expectedResource = `mcp://${request.params.name}`;
         if (challenge.resource !== expectedResource) {
           throw new McpError(
             ErrorCode.InvalidParams,
-            x402 Challenge resource mismatch: challenge was issued for '', but invoked for ''. Cross-tool challenge reuse is strictly prohibited.
+            `x402 Challenge resource mismatch: challenge was issued for '${challenge.resource}', but invoked for '${expectedResource}'. Cross-tool challenge reuse is strictly prohibited.`
           );
         }
 
@@ -92,7 +92,7 @@ export class StellarPaidMcpServer {
         if (challenge.amount !== tool.pricing.amount || challenge.asset !== tool.pricing.asset) {
           throw new McpError(
             ErrorCode.InvalidParams,
-            x402 Challenge pricing mismatch: challenge amount/asset ( ) does not match required tool pricing ( ).
+            `x402 Challenge pricing mismatch: challenge amount/asset (${challenge.amount} ${challenge.asset}) does not match required tool pricing (${tool.pricing.amount} ${tool.pricing.asset}).`
           );
         }
 
