@@ -59,6 +59,17 @@ export function amountToStroops(amount: string | number): bigint {
   return stroops;
 }
 
+export function stroopsToDecimalString(stroops: bigint): string {
+  if (stroops < 0n) {
+    throw new Error(`Stroops amount cannot be negative: ${stroops}`);
+  }
+  const whole = stroops / 10_000_000n;
+  const frac = stroops % 10_000_000n;
+  if (frac === 0n) return whole.toString();
+  const fracStr = frac.toString().padStart(7, '0').replace(/0+$/, '');
+  return `${whole}.${fracStr}`;
+}
+
 export class StellarPaymentVerifier {
   private horizonServer: Horizon.Server;
   private sorobanServer?: rpc.Server;
@@ -659,7 +670,7 @@ export class StellarPaymentVerifier {
         }
       }
 
-      const formattedPaid = (Number(paidStroops) / 10000000).toString();
+      const formattedPaid = stroopsToDecimalString(paidStroops);
 
       if (!paymentFound) {
         return {
@@ -680,7 +691,7 @@ export class StellarPaymentVerifier {
       return {
         valid: true,
         payer: payerAddress,
-        amount: paidAmount.toString(),
+        amount: formattedPaid,
         asset: matchedAsset || challenge.asset,
         ledger: tx.ledger_attr,
         txHash: cleanHash,

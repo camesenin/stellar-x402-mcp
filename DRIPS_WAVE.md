@@ -2,8 +2,8 @@
 
 **Repository:** `camesenin/stellar-x402-mcp`  
 **Network Program:** Drips Stellar Wave / Stellar Community Fund  
-**Audit Baseline Commit:** `9b1d7f9` (v0.2.4-rc1)  
-**CI Status:** 100% Green (54 Vitest TS tests + 8 Soroban Rust tests)  
+**Audit Baseline Commit:** `8458ae9` (v0.2.4-rc1)  
+**CI Status:** 100% Green (55 Vitest TS tests + 8 Soroban Rust tests)  
 
 ---
 
@@ -109,18 +109,18 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 - **Scope:** Add `--format json` and `--format table` options to `x402-stellar balance` and `x402-stellar pay`. Structured JSON writes to `stdout`; error diagnostics write to `stderr`. Exit code `0` on success, `1` on error.
 - **Verification Command:** `pnpm --filter @stellar-x402/cli test`
 
-#### Issue 2: StrKey Address Validation with Network & Type Verification
+#### Issue 2: StrKey Address Format, Type, and Checksum Validation
 - **Tier:** Trivial (100 pts)
 - **Target File:** `packages/client/src/validators/strkey.ts`
 - **Prerequisites:** None
-- **Scope:** Validate StrKey checksum and encode version byte. Distinguish account public keys (`G...`) from contract IDs (`C...`). Reject invalid checksums and malformed lengths before network dispatch.
+- **Scope:** Validate StrKey checksum and encode version byte. Distinguish account public keys (`G...`) from contract IDs (`C...`). Reject invalid checksums, malformed lengths, and unexpected version bytes before network dispatch.
 - **Verification Command:** `pnpm --filter @stellar-x402/client test`
 
 #### Issue 4: PostgreSQL 16 Idempotent Migration Script
 - **Tier:** Medium (150 pts)
 - **Target Files:** `packages/gateway/migrations/001_initial.sql`, `packages/gateway/src/scripts/migrate.ts`
 - **Prerequisites:** None
-- **Scope:** Provide SQL schema with `challenges` table: `id TEXT PRIMARY KEY`, `payer TEXT`, `beneficiary TEXT`, `amount_stroops NUMERIC(38, 0)`, `bound_tx_hash TEXT UNIQUE`, `status TEXT`, `version BIGINT DEFAULT 1`, `min_valid_ledger BIGINT`, `max_valid_ledger BIGINT`, `lease_owner TEXT`, `lease_expires_at TIMESTAMPTZ`, `lease_generation BIGINT DEFAULT 0`. Migration script must run idempotently (`IF NOT EXISTS`).
+- **Scope:** Provide SQL schema with complete `challenges` table preserving all fields: `id TEXT PRIMARY KEY`, `destination TEXT NOT NULL`, `amount_stroops NUMERIC(38, 0) NOT NULL`, `asset TEXT NOT NULL`, `memo TEXT`, `network TEXT NOT NULL`, `status TEXT NOT NULL`, `created_at TIMESTAMPTZ NOT NULL`, `expires_at TIMESTAMPTZ NOT NULL`, `bound_tx_hash TEXT UNIQUE`, `redeemed_at TIMESTAMPTZ`, `payer TEXT`, `paid_amount_stroops NUMERIC(38, 0)`, `min_valid_ledger BIGINT`, `max_valid_ledger BIGINT`, `lease_owner TEXT`, `lease_expires_at TIMESTAMPTZ`, `lease_generation BIGINT DEFAULT 0`, `version BIGINT DEFAULT 1`. Migration script must run idempotently (`IF NOT EXISTS`).
 - **Verification Command:** `pnpm --filter @stellar-x402/gateway test`
 
 #### Issue 5: Contract Settlement Semantic Assertions & Event Parsing
@@ -134,7 +134,7 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 - **Tier:** High (200 pts)
 - **Target File:** `packages/gateway/src/stores/postgres.ts`, `packages/gateway/src/stores/types.ts`
 - **Prerequisites:** Issue 4
-- **Scope:** Define the common `IChallengeStore` interface (extracting it from `ChallengeStore`) and implement `PostgresChallengeStore` against PostgreSQL with `clock_timestamp()` fencing tokens and monotonic `lease_generation`. Prevent concurrent zombie worker overrides.
+- **Scope:** Define the asynchronous `IChallengeStore` interface (`createChallenge`, `getChallenge`, `markRedeemed`, `acquireLease`, `renewLease`, `releaseLease`) and implement `PostgresChallengeStore` against PostgreSQL with `clock_timestamp()` fencing tokens and monotonic `lease_generation` conditional updates.
 - **Verification Command:** `pnpm --filter @stellar-x402/gateway test`
 
 #### Issue 8: SEP-0041 SAC Deterministic Address Resolution & Asset Typing

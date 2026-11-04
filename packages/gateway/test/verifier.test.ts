@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { xdr, Address, nativeToScVal } from '@stellar/stellar-sdk';
-import { StellarPaymentVerifier, amountToStroops } from '../src/verifier.js';
+import { StellarPaymentVerifier, amountToStroops, stroopsToDecimalString } from '../src/verifier.js';
 import { ChallengeStore } from '../src/challenge-store.js';
 import { X402Challenge } from '../src/types.js';
 
@@ -59,6 +59,21 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
     // Zero or empty must throw
     expect(() => amountToStroops('0')).toThrow(/must be greater than zero stroops/i);
     expect(() => amountToStroops('')).toThrow(/Amount must be positive/i);
+  });
+
+  it('accurately converts integer stroops (bigint) to exact decimal string without precision loss', () => {
+    expect(stroopsToDecimalString(10_000_000n)).toBe('1');
+    expect(stroopsToDecimalString(500_000n)).toBe('0.05');
+    expect(stroopsToDecimalString(1n)).toBe('0.0000001');
+    expect(stroopsToDecimalString(15_000_000n)).toBe('1.5');
+    expect(stroopsToDecimalString(102_500_000n)).toBe('10.25');
+
+    // Numbers exceeding Number.MAX_SAFE_INTEGER (9007199254740991)
+    const largeStroops = 9007199254740993n;
+    expect(stroopsToDecimalString(largeStroops)).toBe('900719925.4740993');
+
+    // Exact round-trip invariant
+    expect(amountToStroops(stroopsToDecimalString(largeStroops))).toBe(largeStroops);
   });
 
   it('rejects verification if transaction hash has already been redeemed', async () => {
