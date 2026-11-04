@@ -618,8 +618,6 @@ export class StellarPaymentVerifier {
 
       // Verify Operations
       const ops = await tx.operations();
-      let paymentFound = false;
-      let paidAmount = 0;
       let payerAddress = tx.source_account;
       let matchedAsset = '';
 
@@ -638,19 +636,11 @@ export class StellarPaymentVerifier {
             if (isNative && opIsNative) {
               paidStroops += amountToStroops(op.amount || '0');
               matchedAsset = 'XLM';
-              if (paidStroops >= expectedStroops) {
-                paymentFound = true;
-                break;
-              }
             } else if (!isNative && !opIsNative) {
               const fullAsset = `${op.asset_code}:${op.asset_issuer}`;
               if (fullAsset === challenge.asset) {
                 paidStroops += amountToStroops(op.amount || '0');
                 matchedAsset = fullAsset;
-                if (paidStroops >= expectedStroops) {
-                  paymentFound = true;
-                  break;
-                }
               }
             }
           }
@@ -662,15 +652,12 @@ export class StellarPaymentVerifier {
           if (isNative && op.account === challenge.destination) {
             paidStroops += amountToStroops(op.starting_balance || '0');
             matchedAsset = 'XLM';
-            if (paidStroops >= expectedStroops) {
-              paymentFound = true;
-              break;
-            }
           }
         }
       }
 
       const formattedPaid = stroopsToDecimalString(paidStroops);
+      const paymentFound = paidStroops >= expectedStroops && paidStroops > 0n;
 
       if (!paymentFound) {
         return {

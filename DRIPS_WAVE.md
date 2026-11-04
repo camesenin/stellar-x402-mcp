@@ -2,7 +2,7 @@
 
 **Repository:** `camesenin/stellar-x402-mcp`  
 **Network Program:** Drips Stellar Wave / Stellar Community Fund  
-**Audit Baseline Commit:** `8458ae9` (v0.2.4-rc1)  
+**Audit Baseline Commit:** `b7a685c` (v0.2.4-rc1)  
 **CI Status:** 100% Green (55 Vitest TS tests + 8 Soroban Rust tests)  
 
 ---
@@ -120,7 +120,7 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 - **Tier:** Medium (150 pts)
 - **Target Files:** `packages/gateway/migrations/001_initial.sql`, `packages/gateway/src/scripts/migrate.ts`
 - **Prerequisites:** None
-- **Scope:** Provide SQL schema with complete `challenges` table preserving all fields: `id TEXT PRIMARY KEY`, `destination TEXT NOT NULL`, `amount_stroops NUMERIC(38, 0) NOT NULL`, `asset TEXT NOT NULL`, `memo TEXT`, `network TEXT NOT NULL`, `status TEXT NOT NULL`, `created_at TIMESTAMPTZ NOT NULL`, `expires_at TIMESTAMPTZ NOT NULL`, `bound_tx_hash TEXT UNIQUE`, `redeemed_at TIMESTAMPTZ`, `payer TEXT`, `paid_amount_stroops NUMERIC(38, 0)`, `min_valid_ledger BIGINT`, `max_valid_ledger BIGINT`, `lease_owner TEXT`, `lease_expires_at TIMESTAMPTZ`, `lease_generation BIGINT DEFAULT 0`, `version BIGINT DEFAULT 1`. Migration script must run idempotently (`IF NOT EXISTS`).
+- **Scope:** Provide SQL schema preserving 100% of fields from `ChallengeStore`: `id TEXT PRIMARY KEY`, `destination TEXT NOT NULL`, `amount_stroops NUMERIC(38, 0) NOT NULL`, `asset TEXT NOT NULL`, `resource TEXT NOT NULL`, `memo TEXT`, `network TEXT NOT NULL`, `contract_id TEXT`, `token_address TEXT`, `status TEXT NOT NULL`, `created_at TIMESTAMPTZ NOT NULL`, `expires_at TIMESTAMPTZ NOT NULL`, `bound_tx_hash TEXT UNIQUE`, `redeemed_at TIMESTAMPTZ`, `payer TEXT`, `paid_amount_stroops NUMERIC(38, 0)`, `redeemed_ledger BIGINT`, `min_valid_ledger BIGINT`, `max_valid_ledger BIGINT`, `lease_owner TEXT`, `lease_expires_at TIMESTAMPTZ`, `lease_generation BIGINT DEFAULT 0`, `version BIGINT DEFAULT 1`. Includes `redeemed_transactions` table. Migration script must run idempotently (`IF NOT EXISTS`).
 - **Verification Command:** `pnpm --filter @stellar-x402/gateway test`
 
 #### Issue 5: Contract Settlement Semantic Assertions & Event Parsing
@@ -134,7 +134,7 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 - **Tier:** High (200 pts)
 - **Target File:** `packages/gateway/src/stores/postgres.ts`, `packages/gateway/src/stores/types.ts`
 - **Prerequisites:** Issue 4
-- **Scope:** Define the asynchronous `IChallengeStore` interface (`createChallenge`, `getChallenge`, `markRedeemed`, `acquireLease`, `renewLease`, `releaseLease`) and implement `PostgresChallengeStore` against PostgreSQL with `clock_timestamp()` fencing tokens and monotonic `lease_generation` conditional updates.
+- **Scope:** Implement the asynchronous `IChallengeStore` interface (`createChallenge`, `getChallenge`, `markRedeemed`, `isChallengeRedeemed`, `isTxRedeemed`, `acquireLease`, `renewLease`, `releaseLease` defined in `packages/gateway/src/stores/types.ts`) against PostgreSQL with `clock_timestamp()` fencing tokens and monotonic `lease_generation` conditional updates.
 - **Verification Command:** `pnpm --filter @stellar-x402/gateway test`
 
 #### Issue 8: SEP-0041 SAC Deterministic Address Resolution & Asset Typing
