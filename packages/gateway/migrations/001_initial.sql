@@ -34,15 +34,6 @@ CREATE TABLE IF NOT EXISTS challenges (
   )
 );
 
-CREATE INDEX IF NOT EXISTS idx_challenges_status ON challenges(status);
-CREATE INDEX IF NOT EXISTS idx_challenges_expires_at ON challenges(expires_at);
-CREATE INDEX IF NOT EXISTS idx_challenges_bound_tx_hash ON challenges(bound_tx_hash);
-
-CREATE TABLE IF NOT EXISTS redeemed_transactions (
-  tx_hash TEXT PRIMARY KEY,
-  challenge_id TEXT NOT NULL REFERENCES challenges(id),
-  redeemed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
-);
 -- Evolutionary schema migration support for existing deployments
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS created_ledger BIGINT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS min_valid_ledger BIGINT;
@@ -52,3 +43,17 @@ ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_owner TEXT;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS lease_generation BIGINT DEFAULT 0;
 ALTER TABLE IF EXISTS challenges ADD COLUMN IF NOT EXISTS version BIGINT DEFAULT 1;
+
+-- Type conversions and check constraint enforcement for existing installations
+ALTER TABLE IF EXISTS challenges ALTER COLUMN amount_stroops TYPE NUMERIC(40, 0);
+ALTER TABLE IF EXISTS challenges ALTER COLUMN paid_amount_stroops TYPE NUMERIC(40, 0);
+
+CREATE INDEX IF NOT EXISTS idx_challenges_status ON challenges(status);
+CREATE INDEX IF NOT EXISTS idx_challenges_expires_at ON challenges(expires_at);
+CREATE INDEX IF NOT EXISTS idx_challenges_bound_tx_hash ON challenges(bound_tx_hash);
+
+CREATE TABLE IF NOT EXISTS redeemed_transactions (
+  tx_hash TEXT PRIMARY KEY,
+  challenge_id TEXT NOT NULL REFERENCES challenges(id),
+  redeemed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
