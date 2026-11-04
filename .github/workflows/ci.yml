@@ -399,7 +399,7 @@ jobs:
               0
             );
 
-            -- Row 14: I128 PAID OVERFLOW TEST: operational row with paid_amount_stroops > i128::MAX
+            -- Row 14: I128 PAID OVERFLOW TEST: operational row with paid_amount_stroops = i128::MAX + 1 (39 digits)
             -- Must transition to RECONCILIATION_REQUIRED with paid_amount normalized to NULL!
             INSERT INTO challenges (
               challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, paid_amount_stroops, redeemed_at, is_redeemed
@@ -418,6 +418,26 @@ jobs:
               170141183460469231731687303715884105728,
               1793815621820,
               1
+            );
+
+            -- Row 14b (Seed 21): 40-DIGIT EXACT BOUNDARY TEST: requested amount is 40-digit integer 9999999999999999999999999999999999999999
+            -- Fits precisely in NUMERIC(40,0) and matches regex ^-?[0-9]{1,40}$
+            -- Demonstrates representation limit: pre_amount_stroops captures numeric 40-digit value, overflows i128, isolates to INCONCLUSIVE_MANUAL_REVIEW!
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_21',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              NULL,
+              9999999999999999999999999999999999999999,
+              'XLM',
+              'memo_seed_21',
+              'testnet',
+              'PENDING',
+              1793815821820,
+              1793815521820,
+              'tx_boundary_40digit_hash_21',
+              0
             );
 
             -- Row 15: LEGACY MONETARY CHECK CONFLICT CONTRAEXAMPLE:
@@ -606,6 +626,7 @@ jobs:
               rec18 RECORD;
               rec19 RECORD;
               rec20 RECORD;
+              rec21 RECORD;
               v_audit_count BIGINT;
               v_is_nullable TEXT;
               v_indnullsnotdistinct BOOLEAN;
@@ -783,7 +804,7 @@ jobs:
               -- 1. Individual snapshot verification: verify EXACTLY one snapshot exists for every challenge seed (1 through 16)
               FOR r IN (
                 SELECT 'ch_legacy_seed_' || s::text AS ch_id
-                FROM generate_series(1, 20) s
+                FROM generate_series(1, 21) s
               ) LOOP
                 SELECT count(*) INTO v_audit_count 
                 FROM migration_audit_log 
@@ -958,6 +979,29 @@ jobs:
                   AND sanitization_reason = 'PAID_AMOUNT_EXCEEDS_I128_MAX'
               ) THEN
                 RAISE EXCEPTION '[%] Assertion failed: migration_audit_log missing exact evidence for ch_legacy_seed_14', step_name;
+              END IF;
+
+              -- 6b. Exact evidence for 40-digit integer boundary test (ch_legacy_seed_21)
+              -- Tests that 40-digit numeric value is safely captured in numeric pre_amount_stroops and raw text
+              IF NOT EXISTS (
+                SELECT 1 FROM migration_audit_log 
+                WHERE challenge_id = 'ch_legacy_seed_21' 
+                  AND migration_step = 'OVERFLOW_AMOUNT_I128' 
+                  AND pre_amount_stroops = 9999999999999999999999999999999999999999
+                  AND pre_amount_stroops_raw = '9999999999999999999999999999999999999999'
+                  AND sanitization_reason = 'REQUESTED_AMOUNT_EXCEEDS_I128_MAX'
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: migration_audit_log missing exact 40-digit evidence for ch_legacy_seed_21', step_name;
+              END IF;
+              SELECT * INTO rec21 FROM challenges WHERE id = 'ch_legacy_seed_21';
+              IF NOT FOUND THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_21 missing from challenges table', step_name;
+              END IF;
+              IF rec21.status IS DISTINCT FROM 'INCONCLUSIVE_MANUAL_REVIEW' THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_21 not quarantined to INCONCLUSIVE_MANUAL_REVIEW (got %)', step_name, rec21.status;
+              END IF;
+              IF rec21.amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_21 amount_stroops not normalized to NULL (got %)', step_name, rec21.amount_stroops;
               END IF;
 
               -- 7. Idempotency assertion: assert no duplicate logs exist per (challenge_id, migration_step)

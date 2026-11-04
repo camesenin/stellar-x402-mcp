@@ -284,8 +284,8 @@ BEGIN
     )
     SELECT 
       id, 'INITIAL_PRE_MIGRATION_SNAPSHOT', status,
-      CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
-      CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+      CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+      CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
       amount_stroops::TEXT, paid_amount_stroops::TEXT, amount::TEXT, bound_tx_hash, 'CAPTURE_INITIAL_OBSERVED_STATE'
     FROM challenges
     WHERE NOT EXISTS (
@@ -298,8 +298,8 @@ BEGIN
     )
     SELECT 
       id, 'INITIAL_PRE_MIGRATION_SNAPSHOT', status,
-      CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
-      CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+      CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+      CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
       amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'CAPTURE_INITIAL_OBSERVED_STATE'
     FROM challenges
     WHERE NOT EXISTS (
@@ -339,8 +339,8 @@ BEGIN
   -- STRICT INVARIANT: Status is NEVER changed here, preserving PERMANENT_QUARANTINE and INCONCLUSIVE_MANUAL_REVIEW!
   INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
   SELECT id, 'SANITIZE_PAID_AMOUNT', status,
-    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
-    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
     amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'INVALID_NON_POSITIVE_OR_NAN_PAID_AMOUNT'
   FROM challenges
   WHERE paid_amount_stroops IS NOT NULL AND (paid_amount_stroops = 'NaN'::numeric OR paid_amount_stroops <= 0)
@@ -360,8 +360,8 @@ BEGIN
   -- Instead, detect non-integer values (value != trunc(value)), capture exact raw evidence, and quarantine to RECONCILIATION_REQUIRED.
   INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
   SELECT id, 'FRACTIONAL_STROOPS_QUARANTINE', status,
-    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
-    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
     amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'FRACTIONAL_STROOPS_DETECTED'
   FROM challenges
   WHERE (
@@ -403,8 +403,8 @@ BEGIN
   -- Only operational rows transition to RECONCILIATION_REQUIRED.
   INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
   SELECT id, 'OVERFLOW_PAID_AMOUNT_I128', status,
-    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
-    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
     amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'PAID_AMOUNT_EXCEEDS_I128_MAX'
   FROM challenges
   WHERE paid_amount_stroops IS NOT NULL AND paid_amount_stroops != 'NaN'::numeric AND paid_amount_stroops > 170141183460469231731687303715884105727
@@ -429,8 +429,8 @@ BEGIN
   -- Operational rows transition to INCONCLUSIVE_MANUAL_REVIEW.
   INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
   SELECT id, 'OVERFLOW_AMOUNT_I128', status,
-    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
-    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
     amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'REQUESTED_AMOUNT_EXCEEDS_I128_MAX'
   FROM challenges
   WHERE amount_stroops IS NOT NULL AND amount_stroops != 'NaN'::numeric AND amount_stroops > 170141183460469231731687303715884105727
@@ -456,8 +456,8 @@ BEGIN
   -- Record evidence before normalizing non-positive or NaN amount_stroops to NULL, preserving their respective quarantine status!
   INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
   SELECT id, 'QUARANTINE_AMOUNT_NORMALIZATION', status,
-    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
-    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
     amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'QUARANTINE_AMOUNT_NORMALIZED_TO_NULL'
   FROM challenges
   WHERE status IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE')
@@ -478,8 +478,8 @@ BEGIN
   -- Record evidence. Safely isolate into INCONCLUSIVE_MANUAL_REVIEW with amount_stroops = NULL
   INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
   SELECT id, 'OPERATIONAL_AMOUNT_INVALID', status,
-    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
-    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
     amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'OPERATIONAL_NON_POSITIVE_AMOUNT_ISOLATED'
   FROM challenges
   WHERE (amount_stroops IS NOT NULL AND (amount_stroops <= 0 OR amount_stroops = 'NaN'::numeric))
@@ -496,8 +496,8 @@ BEGIN
   -- 3. Rows with amount_stroops IS NULL: isolate to INCONCLUSIVE_MANUAL_REVIEW if not already permanently quarantined
   INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
   SELECT id, 'UNMETERED_AMOUNT_NULL', status,
-    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
-    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
     amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'UNMETERED_ROW_ISOLATED_TO_INCONCLUSIVE'
   FROM challenges
   WHERE amount_stroops IS NULL AND (status IS NULL OR status NOT IN ('INCONCLUSIVE_MANUAL_REVIEW', 'PERMANENT_QUARANTINE'))
@@ -517,8 +517,8 @@ BEGIN
   -- Only operational rows transition to RECONCILIATION_REQUIRED.
   INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
   SELECT id, 'UNDERPAID_CHALLENGE', status,
-    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
-    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
     amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'PAID_AMOUNT_LESS_THAN_REQUESTED_AMOUNT'
   FROM challenges
   WHERE amount_stroops IS NOT NULL AND paid_amount_stroops IS NOT NULL AND paid_amount_stroops < amount_stroops
@@ -551,8 +551,8 @@ BEGIN
 
     INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
     SELECT id, 'RECONCILE_INCOMPLETE_REDEEMED', status,
-      CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
-      CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+      CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+      CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
       amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'LEGACY_IS_REDEEMED_LACKS_PROOF'
     FROM challenges
     WHERE (status IS NULL OR status = 'PENDING') 
@@ -573,8 +573,8 @@ BEGIN
   -- G. Reconcile any existing rows that were ALREADY marked 'REDEEMED' but lack proof, had NaN paid_amount, or were underpaid:
   INSERT INTO migration_audit_log (challenge_id, migration_step, pre_status, pre_amount_stroops, pre_paid_amount_stroops, pre_amount_stroops_raw, pre_paid_amount_stroops_raw, pre_amount_text, pre_bound_tx_hash, sanitization_reason)
   SELECT id, 'RECONCILE_UNPROVEN_REDEEMED', status,
-    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
-    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,38}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN amount_stroops IS NOT NULL AND amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN amount_stroops::NUMERIC(40, 0) ELSE NULL END,
+    CASE WHEN paid_amount_stroops IS NOT NULL AND paid_amount_stroops::TEXT ~ '^-?[0-9]{1,40}$' THEN paid_amount_stroops::NUMERIC(40, 0) ELSE NULL END,
     amount_stroops::TEXT, paid_amount_stroops::TEXT, NULL, bound_tx_hash, 'REDEEMED_ROW_LACKS_PROOF_OR_PAYMENT'
   FROM challenges
   WHERE status = 'REDEEMED'
