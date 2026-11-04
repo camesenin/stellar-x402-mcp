@@ -392,18 +392,18 @@ export class BudgetManager {
         return; // Transaction could still land before maxTime: maintain quarantine
       }
 
-      if (onChainReceiptExists === false) {
-        // Receipt definitively absent past expiration bound
-      } else {
-        const broadcastSec = res.broadcastAtSec ?? (maxTimeSec - 60);
-        if (
-          typeof oldestLedgerCloseTime !== 'number' ||
-          !Number.isFinite(oldestLedgerCloseTime) ||
-          oldestLedgerCloseTime <= 0 ||
-          oldestLedgerCloseTime > broadcastSec
-        ) {
-          return; // RPC retention window pruned, zero, negative or missing: maintain quarantine
-        }
+      // Retention Window Verification:
+      // Even if an on-chain receipt query reported absent, unquarantining a broadcast transaction
+      // REQUIRES cryptographic certainty that the node retention window encompasses the broadcast time.
+      // If node history has been pruned (oldestLedgerCloseTime > broadcastSec or missing), the query is ambiguous: maintain quarantine!
+      const broadcastSec = res.broadcastAtSec ?? (maxTimeSec - 60);
+      if (
+        typeof oldestLedgerCloseTime !== 'number' ||
+        !Number.isFinite(oldestLedgerCloseTime) ||
+        oldestLedgerCloseTime <= 0 ||
+        oldestLedgerCloseTime > broadcastSec
+      ) {
+        return; // Ambiguous ledger history / pruned node: maintain fail-closed quarantine!
       }
     }
 

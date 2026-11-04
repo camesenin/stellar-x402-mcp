@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS challenges (
   created_at TIMESTAMPTZ NOT NULL,
   created_ledger BIGINT CHECK (created_ledger IS NULL OR created_ledger >= 0),
   expires_at TIMESTAMPTZ NOT NULL,
-  bound_tx_hash TEXT UNIQUE,
+  bound_tx_hash TEXT,
   redeemed_at TIMESTAMPTZ,
   payer TEXT,
   paid_amount_stroops NUMERIC(40, 0) CHECK (paid_amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops),
@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS challenges (
   CONSTRAINT chk_challenge_expiry CHECK (expires_at >= created_at),
   CONSTRAINT chk_redeemed_consistency CHECK (
     (status != 'REDEEMED') OR (bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND redeemed_at IS NOT NULL)
-  )
+  ),
+  CONSTRAINT uq_challenges_bound_tx_hash UNIQUE (bound_tx_hash)
 );
 
 -- Evolutionary schema migration support for existing deployments
@@ -69,9 +70,11 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_amount') THEN
     ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (amount_stroops > 0);
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_status') THEN
-    ALTER TABLE challenges ADD CONSTRAINT chk_challenge_status CHECK (status IN ('PENDING', 'RECONCILIATION_REQUIRED', 'INCONCLUSIVE_MANUAL_REVIEW', 'CONFIRMED', 'REDEEMED', 'CANCELLED', 'PERMANENT_QUARANTINE'));
+  -- Replace any legacy status check constraint that might reject extended state enum
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_status') THEN
+    ALTER TABLE challenges DROP CONSTRAINT chk_challenge_status;
   END IF;
+  ALTER TABLE challenges ADD CONSTRAINT chk_challenge_status CHECK (status IN ('PENDING', 'RECONCILIATION_REQUIRED', 'INCONCLUSIVE_MANUAL_REVIEW', 'CONFIRMED', 'REDEEMED', 'CANCELLED', 'PERMANENT_QUARANTINE'));
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_redeemed_consistency') THEN
     ALTER TABLE challenges ADD CONSTRAINT chk_redeemed_consistency CHECK ((status != 'REDEEMED') OR (bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND redeemed_at IS NOT NULL));
   END IF;

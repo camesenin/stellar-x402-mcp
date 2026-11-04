@@ -266,24 +266,25 @@ describe('BudgetManager', () => {
     expect(budget.getPendingReservedXlm()).toBe(0.5);
   });
 
-  it('resolves evicted txs via on-chain contract receipt absence, preventing permanent budget lock', () => {
+  it('enforces permanent quarantine when node retention is pruned even if receipt absence is claimed', () => {
     let mockTime = 100_000;
     const budget = new BudgetManager(1.0, 5.0, 120_000, () => mockTime);
 
-    // Reservation with maxTime = 110s
+    // Reservation with maxTime = 110s, broadcast at 100s
     const r1 = budget.reserve(0.5);
     budget.release(r1, 110_000, 'tx_evicted_never_settled', 'GMERCHANT_1');
     mockTime = 130_000;
 
-    // RPC pruned history (oldest 120s > maxTime 110s), but direct on-chain query confirms receipt is absent!
+    // RPC pruned history (oldest 120s > broadcastSec 100s).
+    // In accordance with DRIPS_WAVE Section 2 Case C, ambiguous history MUST maintain quarantine fail-closed!
     budget.resolveQuarantine(r1, {
       status: 'NOT_FOUND',
       latestLedgerCloseTime: 140,
       oldestLedgerCloseTime: 120,
       onChainReceiptExists: false,
     });
-    // Safely freed without leaking budget!
-    expect(budget.getPendingReservedXlm()).toBe(0);
+    // Budget reservation remains quarantined fail-closed!
+    expect(budget.getPendingReservedXlm()).toBe(0.5);
 
     // Counter-case: On-chain receipt exists -> overrides NOT_FOUND and marks SUCCESS!
     const r2 = budget.reserve(0.4);
@@ -296,7 +297,8 @@ describe('BudgetManager', () => {
       oldestLedgerCloseTime: 120,
       onChainReceiptExists: true,
     });
-    expect(budget.getPendingReservedXlm()).toBe(0);
+    // r1 is still quarantined (0.5), while r2 is finalized from reserved to spent (0.4)
+    expect(budget.getPendingReservedXlm()).toBe(0.5);
     expect(budget.getSpentTotal()).toBe(0.4);
   });
 

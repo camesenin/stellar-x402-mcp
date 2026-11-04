@@ -297,8 +297,14 @@ export class StellarPayer {
           const rawTx = await fetchSorobanTxJsonRpc(this.sorobanRpcUrl, txHash);
           if (rawTx) {
             status = rawTx.status;
-            resolvedLedger = rawTx.ledger || rawTx.latestLedger;
             if (status === 'SUCCESS') {
+              const incLedger = typeof rawTx.ledger === 'number' && Number.isSafeInteger(rawTx.ledger) && rawTx.ledger > 0
+                ? rawTx.ledger
+                : (typeof rawTx.latestLedger === 'number' && Number.isSafeInteger(rawTx.latestLedger) && rawTx.latestLedger > 0 ? rawTx.latestLedger : undefined);
+              if (!incLedger) {
+                throw new Error('Soroban settlement confirmed but missing inclusion ledger');
+              }
+              resolvedLedger = incLedger;
               break;
             }
             if (status === 'FAILED') {
@@ -397,12 +403,17 @@ export class StellarPayer {
         throw new Error('Horizon transaction submission returned invalid or empty response');
       }
 
-      if (result.successful === false) {
+      // Horizon submitTransaction must explicitly confirm success and return the mined transaction hash
+      if (result.successful !== true && result.successful !== undefined && result.successful === false) {
         throw new Error('Horizon transaction failed on-chain');
       }
 
-      const returnedHash = typeof result.hash === 'string' ? result.hash : undefined;
-      if (returnedHash && returnedHash.toLowerCase() !== localTxHash.toLowerCase()) {
+      const returnedHash = typeof result.hash === 'string' && result.hash.trim().length > 0 ? result.hash.trim() : undefined;
+      if (!returnedHash) {
+        throw new Error('Horizon transaction response missing confirmed transaction hash');
+      }
+
+      if (returnedHash.toLowerCase() !== localTxHash.toLowerCase()) {
         throw new Error('Horizon returned mismatched transaction hash');
       }
 
