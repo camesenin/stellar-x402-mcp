@@ -385,6 +385,9 @@ BEGIN
       END,
       status = CASE 
         WHEN status IN ('PERMANENT_QUARANTINE', 'INCONCLUSIVE_MANUAL_REVIEW') THEN status 
+        -- If requested amount itself was fractional, amount_stroops becomes NULL -> must isolate to INCONCLUSIVE_MANUAL_REVIEW to satisfy chk_challenge_amount!
+        WHEN amount_stroops IS NOT NULL AND amount_stroops != 'NaN'::numeric AND amount_stroops != trunc(amount_stroops) THEN 'INCONCLUSIVE_MANUAL_REVIEW'
+        -- If only paid_amount_stroops was fractional but requested amount was valid integer, isolate to RECONCILIATION_REQUIRED
         ELSE 'RECONCILIATION_REQUIRED' 
       END
   WHERE (

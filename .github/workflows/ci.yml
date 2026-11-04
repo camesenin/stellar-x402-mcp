@@ -467,9 +467,8 @@ jobs:
               1
             );
 
-            -- Row 17: FRACTIONAL STROOPS SANITIZATION TEST: operational row with fractional stroops in both columns (e.g. 1.4 stroops)
-            -- Demonstrates Council requirement: fractional stroops are never silently rounded by ALTER TABLE TYPE NUMERIC(40,0);
-            -- they are detected, evidenced in migration_audit_log, and quarantined to RECONCILIATION_REQUIRED with exact raw text preserved!
+            -- Row 17: FRACTIONAL STROOPS (BOTH FRACTIONAL): operational row with fractional stroops in both columns (1.4 stroops)
+            -- Quarantines to INCONCLUSIVE_MANUAL_REVIEW because requested amount is unmetered/fractional (amount_stroops=NULL)!
             INSERT INTO challenges (
               challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, paid_amount_stroops, redeemed_at, is_redeemed
             ) VALUES (
@@ -487,6 +486,68 @@ jobs:
               1.4,
               1793815621820,
               1
+            );
+
+            -- Row 18: FRACTIONAL STROOPS (ONLY AMOUNT FRACTIONAL): requested amount is fractional 2.5, paid amount is integer 500
+            -- Quarantines to INCONCLUSIVE_MANUAL_REVIEW because requested amount is unmetered/fractional (amount_stroops=NULL)!
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, paid_amount_stroops, redeemed_at, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_18',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              NULL,
+              2.5,
+              'XLM',
+              'memo_seed_18',
+              'testnet',
+              'PENDING',
+              1793815821820,
+              1793815521820,
+              'tx_fractional_hash_18',
+              500,
+              1793815621820,
+              0
+            );
+
+            -- Row 19: FRACTIONAL STROOPS (ONLY PAID FRACTIONAL): requested amount is valid integer 1000, paid amount is fractional 1000.75
+            -- Preserves valid requested amount 1000, normalizes paid to NULL, isolates to RECONCILIATION_REQUIRED (satisfies chk_challenge_amount)!
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, paid_amount_stroops, redeemed_at, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_19',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              NULL,
+              1000,
+              'XLM',
+              'memo_seed_19',
+              'testnet',
+              'REDEEMED',
+              1793815821820,
+              1793815521820,
+              'tx_fractional_hash_19',
+              1000.75,
+              1793815621820,
+              1
+            );
+
+            -- Row 20: FRACTIONAL STROOPS (PRE-EXISTING PERMANENT_QUARANTINE): starts in PERMANENT_QUARANTINE with fractional stroops 9.99
+            -- Strictly PRESERVES PERMANENT_QUARANTINE status, normalizes amounts to NULL!
+            INSERT INTO challenges (
+              challenge_id, destination, amount, amount_stroops, asset, memo, network, status, expires_at, created_at, bound_tx_hash, paid_amount_stroops, is_redeemed
+            ) VALUES (
+              'ch_legacy_seed_20',
+              'GA2I5XXUD3HE6NYX3YZEYREVBIBM5PLLN4DIGO3RWYHQ75J73AKGYEQB',
+              NULL,
+              9.99,
+              'XLM',
+              'memo_seed_20',
+              'testnet',
+              'PERMANENT_QUARANTINE',
+              1793815821820,
+              1793815521820,
+              'tx_fractional_hash_20',
+              9.99,
+              0
             );
 
             -- 1. Duplicate btree index on bound_tx_hash to be purged
@@ -542,6 +603,9 @@ jobs:
               rec15 RECORD;
               rec16 RECORD;
               rec17 RECORD;
+              rec18 RECORD;
+              rec19 RECORD;
+              rec20 RECORD;
               v_audit_count BIGINT;
               v_is_nullable TEXT;
               v_indnullsnotdistinct BOOLEAN;
@@ -719,7 +783,7 @@ jobs:
               -- 1. Individual snapshot verification: verify EXACTLY one snapshot exists for every challenge seed (1 through 16)
               FOR r IN (
                 SELECT 'ch_legacy_seed_' || s::text AS ch_id
-                FROM generate_series(1, 17) s
+                FROM generate_series(1, 20) s
               ) LOOP
                 SELECT count(*) INTO v_audit_count 
                 FROM migration_audit_log 
@@ -751,9 +815,7 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: pre-existing brownfield audit record lost during migration', step_name;
               END IF;
 
-              -- 1d. Verify ultra-wide 42-digit challenge Row 16 raw preservation in snapshot and audit log
-              -- Must verify that pre_amount_stroops_raw and pre_paid_amount_stroops_raw capture the exact 42-digit string,
-              -- and that numeric columns in migration_audit_log are safely NULL to avoid NUMERIC(40,0) field overflow!
+              -- 1d. Verify ultra-wide 42-digit challenge Row 16: raw preservation in audit log, row existence, and final quarantine state
               IF NOT EXISTS (
                 SELECT 1 FROM migration_audit_log 
                 WHERE challenge_id = 'ch_legacy_seed_16' 
@@ -766,7 +828,19 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: INITIAL_PRE_MIGRATION_SNAPSHOT ultra-wide 42-digit assertions failed for ch_legacy_seed_16', step_name;
               END IF;
 
-              -- 1e. Verify fractional stroops quarantine and exact raw evidence for Row 17
+              SELECT * INTO rec16 FROM challenges WHERE id = 'ch_legacy_seed_16';
+              IF NOT FOUND THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_16 missing from challenges table', step_name;
+              END IF;
+              IF rec16.status IS DISTINCT FROM 'INCONCLUSIVE_MANUAL_REVIEW' THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_16 not quarantined to INCONCLUSIVE_MANUAL_REVIEW (got %)', step_name, rec16.status;
+              END IF;
+              IF rec16.amount_stroops IS NOT NULL OR rec16.paid_amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_16 42-digit amounts not normalized to NULL (got amount=%, paid=%)', step_name, rec16.amount_stroops, rec16.paid_amount_stroops;
+              END IF;
+
+              -- 1e. Comprehensive Fractional Stroops Quarantine Assertions (Seeds 17 through 20)
+              -- Seed 17: both requested and paid fractional -> converges to INCONCLUSIVE_MANUAL_REVIEW with both NULL
               IF NOT EXISTS (
                 SELECT 1 FROM migration_audit_log
                 WHERE challenge_id = 'ch_legacy_seed_17' 
@@ -777,13 +851,54 @@ jobs:
               ) THEN
                 RAISE EXCEPTION '[%] Assertion failed: FRACTIONAL_STROOPS_QUARANTINE audit log entry missing for ch_legacy_seed_17', step_name;
               END IF;
-
               SELECT * INTO rec17 FROM challenges WHERE id = 'ch_legacy_seed_17';
-              IF rec17.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
-                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_17 not quarantined to RECONCILIATION_REQUIRED (got %)', step_name, rec17.status;
+              IF NOT FOUND THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_17 missing from challenges table', step_name;
+              END IF;
+              IF rec17.status IS DISTINCT FROM 'INCONCLUSIVE_MANUAL_REVIEW' THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_17 not quarantined to INCONCLUSIVE_MANUAL_REVIEW (got %)', step_name, rec17.status;
               END IF;
               IF rec17.amount_stroops IS NOT NULL OR rec17.paid_amount_stroops IS NOT NULL THEN
                 RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_17 fractional stroops were not normalized to NULL (got amount=%, paid=%)', step_name, rec17.amount_stroops, rec17.paid_amount_stroops;
+              END IF;
+
+              -- Seed 18: requested fractional (2.5), paid integer (500) -> converges to INCONCLUSIVE_MANUAL_REVIEW with amount_stroops=NULL
+              SELECT * INTO rec18 FROM challenges WHERE id = 'ch_legacy_seed_18';
+              IF NOT FOUND THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_18 missing from challenges table', step_name;
+              END IF;
+              IF rec18.status IS DISTINCT FROM 'INCONCLUSIVE_MANUAL_REVIEW' THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_18 not quarantined to INCONCLUSIVE_MANUAL_REVIEW (got %)', step_name, rec18.status;
+              END IF;
+              IF rec18.amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_18 amount_stroops not normalized to NULL (got %)', step_name, rec18.amount_stroops;
+              END IF;
+
+              -- Seed 19: requested integer (1000), paid fractional (1000.75) -> preserves valid requested amount 1000, paid normalized to NULL, status RECONCILIATION_REQUIRED
+              SELECT * INTO rec19 FROM challenges WHERE id = 'ch_legacy_seed_19';
+              IF NOT FOUND THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_19 missing from challenges table', step_name;
+              END IF;
+              IF rec19.status IS DISTINCT FROM 'RECONCILIATION_REQUIRED' THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_19 not isolated to RECONCILIATION_REQUIRED (got %)', step_name, rec19.status;
+              END IF;
+              IF rec19.amount_stroops IS DISTINCT FROM 1000 THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_19 valid requested amount not preserved as 1000 (got %)', step_name, rec19.amount_stroops;
+              END IF;
+              IF rec19.paid_amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_19 fractional paid amount not normalized to NULL (got %)', step_name, rec19.paid_amount_stroops;
+              END IF;
+
+              -- Seed 20: pre-existing PERMANENT_QUARANTINE with fractional stroops 9.99 -> strictly PRESERVED as PERMANENT_QUARANTINE
+              SELECT * INTO rec20 FROM challenges WHERE id = 'ch_legacy_seed_20';
+              IF NOT FOUND THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_20 missing from challenges table', step_name;
+              END IF;
+              IF rec20.status IS DISTINCT FROM 'PERMANENT_QUARANTINE' THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_20 PERMANENT_QUARANTINE status not preserved (got %)', step_name, rec20.status;
+              END IF;
+              IF rec20.amount_stroops IS NOT NULL OR rec20.paid_amount_stroops IS NOT NULL THEN
+                RAISE EXCEPTION '[%] Assertion failed: ch_legacy_seed_20 fractional stroops not normalized to NULL (got amount=%, paid=%)', step_name, rec20.amount_stroops, rec20.paid_amount_stroops;
               END IF;
 
               -- 2. Exact evidence for underpaid operational row (ch_legacy_seed_10)
