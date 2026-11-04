@@ -612,15 +612,8 @@ export class StellarPaymentVerifier {
       let payerAddress = tx.source_account;
       let matchedAsset = '';
 
-      // Integer stroop conversion helper (1 XLM/unit = 10,000,000 stroops) to eliminate IEEE 754 float drift
-      const toStroops = (amtStr: string): bigint => {
-        const parts = amtStr.trim().split('.');
-        const whole = BigInt(parts[0] || '0') * 10000000n;
-        const fracStr = (parts[1] || '').padEnd(7, '0').slice(0, 7);
-        return whole + BigInt(fracStr || '0');
-      };
-
-      const expectedStroops = toStroops(challenge.amount);
+      // Strict integer stroop parsing using canonical amountToStroops (1 XLM/unit = 10,000,000 stroops)
+      const expectedStroops = amountToStroops(challenge.amount);
       let paidStroops = 0n;
 
       for (const op of ops.records as unknown as StellarOpRecord[]) {
@@ -632,32 +625,33 @@ export class StellarPaymentVerifier {
 
           if (op.to === challenge.destination) {
             if (isNative && opIsNative) {
-              paidStroops += toStroops(op.amount || '0');
+              paidStroops += amountToStroops(op.amount || '0');
               matchedAsset = 'XLM';
               if (paidStroops >= expectedStroops) {
                 paymentFound = true;
-                paidAmount = Number(paidStroops) / 10000000;
                 break;
               }
             } else if (!isNative && !opIsNative) {
               const fullAsset = `${op.asset_code}:${op.asset_issuer}`;
               if (fullAsset === challenge.asset) {
-                paidStroops += toStroops(op.amount || '0');
+                paidStroops += amountToStroops(op.amount || '0');
                 matchedAsset = fullAsset;
                 if (paidStroops >= expectedStroops) {
                   paymentFound = true;
-                  paidAmount = Number(paidStroops) / 10000000;
                   break;
                 }
               }
             }
           }
         } else if (op.type === 'create_account') {
-          if (op.account === challenge.destination) {
-            const amt = parseFloat(op.starting_balance || '0');
-            paidAmount += amt;
+          // create_account in Stellar is strictly native XLM
+          const isNative =
+            challenge.asset.toUpperCase() === 'XLM' ||
+            challenge.asset.toUpperCase() === 'NATIVE';
+          if (isNative && op.account === challenge.destination) {
+            paidStroops += amountToStroops(op.starting_balance || '0');
             matchedAsset = 'XLM';
-            if (paidAmount >= expectedAmount) {
+            if (paidStroops >= expectedStroops) {
               paymentFound = true;
               break;
             }
@@ -665,10 +659,12 @@ export class StellarPaymentVerifier {
         }
       }
 
+      const formattedPaid = (Number(paidStroops) / 10000000).toString();
+
       if (!paymentFound) {
         return {
           valid: false,
-          reason: `Payment requirements not met. Found ${paidAmount} ${matchedAsset || challenge.asset}, required >= ${expectedAmount} ${challenge.asset} to ${challenge.destination}`,
+          reason: `Payment requirements not met. Found ${formattedPaid} ${matchedAsset || challenge.asset}, required >= ${challenge.amount} ${challenge.asset} to ${challenge.destination}`,
           txHash: cleanHash,
         };
       }
@@ -676,7 +672,7 @@ export class StellarPaymentVerifier {
       // Mark as redeemed in SQLite
       store.markRedeemed(challenge.challengeId, cleanHash, {
         payer: payerAddress,
-        amount: paidAmount.toString(),
+        amount: formattedPaid,
         asset: matchedAsset || challenge.asset,
         ledger: tx.ledger_attr,
       });

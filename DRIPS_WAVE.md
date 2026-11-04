@@ -120,7 +120,7 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 - **Tier:** Medium (150 pts)
 - **Target Files:** `packages/gateway/migrations/001_initial.sql`, `packages/gateway/src/scripts/migrate.ts`
 - **Prerequisites:** None
-- **Scope:** Provide SQL schema with `challenges` table: `id TEXT PRIMARY KEY`, `payer TEXT`, `beneficiary TEXT`, `amount NUMERIC(38, 0)`, `bound_tx_hash TEXT UNIQUE`, `status TEXT`, `lease_owner TEXT`, `lease_expires_at TIMESTAMPTZ`, `lease_generation BIGINT DEFAULT 0`. Migration script must run idempotently (`IF NOT EXISTS`).
+- **Scope:** Provide SQL schema with `challenges` table: `id TEXT PRIMARY KEY`, `payer TEXT`, `beneficiary TEXT`, `amount_stroops NUMERIC(38, 0)`, `bound_tx_hash TEXT UNIQUE`, `status TEXT`, `version BIGINT DEFAULT 1`, `min_valid_ledger BIGINT`, `max_valid_ledger BIGINT`, `lease_owner TEXT`, `lease_expires_at TIMESTAMPTZ`, `lease_generation BIGINT DEFAULT 0`. Migration script must run idempotently (`IF NOT EXISTS`).
 - **Verification Command:** `pnpm --filter @stellar-x402/gateway test`
 
 #### Issue 5: Contract Settlement Semantic Assertions & Event Parsing
@@ -151,11 +151,11 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 - **Scope:** Provide a complete TypeScript example showing how an autonomous LangGraph agent uses `createX402Fetch` to consume paid MCP tool endpoints.
 - **Verification Command:** `pnpm --filter @stellar-x402/example-langchain test`
 
-#### Issue 10: Reusable GitHub Action for Stellar Standalone Testing
+#### Issue 10: Reusable GitHub Composite Action for Stellar Standalone Testing
 - **Tier:** Medium (150 pts)
-- **Target File:** `.github/workflows/stellar-standalone.yml`
+- **Target File:** `.github/actions/stellar-standalone/action.yml`
 - **Prerequisites:** None
-- **Scope:** Composite action that launches `stellar/quickstart:latest` in standalone mode, waits for ledger close, and executes an end-to-end payment test.
+- **Scope:** Composite action that launches pinned `stellar/quickstart:soroban-dev` (Protocol 22/23 compatible), waits for initial ledger close, and executes an end-to-end payment test against container RPC.
 - **Verification Command:** GitHub Actions CI execution
 
 ---
@@ -185,9 +185,9 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 
 #### Issue 12: Decoupled `beneficiary: Address` in ReceiptVault
 - **Tier:** High (200 pts)
-- **Target File:** `packages/contracts/src/lib.rs`
+- **Target Files:** `packages/contracts/src/lib.rs`, `packages/client/src/payer.ts`
 - **Prerequisites:** Issue 5
-- **Scope:** Decouple `payer` (who authorizes the transfer) from `beneficiary` (the agent receiving the resource access), allowing smart contracts (`C...`) to pay on behalf of agents.
+- **Scope:** Decouple `payer` (who authorizes the transfer) from `beneficiary` (the agent receiving the resource access), allowing smart contracts (`C...`) to pay on behalf of agents. Extends Soroban contract signature and updates client payer bindings.
 - **Verification Command:** `cargo test --manifest-path packages/contracts/Cargo.toml`
 
 #### Issue 13: Asynchronous Reconciliation Worker for Interrupted Challenges
