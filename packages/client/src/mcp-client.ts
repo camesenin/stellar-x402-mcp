@@ -95,12 +95,14 @@ export class StellarPaidMcpClient {
             },
           });
         } catch (callErr: any) {
-          const isRetriable503 = callErr?.data?.retriable === true ||
-            (callErr instanceof Error && callErr.message.includes('temporarily unavailable'));
+          const isRetriable503 = callErr?.data?.retriable === true && callErr?.data?.statusCode === 503;
           if (isRetriable503 && mcpRetryAttempts < 3) {
             mcpRetryAttempts++;
-            const retryWaitSec = callErr?.data?.retryAfterSec ?? 1;
-            await new Promise(resolve => setTimeout(resolve, retryWaitSec * 1000));
+            // Exponential backoff: base 500ms * 2^attempts, respecting server retryAfterSec
+            const baseWaitMs = 500 * Math.pow(2, mcpRetryAttempts);
+            const serverWaitMs = typeof callErr?.data?.retryAfterSec === 'number' ? callErr.data.retryAfterSec * 1000 : 0;
+            const finalWaitMs = Math.min(Math.max(baseWaitMs, serverWaitMs), 5000);
+            await new Promise(resolve => setTimeout(resolve, finalWaitMs));
             continue;
           }
           throw callErr;

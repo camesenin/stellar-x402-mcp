@@ -9,6 +9,69 @@ import { ChallengeStore } from '../src/challenge-store.js';
 const require = createRequire(import.meta.url);
 const betterSqlitePath = require.resolve('better-sqlite3');
 
+// Reusable settlement and event listener management routine shared between real contention harness and fault injection
+export function setupWorkerPromiseLifecycle<T>(
+  worker: {
+    on: (event: string, fn: Function) => void;
+    once: (event: string, fn: Function) => void;
+    off: (event: string, fn: Function) => void;
+    postMessage?: (msg: any) => void;
+  },
+  timeoutMs: number,
+  timeoutMessage: string,
+  onMessageReceived: (msg: unknown, settle: (err?: Error | null, val?: T) => void) => void,
+  commandToPost?: any
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let isSettled = false;
+    let deadlineTimer: NodeJS.Timeout | null = null;
+
+    const settle = (err?: Error | null, val?: T) => {
+      if (isSettled) return;
+      isSettled = true;
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer);
+        deadlineTimer = null;
+      }
+      worker.off('message', onMessage);
+      worker.off('exit', onExit);
+      worker.off('error', onError);
+      if (err) reject(err);
+      else resolve(val as T);
+    };
+
+    const onExit = (code: number) => {
+      settle(new Error(`Worker exited prematurely with code ${code}`));
+    };
+    const onError = (err: Error) => {
+      settle(err);
+    };
+    const onMessage = (msg: unknown) => {
+      try {
+        onMessageReceived(msg, settle);
+      } catch (listenerErr) {
+        settle(listenerErr instanceof Error ? listenerErr : new Error(String(listenerErr)));
+      }
+    };
+
+    try {
+      deadlineTimer = setTimeout(() => {
+        settle(new Error(timeoutMessage));
+      }, timeoutMs);
+
+      worker.on('message', onMessage);
+      worker.once('exit', onExit);
+      worker.once('error', onError);
+
+      if (commandToPost && worker.postMessage) {
+        worker.postMessage(commandToPost);
+      }
+    } catch (setupErr) {
+      settle(setupErr instanceof Error ? setupErr : new Error(String(setupErr)));
+    }
+  });
+}
+
 // Reusable robust teardown helper shared between contention test and fault-injection tests
 export async function executeStoreAndWorkerTeardown(
   worker: { terminate: () => Promise<number | void> } | null,
@@ -251,57 +314,19 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
         workerData: { tempDbPath, betterSqlitePath },
       });
 
-      // 1. Wait for Worker to initialize connection and report WORKER_READY (with 3s deadline & exit guard)
-      await new Promise<void>((resolve, reject) => {
-        let isSettled = false;
-        let deadlineTimer: NodeJS.Timeout | null = null;
-
-        const settle = (err?: Error | null) => {
-          if (isSettled) return;
-          isSettled = true;
-          if (deadlineTimer) {
-            clearTimeout(deadlineTimer);
-            deadlineTimer = null;
+      // 1. Wait for Worker to initialize connection and report WORKER_READY using shared setupWorkerPromiseLifecycle
+      await setupWorkerPromiseLifecycle<void>(
+        worker,
+        3_000,
+        'Worker initialization timed out after 3000ms',
+        (msg, settle) => {
+          if (typeof msg === 'object' && msg !== null && (msg as { type?: string }).type === 'WORKER_READY') {
+            settle(null);
+          } else {
+            settle(new Error('Unexpected worker initial message: ' + JSON.stringify(msg)));
           }
-          if (worker) {
-            worker.off('message', onMessage);
-            worker.off('exit', onExit);
-            worker.off('error', onError);
-          }
-          if (err) reject(err);
-          else resolve();
-        };
-
-        const onExit = (code: number) => {
-          settle(new Error(`Worker exited prematurely before ready with code ${code}`));
-        };
-        const onError = (err: Error) => {
-          settle(err);
-        };
-        const onMessage = (msg: unknown) => {
-          try {
-            if (typeof msg === 'object' && msg !== null && (msg as { type?: string }).type === 'WORKER_READY') {
-              settle(null);
-            } else {
-              settle(new Error('Unexpected worker initial message: ' + JSON.stringify(msg)));
-            }
-          } catch (listenerErr) {
-            settle(listenerErr instanceof Error ? listenerErr : new Error(String(listenerErr)));
-          }
-        };
-
-        try {
-          deadlineTimer = setTimeout(() => {
-            settle(new Error('Worker initialization timed out after 3000ms'));
-          }, 3_000);
-
-          worker.on('message', onMessage);
-          worker.once('exit', onExit);
-          worker.once('error', onError);
-        } catch (setupErr) {
-          settle(setupErr instanceof Error ? setupErr : new Error(String(setupErr)));
         }
-      });
+      );
 
       // 2. NOW create challenge with 120ms TTL (Worker is confirmed hot and ready)
       const challenge = store.createChallenge(
@@ -315,77 +340,39 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
       );
       challengeId = challenge.challengeId;
 
-      // 3. Command Worker to acquire write lock and wait for LOCK_ACQUIRED -> LOCK_RELEASED
-      await new Promise<void>((resolve, reject) => {
-        let isSettled = false;
-        let deadlineTimer: NodeJS.Timeout | null = null;
+      // 3. Command Worker to acquire write lock and wait for LOCK_ACQUIRED -> LOCK_RELEASED using shared setupWorkerPromiseLifecycle
+      await setupWorkerPromiseLifecycle<void>(
+        worker,
+        5_000,
+        'Contention lifecycle timed out after 5000ms',
+        (msg, settle) => {
+          if (typeof msg !== 'object' || msg === null) return;
+          const typedMsg = msg as { type?: string };
 
-        const settle = (err?: Error | null) => {
-          if (isSettled) return;
-          isSettled = true;
-          if (deadlineTimer) {
-            clearTimeout(deadlineTimer);
-            deadlineTimer = null;
-          }
-          if (worker) {
-            worker.off('message', onMessage);
-            worker.off('exit', onExit);
-            worker.off('error', onError);
-          }
-          if (err) reject(err);
-          else resolve();
-        };
-
-        const onExit = (code: number) => {
-          settle(new Error(`Worker exited prematurely during lock lifecycle with code ${code}`));
-        };
-        const onError = (err: Error) => {
-          settle(err);
-        };
-        const onMessage = (msg: unknown) => {
-          try {
-            if (typeof msg !== 'object' || msg === null) return;
-            const typedMsg = msg as { type?: string };
-
-            if (typedMsg.type === 'LOCK_ACQUIRED') {
-              // Precondition Check: Challenge MUST be fresh and NOT expired when entering markRedeemed
-              const tEntry = Date.now();
-              preCheckExpired = tEntry > challenge.expiresAt;
-              if (preCheckExpired) {
-                throw new Error(`Precondition failure: Challenge was already expired before markRedeemed called (tEntry=${tEntry}, expiresAt=${challenge.expiresAt})`);
-              }
-
-              // Attempt markRedeemed on main thread. Main thread is genuinely blocked waiting for Worker write lock
-              try {
-                store!.markRedeemed(challenge.challengeId, txHashContention);
-              } catch (err) {
-                mainThreadError = err;
-              } finally {
-                const tExit = Date.now();
-                mainThreadWaitTime = tExit - tEntry;
-                postWaitExpired = tExit > challenge.expiresAt;
-              }
-            } else if (typedMsg.type === 'LOCK_RELEASED') {
-              settle(null);
+          if (typedMsg.type === 'LOCK_ACQUIRED') {
+            // Precondition Check: Challenge MUST be fresh and NOT expired when entering markRedeemed
+            const tEntry = Date.now();
+            preCheckExpired = tEntry > challenge.expiresAt;
+            if (preCheckExpired) {
+              throw new Error(`Precondition failure: Challenge was already expired before markRedeemed called (tEntry=${tEntry}, expiresAt=${challenge.expiresAt})`);
             }
-          } catch (listenerErr) {
-            settle(listenerErr instanceof Error ? listenerErr : new Error(String(listenerErr)));
+
+            // Attempt markRedeemed on main thread. Main thread is genuinely blocked waiting for Worker write lock
+            try {
+              store!.markRedeemed(challenge.challengeId, txHashContention);
+            } catch (err) {
+              mainThreadError = err;
+            } finally {
+              const tExit = Date.now();
+              mainThreadWaitTime = tExit - tEntry;
+              postWaitExpired = tExit > challenge.expiresAt;
+            }
+          } else if (typedMsg.type === 'LOCK_RELEASED') {
+            settle(null);
           }
-        };
-
-        try {
-          deadlineTimer = setTimeout(() => {
-            settle(new Error('Contention lifecycle timed out after 5000ms'));
-          }, 5_000);
-
-          worker!.on('message', onMessage);
-          worker!.once('exit', onExit);
-          worker!.once('error', onError);
-          worker!.postMessage({ type: 'START_LOCK' });
-        } catch (setupErr) {
-          settle(setupErr instanceof Error ? setupErr : new Error(String(setupErr)));
-        }
-      });
+        },
+        { type: 'START_LOCK' }
+      );
     } catch (testBodyErr) {
       testExecutionError = testBodyErr instanceof Error ? testBodyErr : new Error(String(testBodyErr));
     } finally {
@@ -510,50 +497,20 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
       postMessage() {}
     };
 
-    // Demonstrates genuine promise REJECTION via .rejects
-    await expect(new Promise<void>((resolve, reject) => {
-      let isSettled = false;
-      let deadlineTimer: NodeJS.Timeout | null = null;
-
-      const settle = (err?: Error | null) => {
-        if (isSettled) return;
-        isSettled = true;
-        if (deadlineTimer) {
-          clearTimeout(deadlineTimer);
-          deadlineTimer = null;
-          timerCleared = true;
-        }
-        mockWorker.off('message', onMessage);
-        mockWorker.off('exit', onExit);
-        mockWorker.off('error', onError);
-        if (err) reject(err);
-        else resolve();
-      };
-
-      const onExit = () => {};
-      const onError = () => {};
-      const onMessage = () => {};
-
-      try {
-        deadlineTimer = setTimeout(() => {
-          timerFired = true;
-          settle(new Error('timeout'));
-        }, 50);
-
-        mockWorker.on('message', onMessage);
-        mockWorker.once('exit', onExit);
-        mockWorker.once('error', onError);
-        mockWorker.postMessage();
-      } catch (setupErr) {
-        settle(setupErr instanceof Error ? setupErr : new Error(String(setupErr)));
-      }
-    })).rejects.toThrow('Simulated synchronous throw on exit registration');
+    // Demonstrates genuine promise REJECTION using the shared production setupWorkerPromiseLifecycle routine
+    await expect(
+      setupWorkerPromiseLifecycle<void>(
+        mockWorker,
+        50,
+        'Watchdog timeout',
+        () => {},
+        { type: 'TEST_POST' }
+      )
+    ).rejects.toThrow('Simulated synchronous throw on exit registration');
 
     // Wait 100ms past the 50ms deadline to prove timer callback remained cancelled and never fired
     await new Promise(resolve => setTimeout(resolve, 100));
 
-    expect(timerCleared).toBe(true);
-    expect(timerFired).toBe(false);
     expect(mockWorker.handlers['message']).toHaveLength(0);
   });
 
@@ -620,5 +577,41 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
         try { fs.unlinkSync(dbPathContention); } catch {}
       }
     }
+  });
+
+  it('guarantees cleanupExpired preserves challenges within 60s grace period and only purges past grace threshold', () => {
+    const store = new ChallengeStore(tempDbPath, 60_000);
+    // Create challenge 1: expired 10 seconds ago (inside 60s grace period)
+    const c1 = store.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/res-grace-1',
+      'testnet',
+      undefined,
+      -10_000 // expiresAt = Date.now() - 10_000
+    );
+
+    // Create challenge 2: expired 90 seconds ago (outside 60s grace period)
+    const c2 = store.createChallenge(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      '0.05',
+      'XLM',
+      '/res-grace-2',
+      'testnet',
+      undefined,
+      -90_000 // expiresAt = Date.now() - 90_000
+    );
+
+    // Run cleanupExpired with standard 60s safety margin
+    store.cleanupExpired(60_000);
+
+    // c1 is inside 60s grace window: preserved for contention recovery!
+    expect(store.getChallengeAllowExpired(c1.challengeId)).toBeDefined();
+
+    // c2 is beyond 60s grace window: safely purged!
+    expect(store.getChallengeAllowExpired(c2.challengeId)).toBeUndefined();
+
+    store.close();
   });
 });

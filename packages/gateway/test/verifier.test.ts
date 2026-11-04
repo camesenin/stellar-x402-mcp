@@ -920,36 +920,65 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
         'XLM',
         '/soroban-res',
         'testnet',
-        'CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVOGO',
+        'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
         60_000
       );
 
       const payerKp = Keypair.random();
       const cleanHash = 'soroban_contention_recovery_tx';
+      const expectedHash = Buffer.from('f'.repeat(64), 'hex');
 
-      // Mock Soroban computeCanonicalChallengeHash and getTransaction
-      vi.spyOn(verifier, 'computeCanonicalChallengeHash').mockResolvedValue(
-        Buffer.from('f'.repeat(64), 'hex')
-      );
+      const nonceBytes = Buffer.from(challenge.challengeId, 'hex');
 
-      // Mock querySorobanContractReceipt
-      vi.spyOn(verifier, 'querySorobanContractReceipt').mockResolvedValue({
-        payer: payerKp.publicKey(),
-        recipient: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-        token: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
-        amount: BigInt(500000),
-        timestamp: Math.floor(Date.now() / 1000),
-        challenge_hash: Buffer.from('f'.repeat(64), 'hex'),
-      });
+      // Mock Soroban computeCanonicalChallengeHash
+      vi.spyOn(verifier, 'computeCanonicalChallengeHash').mockResolvedValue(expectedHash);
 
-      // Mock fetchSorobanTxJsonRpc
+      // Mock genuine fetchSorobanTxJsonRpc with authentic envelope and operation
       vi.spyOn(verifier as any, 'fetchSorobanTxJsonRpc').mockResolvedValue({
         status: 'SUCCESS',
         latestLedger: 60000,
+        envelopeXdr: 'mock_base64_envelope',
       });
 
-      // Bypass raw envelope XDR parsing in this unit test
-      (verifier as any).pinnedVaultContractId = undefined;
+      // Mock genuine xdr.TransactionEnvelope.fromXDR matching production verifier logic
+      vi.spyOn(xdr.TransactionEnvelope, 'fromXDR').mockReturnValue({
+        switch: () => ({ name: 'envelopeTypeTx' }),
+        value: () => ({
+          tx: () => ({
+            operations: () => [{
+              body: () => ({
+                switch: () => ({ name: 'invokeHostFunction' }),
+                invokeHostFunctionOp: () => ({
+                  hostFunction: () => ({
+                    switch: () => ({ name: 'hostFunctionTypeInvokeContract' }),
+                    invokeContract: () => ({
+                      contractAddress: () => Address.fromString('CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO').toScAddress(),
+                      functionName: () => Buffer.from('settle_payment'),
+                      args: () => [
+                        new Address(payerKp.publicKey()).toScVal(),
+                        new Address('GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5').toScVal(),
+                        new Address('CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC').toScVal(),
+                        nativeToScVal(500_000n, { type: 'i128' }),
+                        xdr.ScVal.scvBytes(nonceBytes),
+                      ],
+                    }),
+                  }),
+                }),
+              }),
+            }],
+          }),
+        }),
+      } as any);
+
+      // Mock genuine querySorobanContractReceipt
+      vi.spyOn(verifier as any, 'querySorobanContractReceipt').mockResolvedValue({
+        payer: payerKp.publicKey(),
+        recipient: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        token: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+        amount: 500_000n,
+        timestamp: Math.floor(Date.now() / 1000),
+        challenge_hash: expectedHash,
+      });
 
       // Phase 1: Lock contention (markRedeemed throws SQLITE_BUSY)
       const sqliteBusyError = new Error('SQLITE_BUSY: database is locked');
@@ -958,61 +987,23 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
         throw sqliteBusyError;
       });
 
-      // Mock bypass of envelope requirement for unit test
-      const origVerify = (verifier as any).verifySorobanTransactionAndReceipt;
-      vi.spyOn(verifier as any, 'verifySorobanTransactionAndReceipt').mockImplementation(async (
-        txHash: string,
-        chal: any,
-        st: any,
-        auth: any,
-        grace: number
-      ) => {
-        try {
-          st.markRedeemed(chal.challengeId, txHash, {
-            payer: payerKp.publicKey(),
-            amount: chal.amount,
-            asset: chal.asset,
-            ledger: 60000,
-          }, grace);
-          return {
-            valid: true,
-            payer: payerKp.publicKey(),
-            amount: chal.amount,
-            asset: chal.asset,
-            ledger: 60000,
-            txHash,
-          };
-        } catch (redeemErr: any) {
-          if (redeemErr?.code === 'SQLITE_BUSY' || redeemErr?.message?.includes('SQLITE_BUSY')) {
-            return {
-              valid: false,
-              retriable: true,
-              statusCode: 503,
-              reason: `Database busy under writer contention: ${redeemErr.message}. Payment is verified on-chain and unconsumed; please retry verification.`,
-              txHash,
-            };
-          }
-          return {
-            valid: false,
-            reason: `Settlement aborted: ${redeemErr.message}`,
-            txHash,
-          };
-        }
-      });
-
+      // Execute production verifyPayment and verifySorobanTransactionAndReceipt without mocking the method!
       const busyResult = await verifier.verifyPayment(cleanHash, challenge, store);
+      if (!busyResult.retriable) {
+        console.error('DEBUG busyResult:', JSON.stringify(busyResult, null, 2));
+      }
       expect(busyResult.valid).toBe(false);
       expect(busyResult.retriable).toBe(true);
       expect(busyResult.statusCode).toBe(503);
+      expect(busyResult.reason).toContain('Database busy under writer contention');
 
-      // Phase 2: Lock released -> Success with same proof
+      // Phase 2: Lock released -> Success with same proof through production verifier
       markSpy.mockRestore();
       const recoveryResult = await verifier.verifyPayment(cleanHash, challenge, store);
       expect(recoveryResult.valid).toBe(true);
       expect(recoveryResult.payer).toBe(payerKp.publicKey());
 
       // Phase 3: Anti-replay rejection
-      (verifier as any).verifySorobanTransactionAndReceipt.mockRestore();
       const replayResult = await verifier.verifyPayment(cleanHash, challenge, store);
       expect(replayResult.valid).toBe(false);
       expect(replayResult.reason).toContain('Transaction hash has already been redeemed');

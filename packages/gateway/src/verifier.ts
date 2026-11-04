@@ -178,8 +178,9 @@ export class StellarPaymentVerifier {
       };
     }
 
-    // Strict Challenge Expiration Defense: reject if challenge is already expired before querying ledger (respecting allowGracePeriodMs)
-    if (Date.now() > challenge.expiresAt + allowGracePeriodMs) {
+    // Strict Challenge Expiration Defense: reject if challenge is already expired before querying ledger (respecting allowGracePeriodMs up to 60s)
+    const effectiveGrace = Math.min(Math.max(0, allowGracePeriodMs), 60_000);
+    if (Date.now() > challenge.expiresAt + effectiveGrace) {
       return {
         valid: false,
         reason: `Challenge '${challenge.challengeId}' has expired (expired at ${challenge.expiresAt}, current time ${Date.now()})`,
@@ -199,13 +200,13 @@ export class StellarPaymentVerifier {
       }
     }
 
-    // 2. Branch A: Soroban Contract Verification
-    if (challenge.contractId && this.sorobanServer) {
-      return this.verifySorobanTransactionAndReceipt(cleanHash, challenge, store, requesterAuth, allowGracePeriodMs);
-    }
+      // 2. Branch A: Soroban Contract Verification
+      if (challenge.contractId && this.sorobanServer) {
+        return this.verifySorobanTransactionAndReceipt(cleanHash, challenge, store, requesterAuth, effectiveGrace);
+      }
 
-    // 3. Branch B: Classic Horizon Payment Verification
-    return this.verifyHorizonPayment(cleanHash, challenge, store, requesterAuth, allowGracePeriodMs);
+      // 3. Branch B: Classic Horizon Payment Verification
+      return this.verifyHorizonPayment(cleanHash, challenge, store, requesterAuth, effectiveGrace);
   }
 
   /**
@@ -567,72 +568,79 @@ export class StellarPaymentVerifier {
   ): Promise<SorobanReceiptRecord | null> {
     if (!this.sorobanServer) return null;
 
-    try {
-      // Create 32-byte canonical challenge hash buffer
-      let hashBytes: Buffer;
-      if (Buffer.isBuffer(canonicalChallengeHash)) {
-        if (canonicalChallengeHash.length !== 32) return null;
-        hashBytes = canonicalChallengeHash;
-      } else if (typeof canonicalChallengeHash === 'string') {
-        if (!/^[0-9a-fA-F]{64}$/.test(canonicalChallengeHash)) {
-          return null;
-        }
-        hashBytes = Buffer.from(canonicalChallengeHash, 'hex');
-      } else {
+    // Create 32-byte canonical challenge hash buffer
+    let hashBytes: Buffer;
+    if (Buffer.isBuffer(canonicalChallengeHash)) {
+      if (canonicalChallengeHash.length !== 32) return null;
+      hashBytes = canonicalChallengeHash;
+    } else if (typeof canonicalChallengeHash === 'string') {
+      if (!/^[0-9a-fA-F]{64}$/.test(canonicalChallengeHash)) {
         return null;
       }
+      hashBytes = Buffer.from(canonicalChallengeHash, 'hex');
+    } else {
+      return null;
+    }
 
-      // Match Soroban contract enum DataKey::Receipt(BytesN<32>)
-      const keyScVal = xdr.ScVal.scvVec([
-        xdr.ScVal.scvSymbol('Receipt'),
-        xdr.ScVal.scvBytes(hashBytes),
-      ]);
+    // Match Soroban contract enum DataKey::Receipt(BytesN<32>)
+    const keyScVal = xdr.ScVal.scvVec([
+      xdr.ScVal.scvSymbol('Receipt'),
+      xdr.ScVal.scvBytes(hashBytes),
+    ]);
 
-      const data = await this.sorobanServer.getContractData(
+    let data: any;
+    try {
+      data = await this.sorobanServer.getContractData(
         contractId,
         keyScVal,
         rpc.Durability.Persistent
       );
-
-      if (!data || !data.val) {
-        return null;
+    } catch (rpcErr: any) {
+      // If error is genuine network/RPC timeout/5xx, rethrow as retriable RPC error instead of confusing with missing receipt
+      const msg = rpcErr instanceof Error ? rpcErr.message : String(rpcErr);
+      if (msg.includes('504') || msg.includes('503') || msg.includes('timeout') || msg.includes('ENOTFOUND') || msg.includes('ECONNREFUSED')) {
+        throw new Error(`Soroban RPC getContractData transient network failure: ${msg}`);
       }
+      // If key is not found / 404 on ledger, return null
+      return null;
+    }
 
-      const contractData = data.val.contractData();
-      let native: unknown;
-      try {
-        native = scValToNative(contractData.val());
-      } catch {
-        return null;
-      }
+    if (!data || !data.val) {
+      return null;
+    }
 
-      // Strict defensive schema validation of the deserialized receipt struct
-      if (!native || typeof native !== 'object') {
-        return null;
-      }
-
-      const rec = native as Record<string, unknown>;
-      if (
-        typeof rec.payer !== 'string' ||
-        typeof rec.recipient !== 'string' ||
-        typeof rec.token !== 'string' ||
-        rec.amount === undefined ||
-        rec.timestamp === undefined
-      ) {
-        return null;
-      }
-
-      return {
-        payer: rec.payer,
-        recipient: rec.recipient,
-        token: rec.token,
-        amount: rec.amount as bigint | number | string,
-        timestamp: rec.timestamp as number | bigint,
-        challenge_hash: hashBytes,
-      };
+    const contractData = data.val.contractData();
+    let native: unknown;
+    try {
+      native = scValToNative(contractData.val());
     } catch {
       return null;
     }
+
+    // Strict defensive schema validation of the deserialized receipt struct
+    if (!native || typeof native !== 'object') {
+      return null;
+    }
+
+    const rec = native as Record<string, unknown>;
+    if (
+      typeof rec.payer !== 'string' ||
+      typeof rec.recipient !== 'string' ||
+      typeof rec.token !== 'string' ||
+      rec.amount === undefined ||
+      rec.timestamp === undefined
+    ) {
+      return null;
+    }
+
+    return {
+      payer: rec.payer,
+      recipient: rec.recipient,
+      token: rec.token,
+      amount: rec.amount as bigint | number | string,
+      timestamp: rec.timestamp as number | bigint,
+      challenge_hash: hashBytes,
+    };
   }
 
   /**

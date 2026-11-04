@@ -67,13 +67,41 @@ export function createX402Fetch(config: ClientConfig) {
 
     let retryResponse = await fetch(input, retryInit);
 
-    // If server returned 503 (e.g. database busy under contention), retry verification with exponential backoff without double payment
+    // If server returned 503 verification error, retry verification with exponential backoff reusing the same receipt
     let retryAttempts = 0;
     while (retryResponse.status === 503 && retryAttempts < 3) {
+      // Clone response to check structured body if available
+      const clone503 = retryResponse.clone();
+      let isVerifiedRetriable = false;
+      try {
+        const body503 = await clone503.json() as any;
+        if (body503 && body503.retriable === true) {
+          isVerifiedRetriable = true;
+        }
+      } catch {
+        // Not JSON
+      }
+
+      if (!isVerifiedRetriable) {
+        break; // Do not retry generic 503 errors unrelated to payment verification
+      }
+
       retryAttempts++;
+      let waitMs = 500 * Math.pow(2, retryAttempts); // Exponential backoff: 1000ms, 2000ms, 4000ms
       const retryAfterHeader = retryResponse.headers.get('Retry-After');
-      const waitMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 500 * Math.pow(2, retryAttempts);
-      await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 2000)));
+      if (retryAfterHeader) {
+        const parsedSec = parseInt(retryAfterHeader, 10);
+        if (!isNaN(parsedSec) && parsedSec > 0) {
+          waitMs = Math.max(waitMs, parsedSec * 1000);
+        } else {
+          const parsedDate = Date.parse(retryAfterHeader);
+          if (!isNaN(parsedDate) && parsedDate > Date.now()) {
+            waitMs = Math.max(waitMs, parsedDate - Date.now());
+          }
+        }
+      }
+
+      await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 5000)));
       retryResponse = await fetch(input, retryInit);
     }
 

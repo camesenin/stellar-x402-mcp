@@ -199,6 +199,8 @@ export class ChallengeStore {
     allowGracePeriodMs: number = 0
   ): void {
     const cleanHash = txHash.toLowerCase();
+    // Cap grace period at strict security boundary of 60_000ms
+    const effectiveGraceMs = Math.min(Math.max(0, allowGracePeriodMs), 60_000);
 
     // Explicit IMMEDIATE transaction: acquires reserved write lock immediately preventing concurrent writers
     const transaction = this.db.transaction(() => {
@@ -214,7 +216,7 @@ export class ChallengeStore {
           AND is_redeemed = 0
           AND (expires_at + ?) >= ?
       `);
-      const updateResult = updateChallenge.run(challengeId, allowGracePeriodMs, currentRedemptionTime);
+      const updateResult = updateChallenge.run(challengeId, effectiveGraceMs, currentRedemptionTime);
       if (updateResult.changes === 0) {
         throw new Error(
           `Atomic redemption failed: Challenge '${challengeId}' not found, already redeemed, or expired.`
@@ -242,12 +244,12 @@ export class ChallengeStore {
     transaction.immediate();
   }
 
-  public cleanupExpired(): void {
-    const now = Date.now();
+  public cleanupExpired(graceSafetyMarginMs: number = 60_000): void {
+    const threshold = Date.now() - graceSafetyMarginMs;
     const stmt = this.db.prepare(`
       DELETE FROM challenges WHERE expires_at < ? AND is_redeemed = 0
     `);
-    stmt.run(now);
+    stmt.run(threshold);
   }
 
   public close(): void {
