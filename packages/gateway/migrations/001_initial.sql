@@ -128,12 +128,14 @@ BEGIN
     END IF;
 
     -- Case D: Early purge of standalone duplicate or incompatible indexes covering bound_tx_hash
-    -- A. Drop ANY standalone unique index covering bound_tx_hash in ANY position with indnullsnotdistinct = true,
-    --    UNLESS its predicate strictly and structurally guarantees that bound_tx_hash IS NOT NULL as a top-level positive conjunction:
-    --    - Rejects NULL predicates (unconditional unique nulls not distinct).
-    --    - Rejects disjunctions (OR) that could admit NULLs on other branches.
-    --    - Rejects negations and boolean wrappers (NOT, IS TRUE, IS FALSE, IS NOT TRUE, IS NOT FALSE, NULLIF, CASE, COALESCE).
-    --    - Strictly requires positive top-level term 'bound_tx_hash IS NOT NULL'.
+    -- A. Closed Whitelist Policy: Drop ANY standalone unique index covering bound_tx_hash in ANY position
+    --    with indnullsnotdistinct = true UNLESS its predicate matches a strictly closed and recognized
+    --    top-level positive conjunction format where bound_tx_hash IS NOT NULL:
+    --    - Predicate must NOT be NULL.
+    --    - Must strictly match either the exact standalone predicate `(bound_tx_hash IS NOT NULL)`
+    --      or a canonical top-level positive conjunction `((bound_tx_hash IS NOT NULL) AND ...)`.
+    --    - Any predicate with OR, boolean wrappers (IS TRUE/FALSE), equality comparison on booleans,
+    --      functions, or unrecognized syntax is conservatively treated as unsafe and purged!
     -- B. Drop redundant identical single-column btree text_ops index matching canonical definition,
     --    while strictly preserving valid partial indexes and specialized opclasses.
     FOR r IN (
@@ -153,12 +155,14 @@ BEGIN
             i.indisunique = true 
             AND i.indnullsnotdistinct = true
             AND (
-              i.indpred IS NULL 
-              OR pg_get_expr(i.indpred, i.indrelid) ~* '\s+OR\s+'
-              OR pg_get_expr(i.indpred, i.indrelid) ~* '\bNOT\b'
-              OR pg_get_expr(i.indpred, i.indrelid) ~* '\bIS\s+(NOT\s+)?(TRUE|FALSE)\b'
-              OR pg_get_expr(i.indpred, i.indrelid) ~* '\b(CASE|COALESCE|NULLIF)\b'
-              OR pg_get_expr(i.indpred, i.indrelid) !~* 'bound_tx_hash\s+IS\s+NOT\s+NULL'
+              i.indpred IS NULL
+              OR (
+                -- Closed Whitelist: ONLY exact standalone or top-level positive AND conjunctions without OR or boolean equality
+                pg_get_expr(i.indpred, i.indrelid) !~* '^\(?\s*\(?\s*bound_tx_hash\s+IS\s+NOT\s+NULL\s*\)?(\s+AND\s+[^=><]+(?:<>[^=><]+|!=[^=><]+|=?\s*'[^']*')?)?\s*\)?$'
+                OR pg_get_expr(i.indpred, i.indrelid) ~* '\s+OR\s+'
+                OR pg_get_expr(i.indpred, i.indrelid) ~* '\)\s*=\s*\('
+                OR pg_get_expr(i.indpred, i.indrelid) ~* 'IS\s+(NOT\s+)?(TRUE|FALSE)'
+              )
             )
           )
           OR

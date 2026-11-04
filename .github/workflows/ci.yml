@@ -310,6 +310,9 @@ jobs:
             -- 3b. Adversarial regression: boolean wrapper IS NOT TRUE admitting null hashes -> must be purged by Case D!
             CREATE UNIQUE INDEX idx_legacy_adversarial_is_not_true ON challenges (status, bound_tx_hash) NULLS NOT DISTINCT WHERE (((bound_tx_hash IS NOT NULL) IS NOT TRUE));
 
+            -- 3c. Adversarial regression: boolean equality admitting null hashes when both operands are false -> must be purged by Case D!
+            CREATE UNIQUE INDEX idx_legacy_adversarial_boolean_equality ON challenges (status, bound_tx_hash) NULLS NOT DISTINCT WHERE (((bound_tx_hash IS NOT NULL) = (status = 'PENDING')));
+
             -- 4. Protected partial index (MUST be preserved)
             CREATE INDEX idx_legacy_partial_bound ON challenges USING btree (bound_tx_hash) WHERE (status = 'PENDING');
 
@@ -491,6 +494,14 @@ jobs:
                 RAISE EXCEPTION '[%] Assertion failed: idx_legacy_adversarial_is_not_true was not purged by Case D', step_name;
               END IF;
 
+              -- 4c. idx_legacy_adversarial_boolean_equality MUST be purged by Case D
+              IF EXISTS (
+                SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relname = 'idx_legacy_adversarial_boolean_equality' AND n.nspname = current_schema()
+              ) THEN
+                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_adversarial_boolean_equality was not purged by Case D', step_name;
+              END IF;
+
               -- 5. idx_legacy_partial_bound MUST be preserved with exact predicate
               SELECT pg_get_expr(i.indpred, i.indrelid) INTO v_pred
               FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -524,9 +535,10 @@ jobs:
                 OR v_indisunique != true 
                 OR v_indnullsnotdistinct_p != true 
                 OR v_indisvalid != true 
+                OR v_indkey IS DISTINCT FROM '11' -- exactly column attnum 11 (bound_tx_hash)
               THEN
-                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_protected_partial_conjunctive compromised (pred=%, unique=%, nullsnotdistinct=%, valid=%)', 
-                  step_name, v_pred, v_indisunique, v_indnullsnotdistinct_p, v_indisvalid;
+                RAISE EXCEPTION '[%] Assertion failed: idx_legacy_protected_partial_conjunctive compromised (pred=%, unique=%, nullsnotdistinct=%, valid=%, indkey=%)', 
+                  step_name, v_pred, v_indisunique, v_indnullsnotdistinct_p, v_indisvalid, v_indkey;
               END IF;
 
               -- 7. idx_legacy_pattern_bound MUST be preserved with text_pattern_ops
