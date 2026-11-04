@@ -1,5 +1,7 @@
--- 001_initial.sql: PostgreSQL 16 Idempotent Migration for Distributed x402 Gateway
--- Preserves 100% of fields from ChallengeStore plus distributed lease & versioning attributes
+-- 001_initial.sql: PostgreSQL 16 Idempotent & Fully Transactional Migration
+-- Encompasses 100% of DDL operations in a single atomic transaction block
+
+BEGIN;
 
 CREATE TABLE IF NOT EXISTS challenges (
   id TEXT PRIMARY KEY,
@@ -60,18 +62,18 @@ UPDATE challenges SET version = 1 WHERE version IS NULL;
 ALTER TABLE IF EXISTS challenges ALTER COLUMN lease_generation SET NOT NULL;
 ALTER TABLE IF EXISTS challenges ALTER COLUMN version SET NOT NULL;
 
--- Type conversions and check constraint enforcement for existing installations
+-- Type conversions
 ALTER TABLE IF EXISTS challenges ALTER COLUMN amount_stroops TYPE NUMERIC(40, 0);
 ALTER TABLE IF EXISTS challenges ALTER COLUMN paid_amount_stroops TYPE NUMERIC(40, 0);
 
--- Evolutionary check constraints enforcement for existing installations
-BEGIN;
-
-DO $
+-- Evolutionary check constraints enforcement and structural validation
+DO $BODY$
 DECLARE
   r RECORD;
   status_attnum int2;
   bound_attnum int2;
+  rename_suffix int := 1;
+  target_rename text;
 BEGIN
   -- Obtain exact attribute numbers for structural validation
   SELECT attnum INTO status_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'status';
@@ -92,14 +94,22 @@ BEGIN
 
   -- 2. Structural handling of UNIQUE constraints covering bound_tx_hash
   -- Case A: Name collision where 'uq_challenges_bound_tx_hash' exists on different columns.
-  -- RENAME the existing constraint to preserve business invariants rather than dropping it!
+  -- RENAME the existing constraint dynamically with unique suffix to preserve business invariants rather than dropping it!
   IF EXISTS (
     SELECT 1 FROM pg_constraint
     WHERE conrelid = 'challenges'::regclass
+      AND contype = 'u'
       AND conname = 'uq_challenges_bound_tx_hash'
       AND conkey != ARRAY[bound_attnum]
   ) THEN
-    ALTER TABLE challenges RENAME CONSTRAINT uq_challenges_bound_tx_hash TO uq_challenges_legacy_composite_preserved;
+    LOOP
+      target_rename := 'uq_challenges_legacy_composite_' || rename_suffix::text;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = target_rename) THEN
+        EXECUTE format('ALTER TABLE challenges RENAME CONSTRAINT uq_challenges_bound_tx_hash TO %I', target_rename);
+        EXIT;
+      END IF;
+      rename_suffix := rename_suffix + 1;
+    END LOOP;
   END IF;
 
   -- Case B: Drop non-canonical single-column UNIQUE constraints strictly covering bound_tx_hash
@@ -125,7 +135,7 @@ BEGIN
     ALTER TABLE challenges ADD CONSTRAINT uq_challenges_bound_tx_hash UNIQUE (bound_tx_hash);
   END IF;
 
-  -- 3. Case D: Drop any redundant standalone indexes strictly on bound_tx_hash (leaving the constraint index)
+  -- 3. Case D: Drop any redundant standalone indexes strictly on bound_tx_hash (leaving constraint index)
   FOR r IN (
     SELECT idx.relname AS index_name
     FROM pg_index i
@@ -133,7 +143,8 @@ BEGIN
     JOIN pg_class tbl ON tbl.oid = i.indrelid
     LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
     WHERE tbl.oid = 'challenges'::regclass
-      AND i.indkey = ARRAY[bound_attnum]::int2vector
+      AND i.indnkeyatts = 1
+      AND i.indkey[0] = bound_attnum
       AND con.oid IS NULL -- Not backing a constraint
   ) LOOP
     EXECUTE format('DROP INDEX IF EXISTS %I', r.index_name);
@@ -142,7 +153,7 @@ BEGIN
   -- 4. Invariant checks structural definition validation
   -- Amount > 0
   IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_amount') THEN
-    IF pg_get_constraintdef((SELECT oid FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_amount')) !~ 'amount_stroops > 0' THEN
+    IF pg_get_constraintdef((SELECT oid FROM pg_constraint WHERE conrelid = 'challenges'::regclass AND conname = 'chk_challenge_amount')) !~ '^\s*CHECK\s*\(\s*\(?amount_stroops\s*>\s*0\)?\s*\)\s*$' THEN
       ALTER TABLE challenges DROP CONSTRAINT chk_challenge_amount;
       ALTER TABLE challenges ADD CONSTRAINT chk_challenge_amount CHECK (amount_stroops > 0);
     END IF;
@@ -194,18 +205,15 @@ BEGIN
     ALTER TABLE challenges ADD CONSTRAINT chk_challenge_version CHECK (version >= 1);
   END IF;
 END;
-$;
-
-COMMIT;
+$BODY$;
 
 CREATE INDEX IF NOT EXISTS idx_challenges_status ON challenges(status);
 CREATE INDEX IF NOT EXISTS idx_challenges_expires_at ON challenges(expires_at);
--- Note: bound_tx_hash already has an implicit unique b-tree index created by uq_challenges_bound_tx_hash / UNIQUE constraint.
--- Any redundant standalone index is dropped to optimize storage and write amplification:
-DROP INDEX IF EXISTS idx_challenges_bound_tx_hash;
 
 CREATE TABLE IF NOT EXISTS redeemed_transactions (
   tx_hash TEXT PRIMARY KEY,
   challenge_id TEXT NOT NULL REFERENCES challenges(id),
   redeemed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
+
+COMMIT;
