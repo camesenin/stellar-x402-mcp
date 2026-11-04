@@ -17,9 +17,10 @@ export class ChallengeStore {
 
   constructor(
     dbPath: string = 'x402_gateway.sqlite',
-    private defaultTtlMs: number = 300_000
+    private defaultTtlMs: number = 300_000,
+    busyTimeoutMs: number = 10_000
   ) {
-    this.db = new Database(dbPath);
+    this.db = new Database(dbPath, { timeout: busyTimeoutMs });
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = FULL');
     this.initSchema();
