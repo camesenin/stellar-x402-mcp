@@ -67,6 +67,7 @@ export class StellarPaidMcpClient {
       // Budget check & concurrent reservation
       const costXlm = parseFloat(challenge.amount);
       const reservationId = this.budget.reserve(costXlm);
+      const attemptStartSec = Math.floor(Date.now() / 1000);
 
       let receipt;
       try {
@@ -76,7 +77,7 @@ export class StellarPaidMcpClient {
       } catch (paymentErr: any) {
         const keepUntil = paymentErr?.maxTime ? paymentErr.maxTime : Date.now() + 75_000;
         const txHash = paymentErr?.txHash ?? undefined;
-        this.budget.release(reservationId, keepUntil, txHash, challenge.destination);
+        this.budget.release(reservationId, keepUntil, txHash, challenge.destination, attemptStartSec);
         throw paymentErr;
       }
 

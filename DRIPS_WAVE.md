@@ -2,7 +2,7 @@
 
 **Repository:** `camesenin/stellar-x402-mcp`  
 **Network Program:** Drips Stellar Wave / Stellar Community Fund  
-**Audit Baseline Commit:** 3de5c10 (3de5c1059083270713eb07d55a6394f9aff5fc65 on main)  
+**Audit Baseline Commit:** 0cd968c (0cd968c2d3e5c3f2d386ed22562d8e772769630d on main)  
 **QA Test Status:** 100% Green (55 Vitest automated test cases across packages + 8 Soroban Rust tests + simulated end-to-end agent MCP micropayment demo)  
 
 ---
@@ -134,14 +134,12 @@ The backlog features **10 standalone tasks** with zero prerequisites, and **6 de
 - **Target Files:** packages/gateway/src/stores/postgres.ts, packages/gateway/src/stores/types.ts, packages/gateway/src/verifier.ts, packages/gateway/src/middleware.ts, packages/client/src/payer.ts, packages/gateway/src/index.ts
 - **Prerequisites:** Issue 4
 - **Scope:**
-  1. **Asynchronous Interface Implementation:** Implement IChallengeStore against PostgreSQL 16 (pg connection pool) supporting all 11 core operations (createChallenge, getChallenge, bindSubmissionTx, markRedeemed, isChallengeRedeemed, isTxRedeemed, getPendingChallenges, updateChallengeStatus, acquireLease, 
-enewLease, 
-eleaseLease).
+  1. **Asynchronous Interface Implementation:** Implement IChallengeStore against PostgreSQL 16 (pg connection pool) supporting all 11 core operations (createChallenge, getChallenge, bindSubmissionTx, markRedeemed, isChallengeRedeemed, isTxRedeemed, getPendingChallenges, updateChallengeStatus, acquireLease, renewLease, releaseLease).
   2. **Verifier & Middleware Async Adaptation:** Upgrade StellarPaymentVerifier.verifyPayment and gateway middleware (middleware.ts) to fully await store operations (await store.isChallengeRedeemed(...), await store.isTxRedeemed(...), and const committed = await store.markRedeemed(...)). Reject redemptions with 500/503 and do NOT grant resource access if database commit fails or is fenced out.
-  3. **Temporal & Generational Fencing:** In markRedeemed and updateChallengeStatus, enforce atomic CAS in SQL: WHERE id =  AND (lease_generation IS NULL OR lease_generation = ) AND (lease_owner IS NULL OR lease_owner = ) AND (lease_expires_at IS NULL OR lease_expires_at > clock_timestamp()). Check 
-owCount === 1; abort and reject if 0 rows updated.
+  3. **Temporal & Generational Fencing:** In markRedeemed and updateChallengeStatus, enforce atomic CAS in SQL: WHERE id = $1 AND (lease_generation IS NULL OR lease_generation = $2) AND (lease_owner IS NULL OR lease_owner = $3) AND (lease_expires_at IS NULL OR lease_expires_at > clock_timestamp()). Check rowCount === 1; abort and reject if 0 rows updated.
   4. **Pre-Broadcast Binding Handshake Endpoint:** In packages/gateway/src/index.ts (route POST /x402/bind) and packages/client/src/payer.ts, compute transaction hash locally from signed envelope XDR before RPC dispatch, and invoke binding handshake to register (challengeId, bound_tx_hash, envelope_xdr, min_valid_ledger, max_valid_ledger). Gateway enforces immutable 1:1 binding to prevent transaction substitution or front-running across distributed reconcilers.
 - **Verification Command:** pnpm --filter @stellar-x402/gateway test && pnpm --filter @stellar-x402/client test
+
 #### Issue 8: SEP-0041 SAC Deterministic Address Resolution & Asset Typing
 - **Tier:** High (200 pts)
 - **Target File:** `packages/client/src/tokens/sac.ts`

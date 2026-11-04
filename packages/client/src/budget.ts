@@ -50,8 +50,8 @@ export function stroopsToXlmNumber(stroops: bigint): number {
 
 export interface TxStatusReport {
   status: 'SUCCESS' | 'FAILED' | 'NOT_FOUND' | 'PENDING';
-  latestLedgerCloseTime?: number; // epoch seconds
-  oldestLedgerCloseTime?: number; // epoch seconds
+  latestLedgerCloseTime?: number | string; // epoch seconds (numeric or RPC string)
+  oldestLedgerCloseTime?: number | string; // epoch seconds (numeric or RPC string)
   onChainReceiptExists?: boolean; // verified via persistent receipt storage lookup
 }
 
@@ -166,6 +166,7 @@ export class BudgetManager {
       id: reservationId,
       amountStroops: xlmToStroopsBigInt(amountXlm),
       reservedAt: this.clock(),
+      broadcastAtSec: Math.floor(this.clock() / 1000),
     });
 
     return reservationId;
@@ -174,7 +175,15 @@ export class BudgetManager {
   /**
    * Finalize reservation upon successful on-chain confirmation
    */
-    public finalize(reservationId: string, destination: string, txHash: string, amountXlmFallback?: number): void {
+      public finalize(reservationId: string, destination: string, txHash: string, amountXlmFallback?: number): void {
+    // Idempotency: If this exact txHash has already been finalized, no-op to prevent duplicate billing!
+    if (this.receipts.some(r => r.txHash === txHash)) {
+      if (this.reservations.has(reservationId)) {
+        this.reservations.delete(reservationId);
+      }
+      return;
+    }
+
     const res = this.reservations.get(reservationId);
     let amountStroops: bigint;
     if (res) {
@@ -212,7 +221,7 @@ export class BudgetManager {
 
     if (txHash) res.txHash = txHash;
     if (destination) res.destination = destination;
-    res.broadcastAtSec = broadcastAtSec ?? Math.floor(this.clock() / 1000);
+    res.broadcastAtSec = broadcastAtSec ?? res.broadcastAtSec ?? Math.floor(this.clock() / 1000);
 
     if (keepUntil !== undefined) {
       let targetEpochMs: number;
@@ -303,8 +312,16 @@ export class BudgetManager {
 
     if (typeof outcome === 'object') {
       status = outcome.status;
-      latestLedgerCloseTime = outcome.latestLedgerCloseTime;
-      oldestLedgerCloseTime = outcome.oldestLedgerCloseTime;
+      const parseEpochSec = (val: unknown): number | undefined => {
+        if (typeof val === 'number') return Number.isFinite(val) ? val : undefined;
+        if (typeof val === 'string') {
+          const parsed = Number(val.trim());
+          return Number.isFinite(parsed) ? parsed : undefined;
+        }
+        return undefined;
+      };
+      latestLedgerCloseTime = parseEpochSec(outcome.latestLedgerCloseTime);
+      oldestLedgerCloseTime = parseEpochSec(outcome.oldestLedgerCloseTime);
       onChainReceiptExists = outcome.onChainReceiptExists;
     } else {
       status = outcome;
@@ -366,9 +383,10 @@ export class BudgetManager {
         if (
           typeof oldestLedgerCloseTime !== 'number' ||
           !Number.isFinite(oldestLedgerCloseTime) ||
+          oldestLedgerCloseTime <= 0 ||
           oldestLedgerCloseTime > broadcastSec
         ) {
-          return; // RPC retention window pruned or missing: maintain quarantine
+          return; // RPC retention window pruned, zero, negative or missing: maintain quarantine
         }
       }
     }

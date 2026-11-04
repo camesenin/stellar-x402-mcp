@@ -139,7 +139,7 @@ describe('BudgetManager', () => {
     budget.resolveQuarantine(res2, {
       status: 'NOT_FOUND',
       latestLedgerCloseTime: Math.floor(mockTime / 1000) + 10,
-      oldestLedgerCloseTime: 0,
+      oldestLedgerCloseTime: 1,
     });
     expect(budget.getPendingReservedXlm()).toBe(0);
     // Spending total remains 0.6, res2 budget was freed without charge
@@ -164,7 +164,7 @@ describe('BudgetManager', () => {
     budget.resolveQuarantine(res, {
       status: 'NOT_FOUND',
       latestLedgerCloseTime: Math.floor(mockTime / 1000) + 10,
-      oldestLedgerCloseTime: 0,
+      oldestLedgerCloseTime: 1,
     });
     expect(budget.getPendingReservedXlm()).toBe(0);
   });
@@ -195,7 +195,7 @@ describe('BudgetManager', () => {
       return {
         status: 'NOT_FOUND' as const,
         latestLedgerCloseTime: Math.floor(mockTime / 1000) + 10,
-        oldestLedgerCloseTime: 0,
+        oldestLedgerCloseTime: 1,
       };
     };
 

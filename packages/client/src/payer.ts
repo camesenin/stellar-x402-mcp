@@ -291,7 +291,10 @@ export class StellarPayer {
       throw subErr;
     }
 
-    const txHash = sendRes.hash || localTxHash;
+    if (sendRes.hash && sendRes.hash.toLowerCase() !== localTxHash.toLowerCase()) {
+      throw new Error('RPC returned mismatched transaction hash');
+    }
+    const txHash = localTxHash;
 
     // Poll for ledger inclusion safely using standard JSON-RPC 2.0 (protocol-version agnostic)
     let status: string = sendRes.status;
@@ -391,8 +394,12 @@ export class StellarPayer {
       throw wrappedErr;
     }
 
+    if (result.hash && result.hash.toLowerCase() !== localTxHash.toLowerCase()) {
+      throw new Error('Horizon returned mismatched transaction hash');
+    }
+
     return {
-      txHash: result.hash,
+      txHash: localTxHash,
       challengeId: challenge.challengeId,
       destination: challenge.destination,
       amount: challenge.amount,
