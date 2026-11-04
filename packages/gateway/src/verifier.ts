@@ -616,8 +616,8 @@ export class StellarPaymentVerifier {
         };
       }
 
-      // Verify Operations
-      const ops = await tx.operations();
+      // Verify Operations (with full pagination across all pages)
+      let opsPage = await tx.operations();
       let payerAddress = tx.source_account;
       let matchedAsset = '';
 
@@ -625,34 +625,48 @@ export class StellarPaymentVerifier {
       const expectedStroops = amountToStroops(challenge.amount);
       let paidStroops = 0n;
 
-      for (const op of ops.records as unknown as StellarOpRecord[]) {
-        if (op.type === 'payment') {
-          const isNative =
-            challenge.asset.toUpperCase() === 'XLM' ||
-            challenge.asset.toUpperCase() === 'NATIVE';
-          const opIsNative = op.asset_type === 'native';
+      while (opsPage && opsPage.records) {
+        for (const op of opsPage.records as unknown as StellarOpRecord[]) {
+          if (op.type === 'payment') {
+            const isNative =
+              challenge.asset.toUpperCase() === 'XLM' ||
+              challenge.asset.toUpperCase() === 'NATIVE';
+            const opIsNative = op.asset_type === 'native';
 
-          if (op.to === challenge.destination) {
-            if (isNative && opIsNative) {
-              paidStroops += amountToStroops(op.amount || '0');
-              matchedAsset = 'XLM';
-            } else if (!isNative && !opIsNative) {
-              const fullAsset = `${op.asset_code}:${op.asset_issuer}`;
-              if (fullAsset === challenge.asset) {
+            if (op.to === challenge.destination) {
+              if (isNative && opIsNative) {
                 paidStroops += amountToStroops(op.amount || '0');
-                matchedAsset = fullAsset;
+                matchedAsset = 'XLM';
+              } else if (!isNative && !opIsNative) {
+                const fullAsset = `${op.asset_code}:${op.asset_issuer}`;
+                if (fullAsset === challenge.asset) {
+                  paidStroops += amountToStroops(op.amount || '0');
+                  matchedAsset = fullAsset;
+                }
               }
             }
+          } else if (op.type === 'create_account') {
+            // create_account in Stellar is strictly native XLM
+            const isNative =
+              challenge.asset.toUpperCase() === 'XLM' ||
+              challenge.asset.toUpperCase() === 'NATIVE';
+            if (isNative && op.account === challenge.destination) {
+              paidStroops += amountToStroops(op.starting_balance || '0');
+              matchedAsset = 'XLM';
+            }
           }
-        } else if (op.type === 'create_account') {
-          // create_account in Stellar is strictly native XLM
-          const isNative =
-            challenge.asset.toUpperCase() === 'XLM' ||
-            challenge.asset.toUpperCase() === 'NATIVE';
-          if (isNative && op.account === challenge.destination) {
-            paidStroops += amountToStroops(op.starting_balance || '0');
-            matchedAsset = 'XLM';
+        }
+
+        // Fetch next page of operations if present
+        if (typeof opsPage.next === 'function' && opsPage.records.length > 0) {
+          const nextPage = await opsPage.next();
+          if (nextPage && nextPage.records && nextPage.records.length > 0) {
+            opsPage = nextPage;
+          } else {
+            break;
           }
+        } else {
+          break;
         }
       }
 

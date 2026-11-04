@@ -25,6 +25,8 @@ export interface IChallengeStore {
       amount?: string;
       asset?: string;
       ledger?: number;
+      leaseGeneration?: number;
+      leaseOwner?: string;
     }
   ): Promise<boolean>;
 

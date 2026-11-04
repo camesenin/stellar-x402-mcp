@@ -134,7 +134,7 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 - **Tier:** High (200 pts)
 - **Target File:** `packages/gateway/src/stores/postgres.ts`, `packages/gateway/src/stores/types.ts`
 - **Prerequisites:** Issue 4
-- **Scope:** Implement the asynchronous `IChallengeStore` interface (`createChallenge`, `getChallenge`, `markRedeemed`, `isChallengeRedeemed`, `isTxRedeemed`, `acquireLease`, `renewLease`, `releaseLease` defined in `packages/gateway/src/stores/types.ts`) against PostgreSQL with `clock_timestamp()` fencing tokens and monotonic `lease_generation` conditional updates.
+- **Scope:** Implement the asynchronous `IChallengeStore` interface (`createChallenge`, `getChallenge`, `markRedeemed`, `isChallengeRedeemed`, `isTxRedeemed`, `acquireLease`, `renewLease`, `releaseLease` defined in `packages/gateway/src/stores/types.ts`) against PostgreSQL. Enforce `markRedeemed` fencing: mutations must verify `lease_generation = expectedGeneration` and `lease_owner = workerId` within the SQL transaction. Adapt gateway consumers (`verifier.ts`, `middleware.ts`, `mcp-server.ts`) to await store calls.
 - **Verification Command:** `pnpm --filter @stellar-x402/gateway test`
 
 #### Issue 8: SEP-0041 SAC Deterministic Address Resolution & Asset Typing
@@ -185,10 +185,10 @@ The backlog features **11 standalone tasks** with zero prerequisites, and **5 de
 
 #### Issue 12: Decoupled `beneficiary: Address` in ReceiptVault
 - **Tier:** High (200 pts)
-- **Target Files:** `packages/contracts/src/lib.rs`, `packages/client/src/payer.ts`
+- **Target Files:** `packages/contracts/src/lib.rs`, `packages/client/src/payer.ts`, `packages/gateway/src/verifier.ts`
 - **Prerequisites:** Issue 5
-- **Scope:** Decouple `payer` (who authorizes the transfer) from `beneficiary` (the agent receiving the resource access), allowing smart contracts (`C...`) to pay on behalf of agents. Extends Soroban contract signature and updates client payer bindings.
-- **Verification Command:** `cargo test --manifest-path packages/contracts/Cargo.toml`
+- **Scope:** Decouple `payer` (who authorizes the transfer) from `beneficiary` (the agent receiving resource access), allowing smart contracts (`C...`) to pay on behalf of agents. Updates Soroban contract signature and canonical hash calculation, client payer bindings, and gateway verification logic (mapping challenge beneficiary to agent identity).
+- **Verification Command:** `cargo test --manifest-path packages/contracts/Cargo.toml && pnpm --filter @stellar-x402/gateway test`
 
 #### Issue 13: Asynchronous Reconciliation Worker for Interrupted Challenges
 - **Tier:** High (200 pts)
