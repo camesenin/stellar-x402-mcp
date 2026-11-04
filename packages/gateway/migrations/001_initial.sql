@@ -22,12 +22,15 @@ CREATE TABLE IF NOT EXISTS challenges (
   paid_amount_stroops NUMERIC(38, 0) CHECK (paid_amount_stroops IS NULL OR paid_amount_stroops >= amount_stroops),
   redeemed_ledger BIGINT CHECK (redeemed_ledger IS NULL OR redeemed_ledger >= 0),
   min_valid_ledger BIGINT CHECK (min_valid_ledger IS NULL OR min_valid_ledger >= 0),
-  max_valid_ledger BIGINT CHECK (max_valid_ledger IS NULL OR (min_valid_ledger IS NULL OR max_valid_ledger >= min_valid_ledger)),
+  max_valid_ledger BIGINT CHECK (max_valid_ledger IS NULL OR (max_valid_ledger >= 0 AND (min_valid_ledger IS NULL OR max_valid_ledger >= min_valid_ledger))),
   lease_owner TEXT,
   lease_expires_at TIMESTAMPTZ,
   lease_generation BIGINT NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
   version BIGINT NOT NULL DEFAULT 1 CHECK (version >= 1),
-  CONSTRAINT chk_challenge_expiry CHECK (expires_at >= created_at)
+  CONSTRAINT chk_challenge_expiry CHECK (expires_at >= created_at),
+  CONSTRAINT chk_redeemed_consistency CHECK (
+    (status != 'REDEEMED') OR (bound_tx_hash IS NOT NULL AND paid_amount_stroops IS NOT NULL AND redeemed_at IS NOT NULL)
+  )
 );
 
 CREATE INDEX IF NOT EXISTS idx_challenges_status ON challenges(status);

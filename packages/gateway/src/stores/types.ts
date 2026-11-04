@@ -15,6 +15,7 @@ export interface StoredChallengeRecord extends X402Challenge {
   createdLedger?: number;
   minValidLedger?: number;
   maxValidLedger?: number;
+  envelopeXdr?: string;
   leaseOwner?: string;
   leaseExpiresAt?: Date;
   leaseGeneration: number;
@@ -50,6 +51,7 @@ export interface IChallengeStore {
     bounds: {
       minValidLedger?: number;
       maxValidLedger?: number;
+      envelopeXdr?: string;
     }
   ): Promise<boolean>;
 
