@@ -2,7 +2,7 @@
 
 **Repository:** `camesenin/stellar-x402-mcp`  
 **Network Program:** Drips Stellar Wave / Stellar Community Fund  
-**Audit Baseline Commit:** ddde94e (aligned on main, tracking all schema constraints and store contracts)  
+**Audit Baseline Reference:** Tracking origin/main (latest HEAD commit, fully clean working tree)  
 **QA Test Status:** 100% Green (55 Vitest automated test cases across packages + 8 Soroban Rust tests + simulated end-to-end agent MCP micropayment demo)  
 
 ---
