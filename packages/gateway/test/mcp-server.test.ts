@@ -503,5 +503,112 @@ describe('StellarPaidMcpServer tools/call interception, binding, and transport',
       await mcpClient.close();
       await server.getRawServer().close();
     });
+    it('executes real MCP wire protocol with requireRequesterAuth enabled and authentic Stellar verification', async () => {
+      const { server, store, verifier, tool1Handler } = setupServer({
+        requireRequesterAuth: true,
+      });
+
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const mcpClient = new Client(
+        { name: 'authenticated-wire-agent', version: '1.0.0' },
+        { capabilities: {} }
+      );
+
+      await server.getRawServer().connect(serverTransport);
+      await mcpClient.connect(clientTransport);
+
+      // 1. Initial tool call without payment -> intercepts with challenge
+      let unpaidErr: unknown = null;
+      try {
+        await mcpClient.callTool({
+          name: 'tool_one',
+          arguments: { q: 'authenticated query' },
+        });
+      } catch (err) {
+        unpaidErr = err;
+      }
+
+      expect(unpaidErr).toBeDefined();
+      const errMsg = (unpaidErr as Error).message;
+      const parsedChallenge = JSON.parse(errMsg.slice(errMsg.indexOf('{')));
+      const challengeId = parsedChallenge.x402_challenge.challenge_id;
+      const expiresAt = parsedChallenge.x402_challenge.expires_at;
+
+      // 2. Setup real payer keypair and authentic Horizon mock for verifyPayment
+      const payerKp = Keypair.random();
+      const wireTxHash = 'f'.repeat(64);
+      const mockHorizonTx = {
+        id: wireTxHash,
+        successful: true,
+        source_account: payerKp.publicKey(),
+        memo: parsedChallenge.x402_challenge.memo,
+        ledger_attr: 70001,
+        operations: async () => ({
+          records: [
+            {
+              type: 'payment',
+              to: dummyDest,
+              source_account: payerKp.publicKey(),
+              amount: '0.01',
+              asset_type: 'native',
+            },
+          ],
+          next: async () => ({ records: [] }),
+        }),
+      };
+
+      // Mock ONLY external Horizon endpoint; StellarPaymentVerifier logic and crypto verification remain 100% UNTOUCHED!
+      vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+        transaction: () => ({
+          call: async () => mockHorizonTx,
+        }),
+      } as any);
+
+      // 3. Compute authentic domain signature
+      const gatewayResource = 'mcp://tool_one';
+      const cleanHash = wireTxHash.toLowerCase();
+      const domainMsg = `stellar-x402:v1:${verifier.getNetworkPassphrase()}:${gatewayResource}:${challengeId}:${cleanHash}:${expiresAt}`;
+      const validSignature = payerKp.sign(Buffer.from(domainMsg, 'utf-8')).toString('base64');
+
+      // 4. First execution with valid payment and valid signature -> SUCCESS
+      const firstCallRes = (await mcpClient.callTool({
+        name: 'tool_one',
+        arguments: {
+          q: 'authenticated query',
+          _x402_tx_hash: wireTxHash,
+          _x402_challenge_id: challengeId,
+          _x402_payer_signature: validSignature,
+        },
+      })) as { content: Array<{ type: string; text: string }> };
+
+      expect(firstCallRes.content[0].type).toBe('text');
+      expect(JSON.parse(firstCallRes.content[0].text)).toEqual({ success: true, tool: 1 });
+      expect(tool1Handler).toHaveBeenCalledTimes(1);
+      expect(store.isTxRedeemed(wireTxHash)).toBe(true);
+      expect(store.getChallenge(challengeId)).toBeUndefined(); // Challenge consumed!
+
+      // 5. Replay attempt using same settled txHash and challengeId -> REJECTED (anti-replay)
+      let replayErr: unknown = null;
+      try {
+        await mcpClient.callTool({
+          name: 'tool_one',
+          arguments: {
+            q: 'replay attack',
+            _x402_tx_hash: wireTxHash,
+            _x402_challenge_id: challengeId,
+            _x402_payer_signature: validSignature,
+          },
+        });
+      } catch (err) {
+        replayErr = err;
+      }
+
+      expect(replayErr).toBeDefined();
+      expect((replayErr as Error).message).toContain('Invalid or expired x402 challenge ID');
+      expect(tool1Handler).toHaveBeenCalledTimes(1); // Handler was NOT invoked a second time
+
+      await mcpClient.close();
+      await server.getRawServer().close();
+    });
   });
 });

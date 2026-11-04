@@ -16,6 +16,9 @@ import { ChallengeStore } from './challenge-store.js';
 interface StellarOpRecord {
   type: string;
   to?: string;
+  from?: string;
+  source_account?: string;
+  funder?: string;
   amount?: string;
   asset_type?: string;
   asset_code?: string;
@@ -619,7 +622,7 @@ export class StellarPaymentVerifier {
 
       // Verify Operations (with full pagination across all pages)
       let opsPage = await tx.operations();
-      let payerAddress = tx.source_account;
+      const contributingPayers = new Set<string>();
       let matchedAsset = '';
 
       // Strict integer stroop parsing using canonical amountToStroops (1 XLM/unit = 10,000,000 stroops)
@@ -638,11 +641,15 @@ export class StellarPaymentVerifier {
               if (isNative && opIsNative) {
                 paidStroops += amountToStroops(op.amount || '0');
                 matchedAsset = 'XLM';
+                const effectivePayer = op.source_account || op.from || tx.source_account;
+                contributingPayers.add(effectivePayer);
               } else if (!isNative && !opIsNative) {
                 const fullAsset = `${op.asset_code}:${op.asset_issuer}`;
                 if (fullAsset === challenge.asset) {
                   paidStroops += amountToStroops(op.amount || '0');
                   matchedAsset = fullAsset;
+                  const effectivePayer = op.source_account || op.from || tx.source_account;
+                  contributingPayers.add(effectivePayer);
                 }
               }
             }
@@ -654,6 +661,8 @@ export class StellarPaymentVerifier {
             if (isNative && op.account === challenge.destination) {
               paidStroops += amountToStroops(op.starting_balance || '0');
               matchedAsset = 'XLM';
+              const effectivePayer = op.source_account || op.funder || tx.source_account;
+              contributingPayers.add(effectivePayer);
             }
           }
         }
@@ -681,6 +690,17 @@ export class StellarPaymentVerifier {
           txHash: cleanHash,
         };
       }
+
+      // Disallow multi-payer ambiguity: payment operations must originate from exactly one effective payer account
+      if (contributingPayers.size !== 1) {
+        return {
+          valid: false,
+          reason: `Payment rejected: multiple or ambiguous operation payers detected (${contributingPayers.size} payers). Expected single accountable payer.`,
+          txHash: cleanHash,
+        };
+      }
+
+      const payerAddress = Array.from(contributingPayers)[0];
 
       // Requester Binding Defense: If signature proof is present, ensure caller owns payer keypair
       if (requesterAuth) {

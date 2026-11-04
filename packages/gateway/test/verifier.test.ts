@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { xdr, Address, nativeToScVal } from '@stellar/stellar-sdk';
+import { xdr, Address, nativeToScVal, Keypair } from '@stellar/stellar-sdk';
 import { StellarPaymentVerifier, amountToStroops, stroopsToDecimalString } from '../src/verifier.js';
 import { ChallengeStore } from '../src/challenge-store.js';
 import { X402Challenge } from '../src/types.js';
@@ -412,5 +412,196 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
     expect(result.retriable).toBe(true);
     expect(result.statusCode).toBe(503);
     expect(result.reason).toContain('Temporary Soroban RPC simulation failure');
+  });
+
+  describe('Adversarial Requester Authentication & Operation Payer Attribution (Conditions 1, 2, 3)', () => {
+    it('correctly attributes payment to operation source_account (Account B) when tx source is Account A', async () => {
+      const challenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/resource'
+      );
+
+      const txSourceKp = Keypair.random(); // Account A (sponsor/relayer)
+      const opPayerKp = Keypair.random();  // Account B (actual spender)
+
+      const mockTx = {
+        id: 'ab_tx_hash',
+        successful: true,
+        source_account: txSourceKp.publicKey(),
+        memo: challenge.memo,
+        ledger_attr: 50001,
+        operations: async () => ({
+          records: [
+            {
+              type: 'payment',
+              to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+              from: opPayerKp.publicKey(),
+              source_account: opPayerKp.publicKey(),
+              amount: '0.05',
+              asset_type: 'native',
+            },
+          ],
+          next: async () => ({ records: [] }),
+        }),
+      };
+
+      vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+        transaction: () => ({
+          call: async () => mockTx,
+        }),
+      } as any);
+
+      const cleanHash = 'ab_tx_hash';
+      const domainMessage = `stellar-x402:v1:${verifier.getNetworkPassphrase()}:/resource:${challenge.challengeId}:${cleanHash}:${challenge.expiresAt}`;
+
+      // Case 1: Transaction source A attempts to sign -> REJECTED (anti-substitution / anti-attribution spoofing)
+      const sigFromA = txSourceKp.sign(Buffer.from(domainMessage, 'utf-8')).toString('base64');
+      const resultA = await verifier.verifyPayment(cleanHash, challenge, store, {
+        message: domainMessage,
+        signatureBase64: sigFromA,
+      });
+      expect(resultA.valid).toBe(false);
+      expect(resultA.reason).toContain('Requester authentication failed');
+      expect(store.isTxRedeemed(cleanHash)).toBe(false);
+
+      // Case 2: Actual operation payer B signs -> APPROVED
+      const sigFromB = opPayerKp.sign(Buffer.from(domainMessage, 'utf-8')).toString('base64');
+      const resultB = await verifier.verifyPayment(cleanHash, challenge, store, {
+        message: domainMessage,
+        signatureBase64: sigFromB,
+      });
+      expect(resultB.valid).toBe(true);
+      expect(resultB.payer).toBe(opPayerKp.publicKey());
+      expect(store.isTxRedeemed(cleanHash)).toBe(true);
+    });
+
+    it('rejects Horizon payment when contributing operations originate from multiple ambiguous payers', async () => {
+      const challenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.10',
+        'XLM',
+        '/resource'
+      );
+
+      const payer1Kp = Keypair.random();
+      const payer2Kp = Keypair.random();
+
+      const mockMultiTx = {
+        id: 'multi_payer_tx',
+        successful: true,
+        source_account: payer1Kp.publicKey(),
+        memo: challenge.memo,
+        ledger_attr: 50002,
+        operations: async () => ({
+          records: [
+            {
+              type: 'payment',
+              to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+              source_account: payer1Kp.publicKey(),
+              amount: '0.05',
+              asset_type: 'native',
+            },
+            {
+              type: 'payment',
+              to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+              source_account: payer2Kp.publicKey(),
+              amount: '0.05',
+              asset_type: 'native',
+            },
+          ],
+          next: async () => ({ records: [] }),
+        }),
+      };
+
+      vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+        transaction: () => ({
+          call: async () => mockMultiTx,
+        }),
+      } as any);
+
+      const result = await verifier.verifyPayment('multi_payer_tx', challenge, store);
+      expect(result.valid).toBe(false);
+      expect(result.reason).toContain('multiple or ambiguous operation payers detected (2 payers)');
+      expect(store.isTxRedeemed('multi_payer_tx')).toBe(false);
+    });
+
+    it('rigorously validates signature tampering, wrong key, and message component mutations', async () => {
+      const challenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/resource'
+      );
+
+      const payerKp = Keypair.random();
+      const attackerKp = Keypair.random();
+
+      const mockTx = {
+        id: 'tamper_tx_hash',
+        successful: true,
+        source_account: payerKp.publicKey(),
+        memo: challenge.memo,
+        ledger_attr: 50003,
+        operations: async () => ({
+          records: [
+            {
+              type: 'payment',
+              to: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+              source_account: payerKp.publicKey(),
+              amount: '0.05',
+              asset_type: 'native',
+            },
+          ],
+          next: async () => ({ records: [] }),
+        }),
+      };
+
+      vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+        transaction: () => ({
+          call: async () => mockTx,
+        }),
+      } as any);
+
+      const cleanHash = 'tamper_tx_hash';
+      const correctMessage = `stellar-x402:v1:${verifier.getNetworkPassphrase()}:/resource:${challenge.challengeId}:${cleanHash}:${challenge.expiresAt}`;
+
+      // 1. Signature signed by completely wrong keypair
+      const wrongKeySig = attackerKp.sign(Buffer.from(correctMessage, 'utf-8')).toString('base64');
+      const resWrongKey = await verifier.verifyPayment(cleanHash, challenge, store, {
+        message: correctMessage,
+        signatureBase64: wrongKeySig,
+      });
+      expect(resWrongKey.valid).toBe(false);
+      expect(resWrongKey.reason).toContain('Requester authentication failed');
+
+      // 2. Malformed base64 signature
+      const resMalformed = await verifier.verifyPayment(cleanHash, challenge, store, {
+        message: correctMessage,
+        signatureBase64: 'not_valid_base64!!!',
+      });
+      expect(resMalformed.valid).toBe(false);
+
+      // 3. Mismatched domain message presentation (agent signs msgA for /resource, presents msgB for /different_resource)
+      const validSig = payerKp.sign(Buffer.from(correctMessage, 'utf-8')).toString('base64');
+      const alteredMessage = `stellar-x402:v1:${verifier.getNetworkPassphrase()}:/different_resource:${challenge.challengeId}:${cleanHash}:${challenge.expiresAt}`;
+      const resAlteredMsg = await verifier.verifyPayment(cleanHash, challenge, store, {
+        message: alteredMessage,
+        signatureBase64: validSig,
+      });
+      expect(resAlteredMsg.valid).toBe(false);
+      expect(resAlteredMsg.reason).toContain('Requester authentication failed');
+      expect(store.isTxRedeemed(cleanHash)).toBe(false);
+
+      // 4. Valid authentic signature successfully settles payment and marks redeemed in store
+      const resValid = await verifier.verifyPayment(cleanHash, challenge, store, {
+        message: correctMessage,
+        signatureBase64: validSig,
+      });
+      expect(resValid.valid).toBe(true);
+      expect(resValid.payer).toBe(payerKp.publicKey());
+      expect(store.isTxRedeemed(cleanHash)).toBe(true);
+    });
   });
 });
