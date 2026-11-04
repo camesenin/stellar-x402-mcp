@@ -79,8 +79,9 @@ BEGIN
   SELECT attnum INTO status_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'status';
   SELECT attnum INTO bound_attnum FROM pg_attribute WHERE attrelid = 'challenges'::regclass AND attname = 'bound_tx_hash';
 
-  -- 1. Structural purge of legacy single-column CHECK constraints strictly covering ONLY 'status'
-  -- Checks with array_length(conkey, 1) = 1 on status_attnum. Any composite/multi-column check is strictly preserved!
+  -- 1. Structural purge of legacy CHECK constraints covering 'status'
+  -- Unconditionally drops any constraint named 'chk_challenge_status' (even if CHECK (TRUE)) plus any legacy single-column check on status_attnum
+  ALTER TABLE challenges DROP CONSTRAINT IF EXISTS chk_challenge_status;
   FOR r IN (
     SELECT con.conname
     FROM pg_constraint con
@@ -134,6 +135,7 @@ BEGIN
   END LOOP;
 
   -- Case C: Ensure canonical uq_challenges_bound_tx_hash exists covering exactly bound_tx_hash
+  -- If another relation in the schema already occupies the canonical name, abort with explicit actionable diagnostic
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint
     WHERE conrelid = 'challenges'::regclass
@@ -141,16 +143,24 @@ BEGIN
       AND conname = 'uq_challenges_bound_tx_hash'
       AND conkey = ARRAY[bound_attnum]
   ) THEN
+    IF EXISTS (
+      SELECT 1 FROM pg_class
+      WHERE relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'challenges'::regclass)
+        AND relname = 'uq_challenges_bound_tx_hash'
+    ) THEN
+      RAISE EXCEPTION 'Schema namespace collision: uq_challenges_bound_tx_hash is already occupied by a foreign relation or index in schema';
+    END IF;
     ALTER TABLE challenges ADD CONSTRAINT uq_challenges_bound_tx_hash UNIQUE (bound_tx_hash);
   END IF;
 
-  -- 3. Case D: Drop only redundant standalone indexes strictly on bound_tx_hash alone (no INCLUDE, no predicate, b-tree)
+  -- 3. Case D: Drop only proven identically redundant standalone indexes on bound_tx_hash (default opclass text_ops, default collation, no INCLUDE, no predicate)
   FOR r IN (
     SELECT idx.relname AS index_name
     FROM pg_index i
     JOIN pg_class idx ON idx.oid = i.indexrelid
     JOIN pg_class tbl ON tbl.oid = i.indrelid
     JOIN pg_am am ON am.oid = idx.relam
+    JOIN pg_opclass opc ON opc.oid = i.indclass[0]
     LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
     WHERE tbl.oid = 'challenges'::regclass
       AND i.indnkeyatts = 1
@@ -158,6 +168,9 @@ BEGIN
       AND i.indkey[0] = bound_attnum
       AND i.indpred IS NULL -- Preserves partial indexes!
       AND am.amname = 'btree'
+      AND opc.opcname = 'text_ops' -- Strictly standard text_ops: PRESERVES text_pattern_ops and custom opclasses!
+      AND i.indcollation[0] = 0 -- Default collation
+      AND i.indoption[0] = 0 -- Default ASC/NULLS LAST
       AND con.oid IS NULL -- Not backing a constraint
   ) LOOP
     EXECUTE format('DROP INDEX IF EXISTS %I', r.index_name);
