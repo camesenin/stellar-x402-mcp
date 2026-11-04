@@ -149,37 +149,9 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
   });
 
   it('rejects redemption under real multi-threaded writer contention when challenge expires while waiting for locked immediate transaction', async () => {
-    const store = new ChallengeStore(tempDbPath, 100, 10_000);
+    let store: ChallengeStore | null = null;
+    let worker: Worker | null = null;
     const txHashContention = 'f'.repeat(64);
-
-    // Worker script running in a genuine separate OS thread with independent SQLite connection
-    const workerScript = `
-      const { parentPort, workerData } = require('node:worker_threads');
-      const Database = require(workerData.betterSqlitePath);
-      const db = new Database(workerData.tempDbPath, { timeout: 10000 });
-      db.pragma('journal_mode = WAL');
-
-      parentPort.on('message', (cmd) => {
-        if (cmd.type === 'START_LOCK') {
-          const lockTx = db.transaction(() => {
-            parentPort.postMessage({ type: 'LOCK_ACQUIRED' });
-            const start = Date.now();
-            // Hold exclusive write lock for 180ms
-            while (Date.now() - start < 180) {}
-          });
-          lockTx.immediate();
-          parentPort.postMessage({ type: 'LOCK_RELEASED' });
-          db.close();
-        }
-      });
-
-      parentPort.postMessage({ type: 'WORKER_READY' });
-    `;
-
-    const worker = new Worker(workerScript, {
-      eval: true,
-      workerData: { tempDbPath, betterSqlitePath },
-    });
 
     let mainThreadWaitTime = 0;
     let mainThreadError: unknown = null;
@@ -188,29 +160,78 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
     let postWaitExpired = false;
 
     try {
-      // 1. Wait for Worker to initialize connection and report WORKER_READY (with 5s deadline & exit guard)
+      store = new ChallengeStore(tempDbPath, 100, 10_000);
+
+      // Worker script running in a genuine separate OS thread with independent SQLite connection
+      const workerScript = `
+        const { parentPort, workerData } = require('node:worker_threads');
+        const Database = require(workerData.betterSqlitePath);
+        const db = new Database(workerData.tempDbPath, { timeout: 10000 });
+        db.pragma('journal_mode = WAL');
+
+        parentPort.on('message', (cmd) => {
+          if (cmd && typeof cmd === 'object' && cmd.type === 'START_LOCK') {
+            const lockTx = db.transaction(() => {
+              parentPort.postMessage({ type: 'LOCK_ACQUIRED' });
+              const start = Date.now();
+              // Hold exclusive write lock for 180ms
+              while (Date.now() - start < 180) {}
+            });
+            lockTx.immediate();
+            parentPort.postMessage({ type: 'LOCK_RELEASED' });
+            db.close();
+          }
+        });
+
+        parentPort.postMessage({ type: 'WORKER_READY' });
+      `;
+
+      worker = new Worker(workerScript, {
+        eval: true,
+        workerData: { tempDbPath, betterSqlitePath },
+      });
+
+      // 1. Wait for Worker to initialize connection and report WORKER_READY (with 3s deadline & exit guard)
       await new Promise<void>((resolve, reject) => {
-        const deadline = setTimeout(() => reject(new Error('Worker initialization timed out')), 5000);
-        const onExit = (code: number) => {
-          clearTimeout(deadline);
-          reject(new Error(`Worker exited prematurely before ready with code ${code}`));
-        };
-        const onError = (err: Error) => {
-          clearTimeout(deadline);
-          reject(err);
-        };
-        const onMessage = (msg: { type: string }) => {
-          if (msg.type === 'WORKER_READY') {
-            clearTimeout(deadline);
+        let isSettled = false;
+        let deadlineTimer: NodeJS.Timeout | null = null;
+
+        const settle = (err?: Error | null) => {
+          if (isSettled) return;
+          isSettled = true;
+          if (deadlineTimer) clearTimeout(deadlineTimer);
+          if (worker) {
+            worker.off('message', onMessage);
             worker.off('exit', onExit);
             worker.off('error', onError);
-            resolve();
-          } else {
-            clearTimeout(deadline);
-            reject(new Error('Unexpected worker initial message: ' + JSON.stringify(msg)));
+          }
+          if (err) reject(err);
+          else resolve();
+        };
+
+        const onExit = (code: number) => {
+          settle(new Error(`Worker exited prematurely before ready with code ${code}`));
+        };
+        const onError = (err: Error) => {
+          settle(err);
+        };
+        const onMessage = (msg: unknown) => {
+          try {
+            if (typeof msg === 'object' && msg !== null && (msg as { type?: string }).type === 'WORKER_READY') {
+              settle(null);
+            } else {
+              settle(new Error('Unexpected worker initial message: ' + JSON.stringify(msg)));
+            }
+          } catch (listenerErr) {
+            settle(listenerErr instanceof Error ? listenerErr : new Error(String(listenerErr)));
           }
         };
-        worker.once('message', onMessage);
+
+        deadlineTimer = setTimeout(() => {
+          settle(new Error('Worker initialization timed out after 3000ms'));
+        }, 3_000);
+
+        worker.on('message', onMessage);
         worker.once('exit', onExit);
         worker.once('error', onError);
       });
@@ -229,18 +250,34 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
 
       // 3. Command Worker to acquire write lock and wait for LOCK_ACQUIRED -> LOCK_RELEASED
       await new Promise<void>((resolve, reject) => {
-        const deadline = setTimeout(() => reject(new Error('Contention lifecycle timed out')), 10000);
+        let isSettled = false;
+        let deadlineTimer: NodeJS.Timeout | null = null;
+
+        const settle = (err?: Error | null) => {
+          if (isSettled) return;
+          isSettled = true;
+          if (deadlineTimer) clearTimeout(deadlineTimer);
+          if (worker) {
+            worker.off('message', onMessage);
+            worker.off('exit', onExit);
+            worker.off('error', onError);
+          }
+          if (err) reject(err);
+          else resolve();
+        };
+
         const onExit = (code: number) => {
-          clearTimeout(deadline);
-          reject(new Error(`Worker exited prematurely during lock lifecycle with code ${code}`));
+          settle(new Error(`Worker exited prematurely during lock lifecycle with code ${code}`));
         };
         const onError = (err: Error) => {
-          clearTimeout(deadline);
-          reject(err);
+          settle(err);
         };
-        const onMessage = (msg: { type: string }) => {
+        const onMessage = (msg: unknown) => {
           try {
-            if (msg.type === 'LOCK_ACQUIRED') {
+            if (typeof msg !== 'object' || msg === null) return;
+            const typedMsg = msg as { type?: string };
+
+            if (typedMsg.type === 'LOCK_ACQUIRED') {
               // Precondition Check: Challenge MUST be fresh and NOT expired when entering markRedeemed
               const tEntry = Date.now();
               preCheckExpired = tEntry > challenge.expiresAt;
@@ -250,7 +287,7 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
 
               // Attempt markRedeemed on main thread. Main thread is genuinely blocked waiting for Worker write lock
               try {
-                store.markRedeemed(challenge.challengeId, txHashContention);
+                store!.markRedeemed(challenge.challengeId, txHashContention);
               } catch (err) {
                 mainThreadError = err;
               } finally {
@@ -258,32 +295,36 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
                 mainThreadWaitTime = tExit - tEntry;
                 postWaitExpired = tExit > challenge.expiresAt;
               }
-            } else if (msg.type === 'LOCK_RELEASED') {
-              clearTimeout(deadline);
-              worker.off('message', onMessage);
-              worker.off('exit', onExit);
-              worker.off('error', onError);
-              resolve();
+            } else if (typedMsg.type === 'LOCK_RELEASED') {
+              settle(null);
             }
           } catch (listenerErr) {
-            clearTimeout(deadline);
-            worker.off('message', onMessage);
-            worker.off('exit', onExit);
-            worker.off('error', onError);
-            reject(listenerErr);
+            settle(listenerErr instanceof Error ? listenerErr : new Error(String(listenerErr)));
           }
         };
-        worker.on('message', onMessage);
-        worker.once('exit', onExit);
-        worker.once('error', onError);
-        worker.postMessage({ type: 'START_LOCK' });
+
+        deadlineTimer = setTimeout(() => {
+          settle(new Error('Contention lifecycle timed out after 5000ms'));
+        }, 5_000);
+
+        worker!.on('message', onMessage);
+        worker!.once('exit', onExit);
+        worker!.once('error', onError);
+        worker!.postMessage({ type: 'START_LOCK' });
       });
     } finally {
-      // Robust double-finally guarantees store is closed even if worker termination fails
+      // Robust termination & store closure: race worker termination against 2000ms timeout
       try {
-        await worker.terminate();
+        if (worker) {
+          await Promise.race([
+            worker.terminate(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Worker terminate timed out after 2000ms')), 2000)),
+          ]).catch(() => {});
+        }
       } finally {
-        store.close();
+        if (store) {
+          store.close();
+        }
       }
     }
 
@@ -315,5 +356,5 @@ describe('ChallengeStore (SQLite Persistence & Anti-Replay)', () => {
     } finally {
       verifyStore.close();
     }
-  });
+  }, 15_000);
 });
