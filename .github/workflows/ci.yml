@@ -529,9 +529,11 @@ jobs:
               FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
               WHERE c.relname = 'idx_legacy_protected_partial_conjunctive' AND n.nspname = current_schema();
 
+              -- Verify EXACT AST-normalized expression from pg_get_expr in PostgreSQL 16
+              -- and strictly assert that it contains AND and does NOT contain OR
               IF v_pred IS NULL 
-                OR v_pred !~* 'bound_tx_hash IS NOT NULL' 
-                OR v_pred !~* 'status' 
+                OR v_pred != '((bound_tx_hash IS NOT NULL) AND (status <> ''CANCELLED''::text))'
+                OR v_pred ~* '\s+OR\s+'
                 OR v_indisunique != true 
                 OR v_indnullsnotdistinct_p != true 
                 OR v_indisvalid != true 
@@ -539,6 +541,11 @@ jobs:
               THEN
                 RAISE EXCEPTION '[%] Assertion failed: idx_legacy_protected_partial_conjunctive compromised (pred=%, unique=%, nullsnotdistinct=%, valid=%, indkey=%)', 
                   step_name, v_pred, v_indisunique, v_indnullsnotdistinct_p, v_indisvalid, v_indkey;
+              END IF;
+
+              -- Negative control: verify that any disjunctive expression is strictly rejected by our assertion logic
+              IF ('((bound_tx_hash IS NOT NULL) OR (status = ''PENDING''::text))' ~* '\s+OR\s+') IS NOT TRUE THEN
+                RAISE EXCEPTION '[%] Assertion failed: negative control disjunction check failed', step_name;
               END IF;
 
               -- 7. idx_legacy_pattern_bound MUST be preserved with text_pattern_ops

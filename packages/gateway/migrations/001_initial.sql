@@ -158,10 +158,10 @@ BEGIN
               i.indpred IS NULL
               OR (
                 -- Closed Whitelist: ONLY exact standalone or top-level positive AND conjunctions without OR or boolean equality
-                pg_get_expr(i.indpred, i.indrelid) !~* '^\(?\s*\(?\s*bound_tx_hash\s+IS\s+NOT\s+NULL\s*\)?(\s+AND\s+[^=><]+(?:<>[^=><]+|!=[^=><]+|=?\s*'[^']*')?)?\s*\)?$'
-                OR pg_get_expr(i.indpred, i.indrelid) ~* '\s+OR\s+'
-                OR pg_get_expr(i.indpred, i.indrelid) ~* '\)\s*=\s*\('
-                OR pg_get_expr(i.indpred, i.indrelid) ~* 'IS\s+(NOT\s+)?(TRUE|FALSE)'
+                pg_get_expr(i.indpred, i.indrelid) !~* $PRED$^\(?\s*\(?\s*bound_tx_hash\s+IS\s+NOT\s+NULL\s*\)?(\s+AND\s+[^=><]+(?:<>[^=><]+|!=[^=><]+|=?\s*'[^']*')?)?\s*\)?$$PRED$
+                OR pg_get_expr(i.indpred, i.indrelid) ~* $PRED$\s+OR\s+$PRED$
+                OR pg_get_expr(i.indpred, i.indrelid) ~* $PRED$\)\s*=\s*\($PRED$
+                OR pg_get_expr(i.indpred, i.indrelid) ~* $PRED$IS\s+(NOT\s+)?(TRUE|FALSE)$PRED$
               )
             )
           )
@@ -232,7 +232,7 @@ BEGIN
     UPDATE challenges 
     SET amount_stroops = (
       CASE 
-        WHEN amount::TEXT ~ '^[0-9]{1,30}(\.[0-9]{1,7})?$' AND amount::TEXT != '0' AND amount::TEXT !~ '^0+(\.0+)?$'
+        WHEN amount::TEXT ~ $REGEX$^[0-9]{1,30}(\.[0-9]{1,7})?$$REGEX$ AND amount::TEXT != '0' AND amount::TEXT !~ $REGEX$^0+(\.0+)?$$REGEX$
         THEN (amount::NUMERIC * 10000000)::NUMERIC(40, 0)
         ELSE NULL
       END
@@ -241,7 +241,7 @@ BEGIN
       AND amount IS NOT NULL 
       AND (
         CASE 
-          WHEN amount::TEXT ~ '^[0-9]{1,30}(\.[0-9]{1,7})?$' AND amount::TEXT != '0' AND amount::TEXT !~ '^0+(\.0+)?$'
+          WHEN amount::TEXT ~ $REGEX$^[0-9]{1,30}(\.[0-9]{1,7})?$$REGEX$ AND amount::TEXT != '0' AND amount::TEXT !~ $REGEX$^0+(\.0+)?$$REGEX$
           THEN true
           ELSE false
         END
