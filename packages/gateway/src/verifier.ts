@@ -9,6 +9,7 @@ import {
   Contract,
   TransactionBuilder,
   nativeToScVal,
+  StrKey,
 } from '@stellar/stellar-sdk';
 import { X402Challenge, VerificationResult } from './types.js';
 import { ChallengeStore } from './challenge-store.js';
@@ -246,11 +247,28 @@ export class StellarPaymentVerifier {
         if (res.status === 429 || res.status >= 500) {
           throw new TransientInfrastructureError(`Soroban RPC HTTP ${res.status} gateway error`, 503);
         }
-        return null;
+        throw new Error(`Soroban RPC HTTP error: status ${res.status} ${res.statusText}`);
       }
 
-      const data = (await res.json()) as any;
-      if (data?.error) {
+      let data: any;
+      try {
+        data = (await res.json()) as any;
+      } catch (jsonErr: any) {
+        throw new TransientInfrastructureError(
+          `Soroban RPC getTransaction returned invalid/truncated JSON: ${jsonErr?.message || jsonErr}`,
+          503,
+          jsonErr
+        );
+      }
+
+      if (!data || typeof data !== 'object') {
+        throw new TransientInfrastructureError(
+          'Soroban RPC getTransaction returned empty or non-object JSON-RPC response',
+          503
+        );
+      }
+
+      if (data.error) {
         const errObj = data.error;
         if (isTransientInfrastructureError(errObj)) {
           throw new TransientInfrastructureError(
@@ -262,7 +280,7 @@ export class StellarPaymentVerifier {
         // If it's another non-transient JSON-RPC error, throw explicit error rather than silently degrading to null
         throw new Error(`Soroban JSON-RPC error (${errObj.code}): ${errObj.message || 'unknown error'}`);
       }
-      return data?.result || null;
+      return data.result || null;
     } catch (err: any) {
       if (err instanceof TransientInfrastructureError) {
         throw err;
@@ -274,7 +292,8 @@ export class StellarPaymentVerifier {
           err
         );
       }
-      return null;
+      // Re-throw any non-transient error (e.g. JSON-RPC -32602, HTTP 401, SyntaxError) so caller receives explicit failure
+      throw err;
     } finally {
       clearTimeout(timeout);
     }
@@ -385,7 +404,19 @@ export class StellarPaymentVerifier {
 
     try {
       // 1. Query transaction status on Soroban RPC using standard JSON-RPC 2.0
-      const rawTx = await this.fetchSorobanTxJsonRpc(txHash);
+      let rawTx: Record<string, any> | null = null;
+      try {
+        rawTx = await this.fetchSorobanTxJsonRpc(txHash);
+      } catch (fetchErr: any) {
+        if (fetchErr instanceof TransientInfrastructureError || isTransientInfrastructureError(fetchErr)) {
+          throw fetchErr;
+        }
+        return {
+          valid: false,
+          reason: `Soroban transaction query error: ${fetchErr?.message || fetchErr}`,
+          txHash,
+        };
+      }
 
       if (!rawTx || rawTx.status !== 'SUCCESS') {
         return {
@@ -780,10 +811,13 @@ export class StellarPaymentVerifier {
         );
       }
       // Rigorous positive confirmation of entry absence on ledger:
-      // @stellar/stellar-sdk rejects with { code: 404, message: "Contract data not found..." }
+      // @stellar/stellar-sdk getContractData internally inspects getLedgerEntries and rejects with:
+      // { code: 404, message: "Contract data not found..." }
+      // We demand BOTH code 404 AND positive confirmation in the message that contract data was not found on ledger
       const isDemonstratedAbsence =
-        rpcErr?.code === 404 ||
-        /contract data not found/i.test(rpcErr?.message || '');
+        rpcErr?.code === 404 &&
+        typeof rpcErr?.message === 'string' &&
+        /contract data not found/i.test(rpcErr.message);
 
       if (isDemonstratedAbsence) {
         return null;
@@ -850,27 +884,31 @@ export class StellarPaymentVerifier {
       );
     }
 
-    // Defensive parsing & validation of addresses
-    if (!rec.payer.startsWith('G') && !rec.payer.startsWith('C')) {
+    // Defensive parsing & validation of addresses using official Stellar StrKey cryptographic format
+    const isValidPayer =
+      StrKey.isValidEd25519PublicKey(rec.payer) || StrKey.isValidContract(rec.payer);
+    if (!isValidPayer) {
       throw new TransientInfrastructureError(
         `Soroban RPC getContractData invalid receipt payer address format: '${rec.payer}'`,
         503
       );
     }
-    if (!rec.recipient.startsWith('G') && !rec.recipient.startsWith('C')) {
+    const isValidRecipient =
+      StrKey.isValidEd25519PublicKey(rec.recipient) || StrKey.isValidContract(rec.recipient);
+    if (!isValidRecipient) {
       throw new TransientInfrastructureError(
         `Soroban RPC getContractData invalid receipt recipient address format: '${rec.recipient}'`,
         503
       );
     }
-    if (!rec.token.startsWith('C')) {
+    if (!StrKey.isValidContract(rec.token)) {
       throw new TransientInfrastructureError(
         `Soroban RPC getContractData invalid receipt token address format: '${rec.token}'`,
         503
       );
     }
 
-    // Defensive parsing & validation of amount (must be convertible to positive BigInt)
+    // Defensive parsing & validation of amount (must be positive BigInt in u128/i128 domain)
     let parsedAmount: bigint;
     try {
       if (typeof rec.amount === 'bigint') {
@@ -896,13 +934,14 @@ export class StellarPaymentVerifier {
       );
     }
 
-    // Defensive parsing & validation of timestamp (must be non-negative integer)
+    // Defensive parsing & validation of timestamp: strictly positive integer in Soroban u64 domain (1 to 2^64 - 1)
+    const MAX_U64 = 18446744073709551615n;
     let parsedTimestamp: bigint;
     try {
       if (typeof rec.timestamp === 'bigint') {
         parsedTimestamp = rec.timestamp;
       } else if (typeof rec.timestamp === 'number') {
-        if (!Number.isSafeInteger(rec.timestamp) || rec.timestamp < 0) {
+        if (!Number.isSafeInteger(rec.timestamp) || rec.timestamp <= 0) {
           throw new Error(`Timestamp out of range: ${rec.timestamp}`);
         }
         parsedTimestamp = BigInt(rec.timestamp);
@@ -910,6 +949,9 @@ export class StellarPaymentVerifier {
         parsedTimestamp = BigInt(rec.timestamp);
       } else {
         throw new Error(`Unsupported timestamp representation: ${rec.timestamp}`);
+      }
+      if (parsedTimestamp <= 0n || parsedTimestamp > MAX_U64) {
+        throw new Error(`Timestamp outside valid positive u64 range: ${parsedTimestamp}`);
       }
     } catch (tsErr: any) {
       throw new TransientInfrastructureError(

@@ -551,57 +551,59 @@ describe('createX402Middleware with SQLite', () => {
     expect(store.isTxRedeemed(sorobanTxHash)).toBe(false);
     expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(false);
 
-    // Step 2: Retry with successful Soroban RPC response using same proof
-    const { Keypair, xdr, Address, nativeToScVal } = await import('@stellar/stellar-sdk');
+    // Step 2: Retry with successful Soroban RPC response using real XDR and real receipt parser
+    const { Keypair, TransactionBuilder, Networks, Contract, Address, nativeToScVal, xdr, Account } = await import('@stellar/stellar-sdk');
     const payerKp = Keypair.random();
     const expectedNonce = Buffer.from(challenge.challengeId, 'hex');
 
-    // Mock fetchSorobanTxJsonRpc returning SUCCESS
+    // Build authentic Soroban TransactionEnvelope XDR with actual 'settle_payment' operation
+    const dummyAccount = new Account('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF', '0');
+    const contract = new Contract(targetVault);
+    const op = contract.call(
+      'settle_payment',
+      new Address(payerKp.publicKey()).toScVal(),
+      new Address(dummyDest).toScVal(),
+      new Address('CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC').toScVal(),
+      nativeToScVal(500_000n, { type: 'i128' }),
+      xdr.ScVal.scvBytes(expectedNonce)
+    );
+    const realEnvelope = new TransactionBuilder(dummyAccount, { fee: '100', networkPassphrase: Networks.TESTNET })
+      .addOperation(op)
+      .setTimeout(30)
+      .build();
+    const realEnvelopeXdr = realEnvelope.toXDR();
+
+    // Mock fetchSorobanTxJsonRpc returning SUCCESS with authentic envelopeXdr
     vi.spyOn(verifier, 'fetchSorobanTxJsonRpc').mockResolvedValueOnce({
       status: 'SUCCESS',
-      envelopeXdr: 'AAAA',
+      envelopeXdr: realEnvelopeXdr,
+      ledger: 50020,
     });
 
-    vi.spyOn(xdr.TransactionEnvelope, 'fromXDR').mockReturnValueOnce({
-      value: () => ({
-        tx: () => ({
-          operations: () => [{
-            body: () => ({
-              switch: () => ({ name: 'invokeHostFunction' }),
-              invokeHostFunctionOp: () => ({
-                hostFunction: () => ({
-                  switch: () => ({ name: 'hostFunctionTypeInvokeContract' }),
-                  invokeContract: () => ({
-                    contractAddress: () => Address.fromString(targetVault).toScAddress(),
-                    functionName: () => Buffer.from('settle_payment'),
-                    args: () => [
-                      new Address(payerKp.publicKey()).toScVal(),
-                      new Address(dummyDest).toScVal(),
-                      new Address('CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC').toScVal(),
-                      nativeToScVal(500_000n, { type: 'i128' }),
-                      xdr.ScVal.scvBytes(expectedNonce),
-                    ],
-                  }),
-                }),
-              }),
-            }),
-          }],
-        }),
-      }),
-    } as any);
+    // Mock simulateTransaction for canonical on-chain hash simulation
+    vi.spyOn((verifier as any).sorobanServer, 'simulateTransaction').mockResolvedValueOnce({
+      result: {
+        retval: {
+          bytes: () => expectedNonce,
+        },
+      },
+    });
 
-    // Mock canonical hash simulation
-    vi.spyOn(verifier, 'computeCanonicalChallengeHash').mockResolvedValueOnce(expectedNonce);
-
-    // Mock querySorobanContractReceipt returning valid settled receipt
-    vi.spyOn(verifier, 'querySorobanContractReceipt').mockResolvedValueOnce({
+    // Mock getContractData returning real LedgerEntry with real receipt struct ScVal
+    const receiptScVal = nativeToScVal({
       payer: payerKp.publicKey(),
       recipient: dummyDest,
       token: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
       amount: 500_000n,
       timestamp: 12345678n,
-      challenge_hash: expectedNonce,
     });
+    vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockResolvedValueOnce({
+      val: {
+        contractData: () => ({
+          val: () => receiptScVal,
+        }),
+      },
+    } as any);
 
     let nextCalled = false;
     const nextSuccess = vi.fn(() => { nextCalled = true; });

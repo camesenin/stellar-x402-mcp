@@ -1289,11 +1289,12 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
       )).rejects.toThrow('Soroban RPC getContractData deserialized receipt is not a valid struct object');
 
       // d) Hostile receipt data: amount: "invalid", timestamp: null -> throws 503 instead of degrading to BigInt syntax error
+      const validTestKp = Keypair.random();
       vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockResolvedValueOnce({
         val: {
           contractData: () => ({
             val: () => nativeToScVal({
-              payer: 'GAUTONOMOUS_AI_AGENT_KEYPAIR_111111111111111111111111111111',
+              payer: validTestKp.publicKey(),
               recipient: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
               token: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
               amount: 'invalid_amount_string',
@@ -1316,6 +1317,83 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
         }),
       } as any);
       await expect(verifier.fetchSorobanTxJsonRpc('any_tx_hash')).rejects.toThrow('Soroban JSON-RPC transient error (-32001)');
+
+      // f) Parametric Hostile Audit Tests:
+      // 1. JSON-RPC non-transient error (-32602, Invalid params) rethrows explicit Error
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          error: { code: -32602, message: 'Invalid params' },
+        }),
+      } as any);
+      await expect(verifier.fetchSorobanTxJsonRpc('any_tx_hash')).rejects.toThrow('Soroban JSON-RPC error (-32602): Invalid params');
+
+      // 2. Truncated/corrupted JSON from RPC rethrows TransientInfrastructureError(503)
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+        ok: true,
+        json: async () => { throw new SyntaxError('Unexpected token in JSON at position 0'); },
+      } as any);
+      await expect(verifier.fetchSorobanTxJsonRpc('any_tx_hash')).rejects.toThrow('Soroban RPC getTransaction returned invalid/truncated JSON');
+
+      // 3. HTTP 401 Unauthorized rethrows explicit Error instead of returning null
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        statusText: 'Unauthorized',
+      } as any);
+      await expect(verifier.fetchSorobanTxJsonRpc('any_tx_hash')).rejects.toThrow('Soroban RPC HTTP error: status 401 Unauthorized');
+
+      // 4. Timestamp boundary tests: -1n, 0n, >2^64-1 throw 503
+      for (const badTs of [-1n, 0n, 18446744073709551616n]) {
+        vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockResolvedValueOnce({
+          val: {
+            contractData: () => ({
+              val: () => nativeToScVal({
+                payer: validTestKp.publicKey(),
+                recipient: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+                token: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+                amount: 500_000n,
+                timestamp: badTs,
+              }),
+            }),
+          },
+        } as any);
+        await expect(verifier.querySorobanContractReceipt(
+          'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
+          Buffer.from('f'.repeat(64), 'hex')
+        )).rejects.toThrow('Soroban RPC getContractData malformed or unconvertible receipt timestamp');
+      }
+
+      // 5. Incomplete address prefix ("G" or "C") strictly throws 503 instead of passing
+      for (const badAddr of ['G', 'C', 'GAUTONOMOUS_TOO_SHORT']) {
+        vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockResolvedValueOnce({
+          val: {
+            contractData: () => ({
+              val: () => nativeToScVal({
+                payer: badAddr,
+                recipient: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+                token: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+                amount: 500_000n,
+                timestamp: 12345678n,
+              }),
+            }),
+          },
+        } as any);
+        await expect(verifier.querySorobanContractReceipt(
+          'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
+          Buffer.from('f'.repeat(64), 'hex')
+        )).rejects.toThrow('invalid receipt payer address format');
+      }
+
+      // 6. Generic proxy 404 error without 'contract data not found' throws 503, does NOT return null
+      vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockRejectedValueOnce({
+        code: 404,
+        message: 'proxy endpoint not found',
+      });
+      await expect(verifier.querySorobanContractReceipt(
+        'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
+        Buffer.from('f'.repeat(64), 'hex')
+      )).rejects.toThrow('Soroban RPC getContractData non-conclusive query failure');
 
       // 12. Hostile Classifier Matrix: Circular objects, HTTP 501, 550, 599, plain objects {-32001, 'upstream timeout'}
       // a) Circular object in err.error does not throw and is identified as transient
