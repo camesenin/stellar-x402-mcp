@@ -683,6 +683,129 @@ describe('createX402Middleware with SQLite', () => {
     expect(nextReplay).not.toHaveBeenCalled();
     expect(replayStatusCode).toBe(402);
     expect(replayJson.details).toContain('replay attack prevented');
+
+    // Step 4: Full Middleware Pipeline Regressions for Hostile Upstream Cases:
+    // a) Unknown/non-enum status (status: 'PENDING' / 'UNKNOWN' / '') returns HTTP 503 with Retry-After, 0 redemptions
+    for (const badStatus of ['PENDING', 'UNKNOWN', '', 'success']) {
+      const challengeBadStatus = store.createChallenge(dummyDest, '0.05', 'XLM', '/api/soroban-resource', 'testnet', targetVault);
+      const txHashBadStatus = 'aa'.repeat(32);
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          result: { status: badStatus },
+        }),
+      } as any);
+
+      const reqBadStatus = {
+        header: vi.fn((name: string) => {
+          if (name === 'X-Stellar-TxHash') return txHashBadStatus;
+          if (name === 'X-Challenge-Id') return challengeBadStatus.challengeId;
+          return undefined;
+        }),
+        query: {},
+        originalUrl: '/api/soroban-resource',
+        path: '/api/soroban-resource',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as X402Request;
+
+      let badStatusCode = 0;
+      let badJson: any = null;
+      const resBadStatus = {
+        status: vi.fn((code: number) => { badStatusCode = code; return resBadStatus; }),
+        setHeader: vi.fn(),
+        json: vi.fn((b: any) => { badJson = b; return resBadStatus; }),
+      } as unknown as Response;
+
+      const nextBadStatus = vi.fn();
+      await middleware(reqBadStatus, resBadStatus, nextBadStatus);
+
+      expect(nextBadStatus).not.toHaveBeenCalled();
+      expect(badStatusCode).toBe(503);
+      expect(badJson.retriable).toBe(true);
+      expect(store.isTxRedeemed(txHashBadStatus)).toBe(false);
+      expect(store.isChallengeRedeemed(challengeBadStatus.challengeId)).toBe(false);
+    }
+
+    // b) HTTP 401 Unauthorized returns HTTP 502 with retriable: true, 0 redemptions
+    const challenge401 = store.createChallenge(dummyDest, '0.05', 'XLM', '/api/soroban-resource', 'testnet', targetVault);
+    const txHash401 = 'bb'.repeat(32);
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      statusText: 'Unauthorized',
+    } as any);
+
+    const req401 = {
+      header: vi.fn((name: string) => {
+        if (name === 'X-Stellar-TxHash') return txHash401;
+        if (name === 'X-Challenge-Id') return challenge401.challengeId;
+        return undefined;
+      }),
+      query: {},
+      originalUrl: '/api/soroban-resource',
+      path: '/api/soroban-resource',
+      ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as X402Request;
+
+    let status401 = 0;
+    let json401: any = null;
+    const res401 = {
+      status: vi.fn((code: number) => { status401 = code; return res401; }),
+      setHeader: vi.fn(),
+      json: vi.fn((b: any) => { json401 = b; return res401; }),
+    } as unknown as Response;
+
+    const next401 = vi.fn();
+    await middleware(req401, res401, next401);
+
+    expect(next401).not.toHaveBeenCalled();
+    expect(status401).toBe(502);
+    expect(json401.retriable).toBe(true);
+    expect(store.isTxRedeemed(txHash401)).toBe(false);
+    expect(store.isChallengeRedeemed(challenge401.challengeId)).toBe(false);
+
+    // c) JSON-RPC -32602 Invalid params returns HTTP 502 with retriable: true, 0 redemptions
+    const challenge32602 = store.createChallenge(dummyDest, '0.05', 'XLM', '/api/soroban-resource', 'testnet', targetVault);
+    const txHash32602 = 'cc'.repeat(32);
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        error: { code: -32602, message: 'Invalid params' },
+      }),
+    } as any);
+
+    const req32602 = {
+      header: vi.fn((name: string) => {
+        if (name === 'X-Stellar-TxHash') return txHash32602;
+        if (name === 'X-Challenge-Id') return challenge32602.challengeId;
+        return undefined;
+      }),
+      query: {},
+      originalUrl: '/api/soroban-resource',
+      path: '/api/soroban-resource',
+      ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as X402Request;
+
+    let status32602 = 0;
+    let json32602: any = null;
+    const res32602 = {
+      status: vi.fn((code: number) => { status32602 = code; return res32602; }),
+      setHeader: vi.fn(),
+      json: vi.fn((b: any) => { json32602 = b; return res32602; }),
+    } as unknown as Response;
+
+    const next32602 = vi.fn();
+    await middleware(req32602, res32602, next32602);
+
+    expect(next32602).not.toHaveBeenCalled();
+    expect(status32602).toBe(502);
+    expect(json32602.retriable).toBe(true);
+    expect(store.isTxRedeemed(txHash32602)).toBe(false);
+    expect(store.isChallengeRedeemed(challenge32602.challengeId)).toBe(false);
+
     store.close();
   });
 });

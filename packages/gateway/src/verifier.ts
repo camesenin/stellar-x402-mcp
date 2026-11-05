@@ -261,7 +261,7 @@ export class StellarPaymentVerifier {
         );
       }
 
-      if (!data || typeof data !== 'object') {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
         throw new TransientInfrastructureError(
           'Soroban RPC getTransaction returned empty or non-object JSON-RPC response',
           503
@@ -282,16 +282,18 @@ export class StellarPaymentVerifier {
       }
 
       // getTransaction JSON-RPC contract validation:
-      // data.result must be an object with an explicit status field ('SUCCESS', 'FAILED', or 'NOT_FOUND')
-      if (!data.result || typeof data.result !== 'object') {
+      // data.result must be a non-array object with an explicit status enum ('SUCCESS' | 'FAILED' | 'NOT_FOUND')
+      if (!data.result || typeof data.result !== 'object' || Array.isArray(data.result)) {
         throw new TransientInfrastructureError(
           'Soroban RPC getTransaction response missing result object',
           503
         );
       }
-      if (typeof data.result.status !== 'string') {
+      const rawStatus = data.result.status;
+      const validStatuses = new Set(['SUCCESS', 'FAILED', 'NOT_FOUND']);
+      if (typeof rawStatus !== 'string' || !validStatuses.has(rawStatus)) {
         throw new TransientInfrastructureError(
-          `Soroban RPC getTransaction response missing valid status field: ${JSON.stringify(data.result)}`,
+          `Soroban RPC getTransaction response contains invalid or unknown status enum: '${rawStatus}'. Expected SUCCESS | FAILED | NOT_FOUND`,
           503
         );
       }

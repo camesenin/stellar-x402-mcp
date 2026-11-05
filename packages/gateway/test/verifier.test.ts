@@ -1401,7 +1401,7 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
           ok: true,
           json: async () => badRpcPayload,
         } as any);
-        await expect(verifier.fetchSorobanTxJsonRpc('any_tx_hash')).rejects.toThrow(/missing result object|missing valid status field/);
+        await expect(verifier.fetchSorobanTxJsonRpc('any_tx_hash')).rejects.toThrow(/empty or non-object JSON-RPC response|missing result object|missing valid status field|invalid or unknown status enum/);
       }
 
       // 8. Stored challenge_hash mismatch in receipt strictly throws 503
