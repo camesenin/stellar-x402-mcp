@@ -251,11 +251,16 @@ export class StellarPaymentVerifier {
 
       const data = (await res.json()) as any;
       if (data?.error) {
-        const errCode = data.error.code;
-        const errMsg = data.error.message || '';
-        if (errCode === -32603 || errCode === -32000 || errCode === -32005 || /internal|timeout|busy|rate|overloaded/i.test(errMsg)) {
-          throw new TransientInfrastructureError(`Soroban JSON-RPC transient error (${errCode}): ${errMsg}`, 503);
+        const errObj = data.error;
+        if (isTransientInfrastructureError(errObj)) {
+          throw new TransientInfrastructureError(
+            `Soroban JSON-RPC transient error (${errObj.code}): ${errObj.message || ''}`,
+            503,
+            errObj
+          );
         }
+        // If it's another non-transient JSON-RPC error, throw explicit error rather than silently degrading to null
+        throw new Error(`Soroban JSON-RPC error (${errObj.code}): ${errObj.message || 'unknown error'}`);
       }
       return data?.result || null;
     } catch (err: any) {
@@ -727,20 +732,27 @@ export class StellarPaymentVerifier {
     contractId: string,
     canonicalChallengeHash: string | Buffer
   ): Promise<SorobanReceiptRecord | null> {
-    if (!this.sorobanServer) return null;
+    if (!this.sorobanServer) {
+      throw new TransientInfrastructureError(
+        'Soroban RPC server instance not configured on gateway for receipt verification',
+        503
+      );
+    }
 
     // Create 32-byte canonical challenge hash buffer
     let hashBytes: Buffer;
     if (Buffer.isBuffer(canonicalChallengeHash)) {
-      if (canonicalChallengeHash.length !== 32) return null;
+      if (canonicalChallengeHash.length !== 32) {
+        throw new Error(`Invalid canonicalChallengeHash length: expected 32 bytes, got ${canonicalChallengeHash.length}`);
+      }
       hashBytes = canonicalChallengeHash;
     } else if (typeof canonicalChallengeHash === 'string') {
       if (!/^[0-9a-fA-F]{64}$/.test(canonicalChallengeHash)) {
-        return null;
+        throw new Error(`Invalid canonicalChallengeHash format: expected 64 hex characters, got '${canonicalChallengeHash}'`);
       }
       hashBytes = Buffer.from(canonicalChallengeHash, 'hex');
     } else {
-      return null;
+      throw new Error(`Invalid canonicalChallengeHash type: expected Buffer or hex string, got ${typeof canonicalChallengeHash}`);
     }
 
     // Match Soroban contract enum DataKey::Receipt(BytesN<32>)
@@ -828,7 +840,9 @@ export class StellarPaymentVerifier {
       typeof rec.recipient !== 'string' ||
       typeof rec.token !== 'string' ||
       rec.amount === undefined ||
-      rec.timestamp === undefined
+      rec.amount === null ||
+      rec.timestamp === undefined ||
+      rec.timestamp === null
     ) {
       throw new TransientInfrastructureError(
         'Soroban RPC getContractData deserialized receipt lacks required fields (payer, recipient, token, amount, timestamp)',
@@ -836,12 +850,81 @@ export class StellarPaymentVerifier {
       );
     }
 
+    // Defensive parsing & validation of addresses
+    if (!rec.payer.startsWith('G') && !rec.payer.startsWith('C')) {
+      throw new TransientInfrastructureError(
+        `Soroban RPC getContractData invalid receipt payer address format: '${rec.payer}'`,
+        503
+      );
+    }
+    if (!rec.recipient.startsWith('G') && !rec.recipient.startsWith('C')) {
+      throw new TransientInfrastructureError(
+        `Soroban RPC getContractData invalid receipt recipient address format: '${rec.recipient}'`,
+        503
+      );
+    }
+    if (!rec.token.startsWith('C')) {
+      throw new TransientInfrastructureError(
+        `Soroban RPC getContractData invalid receipt token address format: '${rec.token}'`,
+        503
+      );
+    }
+
+    // Defensive parsing & validation of amount (must be convertible to positive BigInt)
+    let parsedAmount: bigint;
+    try {
+      if (typeof rec.amount === 'bigint') {
+        parsedAmount = rec.amount;
+      } else if (typeof rec.amount === 'number') {
+        if (!Number.isSafeInteger(rec.amount) || rec.amount <= 0) {
+          throw new Error(`Amount number out of range: ${rec.amount}`);
+        }
+        parsedAmount = BigInt(rec.amount);
+      } else if (typeof rec.amount === 'string' && /^\d+$/.test(rec.amount)) {
+        parsedAmount = BigInt(rec.amount);
+      } else {
+        throw new Error(`Unsupported amount representation: ${rec.amount}`);
+      }
+      if (parsedAmount <= 0n) {
+        throw new Error(`Non-positive amount: ${parsedAmount}`);
+      }
+    } catch (amountErr: any) {
+      throw new TransientInfrastructureError(
+        `Soroban RPC getContractData malformed or unconvertible receipt amount: ${amountErr?.message || amountErr}`,
+        503,
+        amountErr
+      );
+    }
+
+    // Defensive parsing & validation of timestamp (must be non-negative integer)
+    let parsedTimestamp: bigint;
+    try {
+      if (typeof rec.timestamp === 'bigint') {
+        parsedTimestamp = rec.timestamp;
+      } else if (typeof rec.timestamp === 'number') {
+        if (!Number.isSafeInteger(rec.timestamp) || rec.timestamp < 0) {
+          throw new Error(`Timestamp out of range: ${rec.timestamp}`);
+        }
+        parsedTimestamp = BigInt(rec.timestamp);
+      } else if (typeof rec.timestamp === 'string' && /^\d+$/.test(rec.timestamp)) {
+        parsedTimestamp = BigInt(rec.timestamp);
+      } else {
+        throw new Error(`Unsupported timestamp representation: ${rec.timestamp}`);
+      }
+    } catch (tsErr: any) {
+      throw new TransientInfrastructureError(
+        `Soroban RPC getContractData malformed or unconvertible receipt timestamp: ${tsErr?.message || tsErr}`,
+        503,
+        tsErr
+      );
+    }
+
     return {
       payer: rec.payer,
       recipient: rec.recipient,
       token: rec.token,
-      amount: rec.amount as bigint | number | string,
-      timestamp: rec.timestamp as number | bigint,
+      amount: parsedAmount,
+      timestamp: parsedTimestamp,
       challenge_hash: hashBytes,
     };
   }

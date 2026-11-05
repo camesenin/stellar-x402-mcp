@@ -498,4 +498,150 @@ describe('createX402Middleware with SQLite', () => {
     expect(replayJson.details).toContain('replay attack prevented');
     store.close();
   });
+
+  it('e2e middleware: Soroban RPC transient failure returns HTTP 503 with Retry-After, preserving state for retry, and strictly rejecting subsequent replay', async () => {
+    const store = new ChallengeStore(':memory:');
+    const verifier = new StellarPaymentVerifier('https://horizon-testnet.stellar.org', 'https://soroban-testnet.stellar.org', 'testnet');
+    const targetVault = 'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO';
+    const challenge = store.createChallenge(dummyDest, '0.05', 'XLM', '/api/soroban-resource', 'testnet', targetVault);
+    const sorobanTxHash = '33445566778899001122aabbccddeeff33445566778899001122aabbccddeeff';
+
+    // Step 1: Injected transient network error into fetchSorobanTxJsonRpc (RPC boundary failure)
+    vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(Object.assign(new TypeError('fetch failed'), {
+      cause: { code: 'ECONNRESET' }
+    }));
+
+    const middleware = createX402Middleware(
+      { destinationPublicKey: dummyDest, defaultFeeXlm: '0.05' },
+      store,
+      verifier
+    );
+
+    const req = {
+      header: vi.fn((name: string) => {
+        if (name === 'X-Stellar-TxHash') return sorobanTxHash;
+        if (name === 'X-Challenge-Id') return challenge.challengeId;
+        return undefined;
+      }),
+      query: {},
+      originalUrl: '/api/soroban-resource',
+      path: '/api/soroban-resource',
+      ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as X402Request;
+
+    const headers: Record<string, string> = {};
+    let statusCode = 0;
+    let jsonBody: any = null;
+    const res = {
+      status: vi.fn((code: number) => { statusCode = code; return res; }),
+      setHeader: vi.fn((k: string, v: string) => { headers[k] = v; return res; }),
+      json: vi.fn((b: any) => { jsonBody = b; return res; }),
+    } as unknown as Response;
+
+    const next = vi.fn();
+    await middleware(req, res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(statusCode).toBe(503);
+    expect(headers['Retry-After']).toBe('2');
+    expect(jsonBody.retriable).toBe(true);
+    expect(jsonBody.details).toContain('Soroban RPC getTransaction network timeout/transient failure');
+    // State in SQLite store must remain completely unconsumed
+    expect(store.isTxRedeemed(sorobanTxHash)).toBe(false);
+    expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(false);
+
+    // Step 2: Retry with successful Soroban RPC response using same proof
+    const { Keypair, xdr, Address, nativeToScVal } = await import('@stellar/stellar-sdk');
+    const payerKp = Keypair.random();
+    const expectedNonce = Buffer.from(challenge.challengeId, 'hex');
+
+    // Mock fetchSorobanTxJsonRpc returning SUCCESS
+    vi.spyOn(verifier, 'fetchSorobanTxJsonRpc').mockResolvedValueOnce({
+      status: 'SUCCESS',
+      envelopeXdr: 'AAAA',
+    });
+
+    vi.spyOn(xdr.TransactionEnvelope, 'fromXDR').mockReturnValueOnce({
+      value: () => ({
+        tx: () => ({
+          operations: () => [{
+            body: () => ({
+              switch: () => ({ name: 'invokeHostFunction' }),
+              invokeHostFunctionOp: () => ({
+                hostFunction: () => ({
+                  switch: () => ({ name: 'hostFunctionTypeInvokeContract' }),
+                  invokeContract: () => ({
+                    contractAddress: () => Address.fromString(targetVault).toScAddress(),
+                    functionName: () => Buffer.from('settle_payment'),
+                    args: () => [
+                      new Address(payerKp.publicKey()).toScVal(),
+                      new Address(dummyDest).toScVal(),
+                      new Address('CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC').toScVal(),
+                      nativeToScVal(500_000n, { type: 'i128' }),
+                      xdr.ScVal.scvBytes(expectedNonce),
+                    ],
+                  }),
+                }),
+              }),
+            }),
+          }],
+        }),
+      }),
+    } as any);
+
+    // Mock canonical hash simulation
+    vi.spyOn(verifier, 'computeCanonicalChallengeHash').mockResolvedValueOnce(expectedNonce);
+
+    // Mock querySorobanContractReceipt returning valid settled receipt
+    vi.spyOn(verifier, 'querySorobanContractReceipt').mockResolvedValueOnce({
+      payer: payerKp.publicKey(),
+      recipient: dummyDest,
+      token: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+      amount: 500_000n,
+      timestamp: 12345678n,
+      challenge_hash: expectedNonce,
+    });
+
+    let nextCalled = false;
+    const nextSuccess = vi.fn(() => { nextCalled = true; });
+    await middleware(req, res, nextSuccess);
+
+    expect(nextCalled).toBe(true);
+    expect(headers['X-Payment-Settled']).toBe('true');
+    expect(headers['X-Payment-TxHash']).toBe(sorobanTxHash);
+    expect(store.isTxRedeemed(sorobanTxHash)).toBe(true);
+    expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(true);
+
+    // Step 3: Subsequent replay of the exact same Soroban tx against a fresh challenge is rejected with HTTP 402 replay attack prevented
+    const freshChallenge = store.createChallenge(dummyDest, '0.05', 'XLM', '/api/soroban-resource', 'testnet', targetVault);
+    const reqReplay = {
+      header: vi.fn((name: string) => {
+        if (name === 'X-Stellar-TxHash') return sorobanTxHash;
+        if (name === 'X-Challenge-Id') return freshChallenge.challengeId;
+        return undefined;
+      }),
+      query: {},
+      originalUrl: '/api/soroban-resource',
+      path: '/api/soroban-resource',
+      ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as X402Request;
+
+    let replayStatusCode = 0;
+    let replayJson: any = null;
+    const resReplay = {
+      status: vi.fn((code: number) => { replayStatusCode = code; return resReplay; }),
+      setHeader: vi.fn(),
+      json: vi.fn((b: any) => { replayJson = b; return resReplay; }),
+    } as unknown as Response;
+
+    const nextReplay = vi.fn();
+    await middleware(reqReplay, resReplay, nextReplay);
+
+    expect(nextReplay).not.toHaveBeenCalled();
+    expect(replayStatusCode).toBe(402);
+    expect(replayJson.details).toContain('replay attack prevented');
+    store.close();
+  });
 });

@@ -1288,6 +1288,35 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
         Buffer.from('f'.repeat(64), 'hex')
       )).rejects.toThrow('Soroban RPC getContractData deserialized receipt is not a valid struct object');
 
+      // d) Hostile receipt data: amount: "invalid", timestamp: null -> throws 503 instead of degrading to BigInt syntax error
+      vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockResolvedValueOnce({
+        val: {
+          contractData: () => ({
+            val: () => nativeToScVal({
+              payer: 'GAUTONOMOUS_AI_AGENT_KEYPAIR_111111111111111111111111111111',
+              recipient: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+              token: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+              amount: 'invalid_amount_string',
+              timestamp: 12345678,
+            }),
+          }),
+        },
+      } as any);
+
+      await expect(verifier.querySorobanContractReceipt(
+        'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
+        Buffer.from('f'.repeat(64), 'hex')
+      )).rejects.toThrow('Soroban RPC getContractData malformed or unconvertible receipt amount');
+
+      // e) fetchSorobanTxJsonRpc with JSON-RPC -32001 (node unavailable) throws TransientInfrastructureError
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          error: { code: -32001, message: 'node unavailable' },
+        }),
+      } as any);
+      await expect(verifier.fetchSorobanTxJsonRpc('any_tx_hash')).rejects.toThrow('Soroban JSON-RPC transient error (-32001)');
+
       // 12. Hostile Classifier Matrix: Circular objects, HTTP 501, 550, 599, plain objects {-32001, 'upstream timeout'}
       // a) Circular object in err.error does not throw and is identified as transient
       const circularError: any = { message: 'upstream timeout', error: {} };
