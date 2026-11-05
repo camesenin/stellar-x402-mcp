@@ -685,7 +685,7 @@ describe('createX402Middleware with SQLite', () => {
     expect(replayJson.details).toContain('replay attack prevented');
 
     // Step 4: Full Middleware Pipeline Regressions for Hostile Upstream Cases:
-    // a) Unknown/non-enum status (status: 'PENDING' / 'UNKNOWN' / '') returns HTTP 503 with Retry-After, 0 redemptions
+    // a) Unknown/non-enum status (status: 'PENDING' / 'UNKNOWN' / '') returns HTTP 503 with Retry-After: 2, 0 mutations
     for (const badStatus of ['PENDING', 'UNKNOWN', '', 'success']) {
       const challengeBadStatus = store.createChallenge(dummyDest, '0.05', 'XLM', '/api/soroban-resource', 'testnet', targetVault);
       const txHashBadStatus = 'aa'.repeat(32);
@@ -711,23 +711,37 @@ describe('createX402Middleware with SQLite', () => {
 
       let badStatusCode = 0;
       let badJson: any = null;
+      const setHeaderSpy = vi.fn();
       const resBadStatus = {
         status: vi.fn((code: number) => { badStatusCode = code; return resBadStatus; }),
-        setHeader: vi.fn(),
+        setHeader: setHeaderSpy,
         json: vi.fn((b: any) => { badJson = b; return resBadStatus; }),
       } as unknown as Response;
+
+      // Track total_changes before request
+      const changesBefore = (store as any).db.prepare('SELECT total_changes() as tc').get().tc;
+      const challengeBefore = store.getChallenge(challengeBadStatus.challengeId);
 
       const nextBadStatus = vi.fn();
       await middleware(reqBadStatus, resBadStatus, nextBadStatus);
 
+      // Explicit assertion on Retry-After header
+      expect(setHeaderSpy).toHaveBeenCalledWith('Retry-After', '2');
       expect(nextBadStatus).not.toHaveBeenCalled();
       expect(badStatusCode).toBe(503);
       expect(badJson.retriable).toBe(true);
+
+      // Strict verification of 0 database mutations:
+      const changesAfter = (store as any).db.prepare('SELECT total_changes() as tc').get().tc;
+      expect(changesAfter - changesBefore).toBe(0); // literal 0 SQLite writes
       expect(store.isTxRedeemed(txHashBadStatus)).toBe(false);
       expect(store.isChallengeRedeemed(challengeBadStatus.challengeId)).toBe(false);
+      // Challenge row preserved exactly intact
+      const challengeAfter = store.getChallenge(challengeBadStatus.challengeId);
+      expect(challengeAfter).toEqual(challengeBefore);
     }
 
-    // b) HTTP 401 Unauthorized returns HTTP 502 with retriable: true, 0 redemptions
+    // b) HTTP 401 Unauthorized returns HTTP 502 with retriable: true, Retry-After: 2, 0 mutations
     const challenge401 = store.createChallenge(dummyDest, '0.05', 'XLM', '/api/soroban-resource', 'testnet', targetVault);
     const txHash401 = 'bb'.repeat(32);
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
@@ -751,22 +765,32 @@ describe('createX402Middleware with SQLite', () => {
 
     let status401 = 0;
     let json401: any = null;
+    const setHeader401Spy = vi.fn();
     const res401 = {
       status: vi.fn((code: number) => { status401 = code; return res401; }),
-      setHeader: vi.fn(),
+      setHeader: setHeader401Spy,
       json: vi.fn((b: any) => { json401 = b; return res401; }),
     } as unknown as Response;
+
+    const changesBefore401 = (store as any).db.prepare('SELECT total_changes() as tc').get().tc;
+    const challengeBefore401 = store.getChallenge(challenge401.challengeId);
 
     const next401 = vi.fn();
     await middleware(req401, res401, next401);
 
+    expect(setHeader401Spy).toHaveBeenCalledWith('Retry-After', '2');
     expect(next401).not.toHaveBeenCalled();
     expect(status401).toBe(502);
     expect(json401.retriable).toBe(true);
+
+    const changesAfter401 = (store as any).db.prepare('SELECT total_changes() as tc').get().tc;
+    expect(changesAfter401 - changesBefore401).toBe(0);
     expect(store.isTxRedeemed(txHash401)).toBe(false);
     expect(store.isChallengeRedeemed(challenge401.challengeId)).toBe(false);
+    const challengeAfter401 = store.getChallenge(challenge401.challengeId);
+    expect(challengeAfter401).toEqual(challengeBefore401);
 
-    // c) JSON-RPC -32602 Invalid params returns HTTP 502 with retriable: true, 0 redemptions
+    // c) JSON-RPC -32602 Invalid params returns HTTP 502 with retriable: true, Retry-After: 2, 0 mutations
     const challenge32602 = store.createChallenge(dummyDest, '0.05', 'XLM', '/api/soroban-resource', 'testnet', targetVault);
     const txHash32602 = 'cc'.repeat(32);
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
@@ -791,20 +815,30 @@ describe('createX402Middleware with SQLite', () => {
 
     let status32602 = 0;
     let json32602: any = null;
+    const setHeader32602Spy = vi.fn();
     const res32602 = {
       status: vi.fn((code: number) => { status32602 = code; return res32602; }),
-      setHeader: vi.fn(),
+      setHeader: setHeader32602Spy,
       json: vi.fn((b: any) => { json32602 = b; return res32602; }),
     } as unknown as Response;
+
+    const changesBefore32602 = (store as any).db.prepare('SELECT total_changes() as tc').get().tc;
+    const challengeBefore32602 = store.getChallenge(challenge32602.challengeId);
 
     const next32602 = vi.fn();
     await middleware(req32602, res32602, next32602);
 
+    expect(setHeader32602Spy).toHaveBeenCalledWith('Retry-After', '2');
     expect(next32602).not.toHaveBeenCalled();
     expect(status32602).toBe(502);
     expect(json32602.retriable).toBe(true);
+
+    const changesAfter32602 = (store as any).db.prepare('SELECT total_changes() as tc').get().tc;
+    expect(changesAfter32602 - changesBefore32602).toBe(0);
     expect(store.isTxRedeemed(txHash32602)).toBe(false);
     expect(store.isChallengeRedeemed(challenge32602.challengeId)).toBe(false);
+    const challengeAfter32602 = store.getChallenge(challenge32602.challengeId);
+    expect(challengeAfter32602).toEqual(challengeBefore32602);
 
     store.close();
   });
