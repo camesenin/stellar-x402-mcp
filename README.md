@@ -176,7 +176,7 @@ cargo build --target wasm32v1-none --release
 
 ## 🧪 Testing & Empirical Verification
 
-### 1. Monorepo Test Suite (61 automated tests + 1 integration demo + 5 live on-chain = 67 total verifications)
+### 1. Monorepo Test Suite (99 automated unit/spec tests: 8 Rust + 91 Vitest, plus 1 integration demo + 5 live on-chain = 105 total verifications)
 Run all unit and integration tests across both Rust contracts and TypeScript packages:
 
 ```bash

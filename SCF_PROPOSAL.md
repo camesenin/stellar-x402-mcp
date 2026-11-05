@@ -89,7 +89,7 @@ As of proposal preparation:
 - [x] Soroban `X402PaymentVault` contract in Rust with on-chain hash recomputation and anti-replay guarantees.
 - [x] HTTP 402 Express middleware and Soroban JSON-RPC 2.0 transaction verifier.
 - [x] Autonomous Agent Client SDK with in-flight budget quarantine manager and simulation auth tree verification.
-- [x] Working MCP server wrapper with paid tool demonstration and 61 automated unit tests.
+- [x] Working MCP server wrapper with paid tool demonstration and 99 automated unit tests.
 
 ### Milestone 2: Feature Freeze & Multi-Token SAC Contracts (Weeks 1 – 4) — $12,000 USD (34%)
 - [ ] Multi-asset Soroban Stellar Asset Contract (SAC) routing (USDC, EURC) with slippage bounds.
