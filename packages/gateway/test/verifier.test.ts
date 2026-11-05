@@ -1395,6 +1395,35 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
         Buffer.from('f'.repeat(64), 'hex')
       )).rejects.toThrow('Soroban RPC getContractData non-conclusive query failure');
 
+      // 7. Missing result or missing/invalid status in JSON-RPC getTransaction throws 503 instead of degrading to null
+      for (const badRpcPayload of [{}, [], { result: null }, { result: {} }]) {
+        vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+          ok: true,
+          json: async () => badRpcPayload,
+        } as any);
+        await expect(verifier.fetchSorobanTxJsonRpc('any_tx_hash')).rejects.toThrow(/missing result object|missing valid status field/);
+      }
+
+      // 8. Stored challenge_hash mismatch in receipt strictly throws 503
+      vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockResolvedValueOnce({
+        val: {
+          contractData: () => ({
+            val: () => nativeToScVal({
+              payer: validTestKp.publicKey(),
+              recipient: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+              token: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+              amount: 500_000n,
+              timestamp: 12345678n,
+              challenge_hash: Buffer.alloc(32, 9), // mismatch vs 'f'.repeat(64)
+            }),
+          }),
+        },
+      } as any);
+      await expect(verifier.querySorobanContractReceipt(
+        'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
+        Buffer.from('f'.repeat(64), 'hex')
+      )).rejects.toThrow('Soroban RPC getContractData receipt challenge_hash mismatch');
+
       // 12. Hostile Classifier Matrix: Circular objects, HTTP 501, 550, 599, plain objects {-32001, 'upstream timeout'}
       // a) Circular object in err.error does not throw and is identified as transient
       const circularError: any = { message: 'upstream timeout', error: {} };

@@ -589,20 +589,59 @@ describe('createX402Middleware with SQLite', () => {
       },
     });
 
-    // Mock getContractData returning real LedgerEntry with real receipt struct ScVal
-    const receiptScVal = nativeToScVal({
-      payer: payerKp.publicKey(),
-      recipient: dummyDest,
-      token: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
-      amount: 500_000n,
-      timestamp: 12345678n,
+    // Mock getContractData returning real LedgerEntryData with exact Rust PaymentReceipt ScVal map:
+    // Rust struct PaymentReceipt {
+    //   payer: Address,
+    //   recipient: Address,
+    //   token: Address,
+    //   amount: i128,
+    //   timestamp: u64,
+    //   challenge_hash: BytesN<32>,
+    // }
+    const rustPaymentReceiptScVal = xdr.ScVal.scvMap([
+      new xdr.ScMapEntry({
+        key: xdr.ScVal.scvSymbol('amount'),
+        val: nativeToScVal(500_000n, { type: 'i128' }),
+      }),
+      new xdr.ScMapEntry({
+        key: xdr.ScVal.scvSymbol('challenge_hash'),
+        val: xdr.ScVal.scvBytes(expectedNonce),
+      }),
+      new xdr.ScMapEntry({
+        key: xdr.ScVal.scvSymbol('payer'),
+        val: new Address(payerKp.publicKey()).toScVal(),
+      }),
+      new xdr.ScMapEntry({
+        key: xdr.ScVal.scvSymbol('recipient'),
+        val: new Address(dummyDest).toScVal(),
+      }),
+      new xdr.ScMapEntry({
+        key: xdr.ScVal.scvSymbol('timestamp'),
+        val: nativeToScVal(12345678n, { type: 'u64' }),
+      }),
+      new xdr.ScMapEntry({
+        key: xdr.ScVal.scvSymbol('token'),
+        val: new Address('CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC').toScVal(),
+      }),
+    ]);
+
+    // Encode into authentic LedgerEntryData and deserialize via xdr.LedgerEntryData.fromXDR
+    const contractDataEntry = new xdr.ContractDataEntry({
+      ext: new xdr.ExtensionPoint(0),
+      contract: new Address(targetVault).toScAddress(),
+      key: xdr.ScVal.scvVec([
+        xdr.ScVal.scvSymbol('Receipt'),
+        xdr.ScVal.scvBytes(expectedNonce),
+      ]),
+      durability: xdr.ContractDataDurability.persistent(),
+      val: rustPaymentReceiptScVal,
     });
+    const ledgerEntryData = xdr.LedgerEntryData.contractData(contractDataEntry);
+    const serializedLedgerEntry = ledgerEntryData.toXDR();
+    const authenticDecodedLedgerEntry = xdr.LedgerEntryData.fromXDR(serializedLedgerEntry);
+
     vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockResolvedValueOnce({
-      val: {
-        contractData: () => ({
-          val: () => receiptScVal,
-        }),
-      },
+      val: authenticDecodedLedgerEntry,
     } as any);
 
     let nextCalled = false;

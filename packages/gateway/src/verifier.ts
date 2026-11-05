@@ -226,7 +226,7 @@ export class StellarPaymentVerifier {
    * Fetch transaction from Soroban RPC using official JSON-RPC 2.0 specification
    * completely independent of SDK internal private methods
    */
-  public async fetchSorobanTxJsonRpc(txHash: string): Promise<Record<string, any> | null> {
+  public async fetchSorobanTxJsonRpc(txHash: string): Promise<Record<string, any>> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10_000);
 
@@ -280,7 +280,23 @@ export class StellarPaymentVerifier {
         // If it's another non-transient JSON-RPC error, throw explicit error rather than silently degrading to null
         throw new Error(`Soroban JSON-RPC error (${errObj.code}): ${errObj.message || 'unknown error'}`);
       }
-      return data.result || null;
+
+      // getTransaction JSON-RPC contract validation:
+      // data.result must be an object with an explicit status field ('SUCCESS', 'FAILED', or 'NOT_FOUND')
+      if (!data.result || typeof data.result !== 'object') {
+        throw new TransientInfrastructureError(
+          'Soroban RPC getTransaction response missing result object',
+          503
+        );
+      }
+      if (typeof data.result.status !== 'string') {
+        throw new TransientInfrastructureError(
+          `Soroban RPC getTransaction response missing valid status field: ${JSON.stringify(data.result)}`,
+          503
+        );
+      }
+
+      return data.result;
     } catch (err: any) {
       if (err instanceof TransientInfrastructureError) {
         throw err;
@@ -404,24 +420,26 @@ export class StellarPaymentVerifier {
 
     try {
       // 1. Query transaction status on Soroban RPC using standard JSON-RPC 2.0
-      let rawTx: Record<string, any> | null = null;
+      let rawTx: Record<string, any>;
       try {
         rawTx = await this.fetchSorobanTxJsonRpc(txHash);
       } catch (fetchErr: any) {
         if (fetchErr instanceof TransientInfrastructureError || isTransientInfrastructureError(fetchErr)) {
           throw fetchErr;
         }
-        return {
-          valid: false,
-          reason: `Soroban transaction query error: ${fetchErr?.message || fetchErr}`,
-          txHash,
-        };
+        // Non-transient RPC upstream/protocol errors (e.g. HTTP 401 Unauthorized, JSON-RPC -32602)
+        // must be treated as gateway infrastructure failures (502/500), NOT false payment rejections (402)
+        throw new TransientInfrastructureError(
+          `Soroban RPC upstream query failure: ${fetchErr?.message || fetchErr}`,
+          502,
+          fetchErr
+        );
       }
 
-      if (!rawTx || rawTx.status !== 'SUCCESS') {
+      if (rawTx.status !== 'SUCCESS') {
         return {
           valid: false,
-          reason: `Soroban transaction status is '${rawTx?.status || 'NOT_FOUND'}', expected 'SUCCESS'`,
+          reason: `Soroban transaction status is '${rawTx.status}', expected 'SUCCESS'`,
           txHash,
         };
       }
@@ -961,13 +979,36 @@ export class StellarPaymentVerifier {
       );
     }
 
+    // Defensive parsing & validation of challenge_hash in persistent receipt:
+    // Must match the requested canonical challenge hash byte-for-byte
+    let storedHashBytes: Buffer;
+    if (Buffer.isBuffer(rec.challenge_hash)) {
+      storedHashBytes = rec.challenge_hash;
+    } else if (typeof rec.challenge_hash === 'string' && /^[0-9a-fA-F]{64}$/.test(rec.challenge_hash)) {
+      storedHashBytes = Buffer.from(rec.challenge_hash, 'hex');
+    } else if (rec.challenge_hash instanceof Uint8Array && rec.challenge_hash.length === 32) {
+      storedHashBytes = Buffer.from(rec.challenge_hash);
+    } else {
+      throw new TransientInfrastructureError(
+        'Soroban RPC getContractData receipt contains invalid or missing challenge_hash',
+        503
+      );
+    }
+
+    if (!storedHashBytes.equals(hashBytes)) {
+      throw new TransientInfrastructureError(
+        `Soroban RPC getContractData receipt challenge_hash mismatch: expected ${hashBytes.toString('hex')}, found ${storedHashBytes.toString('hex')}`,
+        503
+      );
+    }
+
     return {
       payer: rec.payer,
       recipient: rec.recipient,
       token: rec.token,
       amount: parsedAmount,
       timestamp: parsedTimestamp,
-      challenge_hash: hashBytes,
+      challenge_hash: storedHashBytes,
     };
   }
 
