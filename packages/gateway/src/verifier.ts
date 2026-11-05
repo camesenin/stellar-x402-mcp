@@ -79,7 +79,7 @@ export function isTransientInfrastructureError(err: unknown): boolean {
     }
   }
 
-  // 3. String representations and message inspection (handling Errors and plain objects)
+  // 3. String representations and message inspection (handling Errors and plain objects defensively)
   const pieces: string[] = [];
   if (err instanceof Error) {
     pieces.push(err.name, err.message);
@@ -87,7 +87,18 @@ export function isTransientInfrastructureError(err: unknown): boolean {
     if ((err as any).name) pieces.push(String((err as any).name));
     if ((err as any).message) pieces.push(String((err as any).message));
     if ((err as any).error) {
-      pieces.push(typeof (err as any).error === 'string' ? (err as any).error : JSON.stringify((err as any).error));
+      if (typeof (err as any).error === 'string') {
+        pieces.push((err as any).error);
+      } else {
+        try {
+          pieces.push(JSON.stringify((err as any).error));
+        } catch {
+          // Circular or unstringifiable error object: capture key names
+          try {
+            pieces.push(String((err as any).error.message || (err as any).error.code || ''));
+          } catch {}
+        }
+      }
     }
     try { pieces.push(JSON.stringify(err)); } catch {}
   } else {
@@ -99,7 +110,11 @@ export function isTransientInfrastructureError(err: unknown): boolean {
     if (cause instanceof Error) {
       pieces.push(cause.name, cause.message);
     } else if (typeof cause === 'object') {
-      try { pieces.push(JSON.stringify(cause)); } catch {}
+      try { pieces.push(JSON.stringify(cause)); } catch {
+        try {
+          pieces.push(String((cause as any).message || (cause as any).code || ''));
+        } catch {}
+      }
     } else {
       pieces.push(String(cause));
     }
@@ -771,20 +786,40 @@ export class StellarPaymentVerifier {
     }
 
     if (!data || !data.val) {
-      return null;
+      throw new TransientInfrastructureError(
+        'Soroban RPC getContractData returned empty or malformed ledger response without entry value',
+        503
+      );
     }
 
-    const contractData = data.val.contractData();
+    let contractData: any;
+    try {
+      contractData = data.val.contractData();
+    } catch (contractDataErr: any) {
+      throw new TransientInfrastructureError(
+        `Soroban RPC getContractData failed to parse ledger contractData entry: ${contractDataErr?.message || contractDataErr}`,
+        503,
+        contractDataErr
+      );
+    }
+
     let native: unknown;
     try {
       native = scValToNative(contractData.val());
-    } catch {
-      return null;
+    } catch (deserErr: any) {
+      throw new TransientInfrastructureError(
+        `Soroban RPC getContractData failed to deserialize receipt ScVal: ${deserErr?.message || deserErr}`,
+        503,
+        deserErr
+      );
     }
 
     // Strict defensive schema validation of the deserialized receipt struct
     if (!native || typeof native !== 'object') {
-      return null;
+      throw new TransientInfrastructureError(
+        'Soroban RPC getContractData deserialized receipt is not a valid struct object',
+        503
+      );
     }
 
     const rec = native as Record<string, unknown>;
@@ -795,7 +830,10 @@ export class StellarPaymentVerifier {
       rec.amount === undefined ||
       rec.timestamp === undefined
     ) {
-      return null;
+      throw new TransientInfrastructureError(
+        'Soroban RPC getContractData deserialized receipt lacks required fields (payer, recipient, token, amount, timestamp)',
+        503
+      );
     }
 
     return {
@@ -995,11 +1033,12 @@ export class StellarPaymentVerifier {
     } catch (err: unknown) {
       if (err instanceof TransientInfrastructureError || isTransientInfrastructureError(err)) {
         const errorMsg = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as any)?.statusCode || (err as any)?.response?.status || 503;
+        const rawStatus = (err as any)?.statusCode || (err as any)?.response?.status;
+        const statusCode = typeof rawStatus === 'number' && rawStatus >= 500 && rawStatus <= 599 ? rawStatus : 503;
         return {
           valid: false,
           retriable: true,
-          statusCode: typeof statusCode === 'number' && statusCode >= 500 && statusCode <= 599 ? statusCode : 503,
+          statusCode,
           reason: `Stellar Horizon transient infrastructure failure: ${errorMsg}. Payment verification may be safely retried without double payment.`,
           txHash: cleanHash,
         };

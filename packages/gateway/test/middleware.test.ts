@@ -376,4 +376,126 @@ describe('createX402Middleware with SQLite', () => {
     expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(false);
     store.close();
   });
+
+  it('e2e middleware: Horizon HTTP 520 / 5xx returns HTTP 520/503 with Retry-After, preserving state for retry and preventing replay afterwards', async () => {
+    const store = new ChallengeStore(':memory:');
+    const verifier = new StellarPaymentVerifier('https://horizon-testnet.stellar.org', 'https://soroban-testnet.stellar.org', 'testnet');
+    const challenge = store.createChallenge(dummyDest, '0.05', 'XLM', '/api/resource');
+    const dummyTx = '22334455667788990011aabbccddeeff22334455667788990011aabbccddeeff';
+
+    // Injected Horizon 520 error into Horizon SDK call
+    const horizon520 = new Error('Request failed with status code 520');
+    (horizon520 as any).response = { status: 520 };
+    vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+      transaction: () => ({
+        call: async () => { throw horizon520; },
+      }),
+    } as any);
+
+    const middleware = createX402Middleware(
+      { destinationPublicKey: dummyDest, defaultFeeXlm: '0.05' },
+      store,
+      verifier
+    );
+
+    const req = {
+      header: vi.fn((name: string) => {
+        if (name === 'X-Stellar-TxHash') return dummyTx;
+        if (name === 'X-Challenge-Id') return challenge.challengeId;
+        return undefined;
+      }),
+      query: {},
+      originalUrl: '/api/resource',
+      path: '/api/resource',
+      ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as X402Request;
+
+    const headers: Record<string, string> = {};
+    let statusCode = 0;
+    let jsonBody: any = null;
+    const res = {
+      status: vi.fn((code: number) => { statusCode = code; return res; }),
+      setHeader: vi.fn((k: string, v: string) => { headers[k] = v; return res; }),
+      json: vi.fn((b: any) => { jsonBody = b; return res; }),
+    } as unknown as Response;
+
+    const next = vi.fn();
+    // Step 1: Request encounters Horizon 520 transient failure
+    await middleware(req, res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    // Must return 520 (or 503) instead of 402!
+    expect([503, 520]).toContain(statusCode);
+    expect(headers['Retry-After']).toBe('2');
+    expect(jsonBody.retriable).toBe(true);
+    expect(jsonBody.details).toContain('Stellar Horizon transient infrastructure failure');
+    // Challenge and tx must remain unconsumed in SQLite store
+    expect(store.isTxRedeemed(dummyTx)).toBe(false);
+    expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(false);
+
+    // Step 2: Retry with successful Horizon response (same proof)
+    vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValue({
+      transaction: () => ({
+        call: async () => ({
+          successful: true,
+          memo: challenge.memo,
+          ledger_attr: 50010,
+          operations: async () => ({
+            records: [
+              {
+                type: 'payment',
+                to: dummyDest,
+                source_account: 'GAUTONOMOUS_AI_AGENT_KEYPAIR_111111111111111111111111111111',
+                amount: '0.05',
+                asset_type: 'native',
+              },
+            ],
+            next: async () => ({ records: [] }),
+          }),
+        }),
+      }),
+    } as any);
+
+    let nextCalled = false;
+    const nextSuccess = vi.fn(() => { nextCalled = true; });
+    await middleware(req, res, nextSuccess);
+
+    expect(nextCalled).toBe(true);
+    expect(headers['X-Payment-Settled']).toBe('true');
+    expect(headers['X-Payment-TxHash']).toBe(dummyTx);
+    expect(store.isTxRedeemed(dummyTx)).toBe(true);
+    expect(store.isChallengeRedeemed(challenge.challengeId)).toBe(true);
+
+    // Step 3: Subsequent replay of the exact same tx hash with a new challenge must be rejected with 402 replay attack prevented
+    const freshChallenge = store.createChallenge(dummyDest, '0.05', 'XLM', '/api/resource');
+    const reqReplay = {
+      header: vi.fn((name: string) => {
+        if (name === 'X-Stellar-TxHash') return dummyTx;
+        if (name === 'X-Challenge-Id') return freshChallenge.challengeId;
+        return undefined;
+      }),
+      query: {},
+      originalUrl: '/api/resource',
+      path: '/api/resource',
+      ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
+    } as unknown as X402Request;
+
+    let replayStatusCode = 0;
+    let replayJson: any = null;
+    const resReplay = {
+      status: vi.fn((code: number) => { replayStatusCode = code; return resReplay; }),
+      setHeader: vi.fn(),
+      json: vi.fn((b: any) => { replayJson = b; return resReplay; }),
+    } as unknown as Response;
+
+    const nextReplay = vi.fn();
+    await middleware(reqReplay, resReplay, nextReplay);
+
+    expect(nextReplay).not.toHaveBeenCalled();
+    expect(replayStatusCode).toBe(402);
+    expect(replayJson.details).toContain('replay attack prevented');
+    store.close();
+  });
 });

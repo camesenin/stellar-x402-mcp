@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { xdr, Address, nativeToScVal, Keypair } from '@stellar/stellar-sdk';
-import { StellarPaymentVerifier, amountToStroops, stroopsToDecimalString } from '../src/verifier.js';
+import { StellarPaymentVerifier, amountToStroops, stroopsToDecimalString, isTransientInfrastructureError } from '../src/verifier.js';
 import { ChallengeStore } from '../src/challenge-store.js';
 import { X402Challenge } from '../src/types.js';
 
@@ -1259,6 +1259,50 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
         Buffer.from('f'.repeat(64), 'hex')
       );
       expect(receiptNotFound).toBeNull();
+
+      // 11. Rigorous Audit Matrix Verification: unhandled / non-404 responses from getContractData throw TransientInfrastructureError (503)
+      // a) undefined or empty response from RPC without .val
+      vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockResolvedValueOnce(undefined as any);
+      await expect(verifier.querySorobanContractReceipt(
+        'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
+        Buffer.from('f'.repeat(64), 'hex')
+      )).rejects.toThrow('Soroban RPC getContractData returned empty or malformed ledger response');
+
+      // b) empty object {} from RPC
+      vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockResolvedValueOnce({} as any);
+      await expect(verifier.querySorobanContractReceipt(
+        'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
+        Buffer.from('f'.repeat(64), 'hex')
+      )).rejects.toThrow('Soroban RPC getContractData returned empty or malformed ledger response');
+
+      // c) Malformed receipt that deserializes to primitive string instead of struct
+      vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockResolvedValueOnce({
+        val: {
+          contractData: () => ({
+            val: () => nativeToScVal('primitive_string'),
+          }),
+        },
+      } as any);
+      await expect(verifier.querySorobanContractReceipt(
+        'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
+        Buffer.from('f'.repeat(64), 'hex')
+      )).rejects.toThrow('Soroban RPC getContractData deserialized receipt is not a valid struct object');
+
+      // 12. Hostile Classifier Matrix: Circular objects, HTTP 501, 550, 599, plain objects {-32001, 'upstream timeout'}
+      // a) Circular object in err.error does not throw and is identified as transient
+      const circularError: any = { message: 'upstream timeout', error: {} };
+      circularError.error.self = circularError.error;
+      expect(isTransientInfrastructureError(circularError)).toBe(true);
+
+      // b) HTTP 501, 550, 599 status and messages
+      expect(isTransientInfrastructureError(new Error('Request failed with status 501'))).toBe(true);
+      expect(isTransientInfrastructureError(new Error('Internal server error 550'))).toBe(true);
+      expect(isTransientInfrastructureError(new Error('Gateway error 599'))).toBe(true);
+      expect(isTransientInfrastructureError({ response: { status: 550 } })).toBe(true);
+      expect(isTransientInfrastructureError({ cause: { response: { status: 599 } } })).toBe(true);
+
+      // c) Plain JSON-RPC object
+      expect(isTransientInfrastructureError({ code: -32001, message: 'upstream timeout' })).toBe(true);
     });
   });
 });

@@ -191,14 +191,16 @@ export function createX402Middleware(
         isGracePeriodRecovery ? 60_000 : 0
       );
       if (!result.valid) {
-        if (result.retriable && result.statusCode === 503) {
+        if (result.retriable) {
+          const status = result.statusCode || 503;
           res.setHeader('Retry-After', '2');
-          res.status(503).json({
+          res.status(status).json({
             error: 'Payment Verification Temporarily Unavailable',
             details: result.reason,
             txHash,
             challengeId,
             retriable: true,
+            upstreamStatus: result.statusCode,
           });
           return;
         }
