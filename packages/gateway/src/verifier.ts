@@ -38,33 +38,93 @@ export interface SorobanReceiptRecord {
 
 export function isTransientInfrastructureError(err: unknown): boolean {
   if (!err) return false;
-  if ((err as any)?._isTransientRpcError) return true;
-
-  const msg = err instanceof Error ? err.message : String(err);
-  const name = err instanceof Error ? err.name : '';
-  const code = String((err as any)?.code || (err as any)?.status || '');
-  const causeCode = String((err as any)?.cause?.code || '');
-  const causeMsg = String((err as any)?.cause?.message || '');
-
-  const combined = `${name} ${msg} ${code} ${causeCode} ${causeMsg}`.toLowerCase();
-
-  // Network transport codes (Node.js & POSIX)
-  const transientCodes = [
-    'eai_again', 'etimedout', 'econnreset', 'econnrefused', 'enotfound',
-    'epipe', 'enetunreach', 'ehostunreach', 'enetdown'
-  ];
-  if (transientCodes.some(c => combined.includes(c))) return true;
-
-  // HTTP rate limit & server error status codes (429, 500, 502, 503, 504, 520..599)
-  if (/(^|\D)(429|500|502|503|504|52\d|53\d|54\d)(\D|$)/.test(combined)) return true;
-
-  // Specific transient terms
-  if (/aborterror|timeout|timed out|fetch failed|rate limit|too many requests|overloaded|busy/i.test(combined)) {
+  if (typeof err === 'object' && ((err as any)._isTransientRpcError || (err as any).isTransientInfrastructureError)) {
     return true;
   }
 
-  // JSON-RPC internal / rate limit codes
-  if (/(^|\D)(-32603|-32000|-32005)(\D|$)/.test(combined)) return true;
+  // 1. Direct status number inspection (status, statusCode, response.status, cause.status, etc.)
+  const directStatuses = [
+    (err as any)?.statusCode,
+    (err as any)?.status,
+    (err as any)?.response?.status,
+    (err as any)?.cause?.status,
+    (err as any)?.cause?.statusCode,
+    (err as any)?.cause?.response?.status,
+  ];
+  for (const s of directStatuses) {
+    if (typeof s === 'number' && (s === 429 || (s >= 500 && s <= 599))) {
+      return true;
+    }
+  }
+
+  // 2. Direct code inspection (POSIX, Axios, JSON-RPC, Undici)
+  const transientCodes = new Set([
+    'EAI_AGAIN', 'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND',
+    'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH', 'ENETDOWN', 'UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET', 'ERR_BAD_RESPONSE', 'ERR_NETWORK',
+    'ECONNABORTED', 'ERR_SOCKET_CONNECTION_TIMEOUT'
+  ]);
+  const transientRpcCodes = new Set([-32603, -32000, -32001, -32002, -32003, -32004, -32005]);
+
+  const codes = [
+    (err as any)?.code,
+    (err as any)?.cause?.code,
+    (err as any)?.response?.data?.error?.code,
+    (err as any)?.data?.error?.code,
+  ];
+  for (const c of codes) {
+    if (c !== undefined && c !== null) {
+      if (typeof c === 'string' && transientCodes.has(c.toUpperCase())) return true;
+      if (typeof c === 'number' && (transientRpcCodes.has(c) || c === 429 || (c >= 500 && c <= 599))) return true;
+    }
+  }
+
+  // 3. String representations and message inspection (handling Errors and plain objects)
+  const pieces: string[] = [];
+  if (err instanceof Error) {
+    pieces.push(err.name, err.message);
+  } else if (typeof err === 'object') {
+    if ((err as any).name) pieces.push(String((err as any).name));
+    if ((err as any).message) pieces.push(String((err as any).message));
+    if ((err as any).error) {
+      pieces.push(typeof (err as any).error === 'string' ? (err as any).error : JSON.stringify((err as any).error));
+    }
+    try { pieces.push(JSON.stringify(err)); } catch {}
+  } else {
+    pieces.push(String(err));
+  }
+
+  const cause = (err as any)?.cause;
+  if (cause) {
+    if (cause instanceof Error) {
+      pieces.push(cause.name, cause.message);
+    } else if (typeof cause === 'object') {
+      try { pieces.push(JSON.stringify(cause)); } catch {}
+    } else {
+      pieces.push(String(cause));
+    }
+  }
+
+  const combined = pieces.join(' ').toLowerCase();
+
+  // POSIX / Node network codes
+  const codeSubstrings = [
+    'eai_again', 'etimedout', 'econnreset', 'econnrefused', 'enotfound',
+    'epipe', 'enetunreach', 'ehostunreach', 'enetdown', 'err_bad_response',
+    'err_network', 'econnaborted'
+  ];
+  if (codeSubstrings.some(s => combined.includes(s))) return true;
+
+  // HTTP status codes: 429 and complete 500..599 range
+  if (/(^|\D)(429|5\d{2})(\D|$)/.test(combined)) return true;
+
+  // JSON-RPC transient codes (-32603, -32000 to -32005)
+  if (/(^|\D)(-32603|-3200[0-5])(\D|$)/.test(combined)) return true;
+
+  // Specific transient terms
+  if (/aborterror|timeout|timed out|fetch failed|rate limit|too many requests|overloaded|busy|upstream timeout|gateway timeout|bad gateway|service unavailable/i.test(combined)) {
+    return true;
+  }
 
   return false;
 }
@@ -692,8 +752,22 @@ export class StellarPaymentVerifier {
           rpcErr
         );
       }
-      // If key is not found / 404 on ledger, return null
-      return null;
+      // Rigorous positive confirmation of entry absence on ledger:
+      // @stellar/stellar-sdk rejects with { code: 404, message: "Contract data not found..." }
+      const isDemonstratedAbsence =
+        rpcErr?.code === 404 ||
+        /contract data not found/i.test(rpcErr?.message || '');
+
+      if (isDemonstratedAbsence) {
+        return null;
+      }
+
+      // If it is neither demonstrated absence nor an expected 404, treat unknown RPC error as transient infrastructure failure
+      throw new TransientInfrastructureError(
+        `Soroban RPC getContractData non-conclusive query failure: ${rpcErr?.message || rpcErr}`,
+        503,
+        rpcErr
+      );
     }
 
     if (!data || !data.val) {
@@ -919,6 +993,17 @@ export class StellarPaymentVerifier {
         txHash: cleanHash,
       };
     } catch (err: unknown) {
+      if (err instanceof TransientInfrastructureError || isTransientInfrastructureError(err)) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        const statusCode = (err as any)?.statusCode || (err as any)?.response?.status || 503;
+        return {
+          valid: false,
+          retriable: true,
+          statusCode: typeof statusCode === 'number' && statusCode >= 500 && statusCode <= 599 ? statusCode : 503,
+          reason: `Stellar Horizon transient infrastructure failure: ${errorMsg}. Payment verification may be safely retried without double payment.`,
+          txHash: cleanHash,
+        };
+      }
       const errorMsg = err instanceof Error ? err.message : String(err);
       return {
         valid: false,

@@ -1155,6 +1155,110 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
         'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
         Buffer.from('f'.repeat(64), 'hex')
       )).rejects.toThrow('Soroban RPC getContractData transient network failure');
+
+      // 8. Full End-to-End Soroban pipeline test: receipt query failure propagates to HTTP 503 retriable in verifyPayment
+      const sorobanChallenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/soroban-resource',
+        'testnet',
+        'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO'
+      );
+      const validTxHash = 'e'.repeat(64);
+      vi.spyOn(verifier, 'fetchSorobanTxJsonRpc').mockResolvedValueOnce({
+        status: 'SUCCESS',
+        envelopeXdr: 'AAAA',
+      });
+      const expectedNonce = Buffer.from(sorobanChallenge.challengeId, 'hex');
+      const validAgentKp = Keypair.random();
+      vi.spyOn(xdr.TransactionEnvelope, 'fromXDR').mockReturnValueOnce({
+        value: () => ({
+          tx: () => ({
+            operations: () => [{
+              body: () => ({
+                switch: () => ({ name: 'invokeHostFunction' }),
+                invokeHostFunctionOp: () => ({
+                  hostFunction: () => ({
+                    switch: () => ({ name: 'hostFunctionTypeInvokeContract' }),
+                    invokeContract: () => ({
+                      contractAddress: () => Address.fromString('CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO').toScAddress(),
+                      functionName: () => Buffer.from('settle_payment'),
+                      args: () => [
+                        new Address(validAgentKp.publicKey()).toScVal(),
+                        new Address(sorobanChallenge.destination).toScVal(),
+                        new Address('CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC').toScVal(),
+                        nativeToScVal(500_000n, { type: 'i128' }),
+                        xdr.ScVal.scvBytes(expectedNonce),
+                      ],
+                    }),
+                  }),
+                }),
+              }),
+            }],
+          }),
+        }),
+      } as any);
+
+      // Mock simulateTransaction for canonical hash
+      vi.spyOn((verifier as any).sorobanServer, 'simulateTransaction').mockResolvedValueOnce({
+        result: {
+          retval: {
+            bytes: () => Buffer.from('a'.repeat(64), 'hex'),
+          },
+        },
+      });
+      // Mock getContractData with 501 / 550 / 599 / Axios ERR_BAD_RESPONSE with response.status = 520
+      const axios520Err = {
+        code: 'ERR_BAD_RESPONSE',
+        message: 'Bad response',
+        response: { status: 520 },
+      };
+      vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockRejectedValueOnce(axios520Err);
+
+      const receiptE2EResult = await verifier.verifyPayment(validTxHash, sorobanChallenge, store);
+      expect(receiptE2EResult.valid).toBe(false);
+      expect(receiptE2EResult.retriable).toBe(true);
+      expect(receiptE2EResult.statusCode).toBe(503);
+      expect(receiptE2EResult.reason).toContain('Soroban RPC transient infrastructure failure');
+      // Anti-replay store must NOT have redeemed the challenge or transaction
+      expect(store.isTxRedeemed(validTxHash)).toBe(false);
+      expect(store.isChallengeRedeemed(sorobanChallenge.challengeId)).toBe(false);
+
+      // 9. Horizon Horizon Server Error (HTTP 520 / 500 / 502) propagates to retriable 503 instead of false 402 rejection
+      const horizonChallenge = store.createChallenge(
+        'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        '0.05',
+        'XLM',
+        '/horizon-resource'
+      );
+      const horizon520Error = new Error('Request failed with status code 520');
+      (horizon520Error as any).response = { status: 520 };
+      vi.spyOn((verifier as any).horizonServer, 'transactions').mockReturnValueOnce({
+        transaction: () => ({
+          call: async () => { throw horizon520Error; },
+        }),
+      } as any);
+
+      const horizon520Result = await verifier.verifyPayment('horizon_tx_520', horizonChallenge, store);
+      expect(horizon520Result.valid).toBe(false);
+      expect(horizon520Result.retriable).toBe(true);
+      expect(horizon520Result.statusCode).toBe(520);
+      expect(horizon520Result.reason).toContain('Stellar Horizon transient infrastructure failure');
+      // Must not consume challenge or tx
+      expect(store.isTxRedeemed('horizon_tx_520')).toBe(false);
+      expect(store.isChallengeRedeemed(horizonChallenge.challengeId)).toBe(false);
+
+      // 10. Demonstrated key absence (code: 404) in querySorobanContractReceipt returns null, NOT a 503
+      vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockRejectedValueOnce({
+        code: 404,
+        message: 'Contract data not found. Contract: CB5DW4..., Key: ..., Durability: persistent',
+      });
+      const receiptNotFound = await verifier.querySorobanContractReceipt(
+        'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
+        Buffer.from('f'.repeat(64), 'hex')
+      );
+      expect(receiptNotFound).toBeNull();
     });
   });
 });
