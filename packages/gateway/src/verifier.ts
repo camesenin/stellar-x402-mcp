@@ -36,6 +36,50 @@ export interface SorobanReceiptRecord {
   challenge_hash: Buffer | Uint8Array;
 }
 
+export function isTransientInfrastructureError(err: unknown): boolean {
+  if (!err) return false;
+  if ((err as any)?._isTransientRpcError) return true;
+
+  const msg = err instanceof Error ? err.message : String(err);
+  const name = err instanceof Error ? err.name : '';
+  const code = String((err as any)?.code || (err as any)?.status || '');
+  const causeCode = String((err as any)?.cause?.code || '');
+  const causeMsg = String((err as any)?.cause?.message || '');
+
+  const combined = `${name} ${msg} ${code} ${causeCode} ${causeMsg}`.toLowerCase();
+
+  // Network transport codes (Node.js & POSIX)
+  const transientCodes = [
+    'eai_again', 'etimedout', 'econnreset', 'econnrefused', 'enotfound',
+    'epipe', 'enetunreach', 'ehostunreach', 'enetdown'
+  ];
+  if (transientCodes.some(c => combined.includes(c))) return true;
+
+  // HTTP rate limit & server error status codes (429, 500, 502, 503, 504, 520..599)
+  if (/(^|\D)(429|500|502|503|504|52\d|53\d|54\d)(\D|$)/.test(combined)) return true;
+
+  // Specific transient terms
+  if (/aborterror|timeout|timed out|fetch failed|rate limit|too many requests|overloaded|busy/i.test(combined)) {
+    return true;
+  }
+
+  // JSON-RPC internal / rate limit codes
+  if (/(^|\D)(-32603|-32000|-32005)(\D|$)/.test(combined)) return true;
+
+  return false;
+}
+
+export class TransientInfrastructureError extends Error {
+  public readonly _isTransientRpcError = true;
+  public readonly statusCode: number;
+
+  constructor(message: string, statusCode: number = 503, public readonly cause?: unknown) {
+    super(message);
+    this.name = 'TransientInfrastructureError';
+    this.statusCode = statusCode;
+  }
+}
+
 const TESTNET_NATIVE_SAC = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
 const PUBLIC_NATIVE_SAC = 'CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA';
 
@@ -124,26 +168,31 @@ export class StellarPaymentVerifier {
       });
 
       if (!res.ok) {
-        if (res.status >= 500) {
-          throw new Error(`Soroban RPC HTTP ${res.status} gateway error`);
+        if (res.status === 429 || res.status >= 500) {
+          throw new TransientInfrastructureError(`Soroban RPC HTTP ${res.status} gateway error`, 503);
         }
         return null;
       }
 
       const data = (await res.json()) as any;
       if (data?.error) {
-        if (data.error.code === -32603 || /internal|timeout|busy/i.test(data.error.message)) {
-          throw new Error(`Soroban JSON-RPC transient error (${data.error.code}): ${data.error.message}`);
+        const errCode = data.error.code;
+        const errMsg = data.error.message || '';
+        if (errCode === -32603 || errCode === -32000 || errCode === -32005 || /internal|timeout|busy|rate|overloaded/i.test(errMsg)) {
+          throw new TransientInfrastructureError(`Soroban JSON-RPC transient error (${errCode}): ${errMsg}`, 503);
         }
       }
       return data?.result || null;
     } catch (err: any) {
-      const causeCode = (err?.cause as any)?.code || (err as any)?.code || '';
-      const combined = `${err.name} ${err.message} ${causeCode}`;
-      const isTransient = /AbortError|timeout|500|502|503|504|ECONNRESET|ECONNREFUSED|ENOTFOUND|fetch failed|transient/i.test(combined);
-
-      if (isTransient) {
-        throw new Error(`Soroban RPC getTransaction network timeout/transient failure: ${err.message} (code: ${causeCode})`);
+      if (err instanceof TransientInfrastructureError) {
+        throw err;
+      }
+      if (isTransientInfrastructureError(err)) {
+        throw new TransientInfrastructureError(
+          `Soroban RPC getTransaction network timeout/transient failure: ${err?.message || err}`,
+          503,
+          err
+        );
       }
       return null;
     } finally {
@@ -534,17 +583,18 @@ export class StellarPaymentVerifier {
         txHash,
       };
     } catch (err: unknown) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      const isTransient = /503|504|502|500|timeout|ECONNRESET|ECONNREFUSED|ENOTFOUND/i.test(errorMsg);
-      if (isTransient) {
+      if (err instanceof TransientInfrastructureError || isTransientInfrastructureError(err)) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        const statusCode = (err as any)?.statusCode || 503;
         return {
           valid: false,
           retriable: true,
-          statusCode: 503,
-          reason: `Soroban RPC transient infrastructure failure: ${errorMsg}. Payment verification may be safely retried.`,
+          statusCode,
+          reason: `Soroban RPC transient infrastructure failure: ${errorMsg}. Payment verification may be safely retried without double payment.`,
           txHash,
         };
       }
+      const errorMsg = err instanceof Error ? err.message : String(err);
       return {
         valid: false,
         reason: `Soroban verification error: ${errorMsg}`,
@@ -632,10 +682,15 @@ export class StellarPaymentVerifier {
         rpc.Durability.Persistent
       );
     } catch (rpcErr: any) {
-      // If error is genuine network/RPC timeout/5xx, rethrow as retriable RPC error instead of confusing with missing receipt
-      const msg = rpcErr instanceof Error ? rpcErr.message : String(rpcErr);
-      if (/500|502|503|504|timeout|ECONNRESET|ECONNREFUSED|ENOTFOUND/i.test(msg)) {
-        throw new Error(`Soroban RPC getContractData transient network failure: ${msg}`);
+      if (rpcErr instanceof TransientInfrastructureError) {
+        throw rpcErr;
+      }
+      if (isTransientInfrastructureError(rpcErr)) {
+        throw new TransientInfrastructureError(
+          `Soroban RPC getContractData transient network failure: ${rpcErr?.message || rpcErr}`,
+          503,
+          rpcErr
+        );
       }
       // If key is not found / 404 on ledger, return null
       return null;

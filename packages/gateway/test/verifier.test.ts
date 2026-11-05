@@ -1101,6 +1101,60 @@ describe('StellarPaymentVerifier & amountToStroops', () => {
       expect(rpcInternalResult.retriable).toBe(true);
       expect(rpcInternalResult.statusCode).toBe(503);
       expect(rpcInternalResult.reason).toContain('Soroban JSON-RPC transient error (-32603)');
+
+      // 3. Injected neutral error message with cause.code = 'EAI_AGAIN'
+      const eaiAgainError = new Error('getaddrinfo failure');
+      (eaiAgainError as any).cause = { code: 'EAI_AGAIN' };
+      vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(eaiAgainError);
+
+      const eaiAgainResult = await verifier.verifyPayment('tx_eai_again', challenge, store);
+      expect(eaiAgainResult.valid).toBe(false);
+      expect(eaiAgainResult.retriable).toBe(true);
+      expect(eaiAgainResult.statusCode).toBe(503);
+
+      // 4. Injected neutral error message with cause.code = 'ETIMEDOUT'
+      const etimedoutError = new Error('socket closed');
+      (etimedoutError as any).cause = { code: 'ETIMEDOUT' };
+      vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(etimedoutError);
+
+      const etimedoutResult = await verifier.verifyPayment('tx_etimedout', challenge, store);
+      expect(etimedoutResult.valid).toBe(false);
+      expect(etimedoutResult.retriable).toBe(true);
+      expect(etimedoutResult.statusCode).toBe(503);
+
+      // 5. Injected HTTP 429 Rate Limit
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        statusText: 'Too Many Requests',
+      } as any);
+
+      const rateLimitResult = await verifier.verifyPayment('tx_rate_limit', challenge, store);
+      expect(rateLimitResult.valid).toBe(false);
+      expect(rateLimitResult.retriable).toBe(true);
+      expect(rateLimitResult.statusCode).toBe(503);
+
+      // 6. Injected HTTP 520 / 5xx Cloudflare / Gateway Error
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+        ok: false,
+        status: 520,
+        statusText: 'Web Server Returned an Unknown Error',
+      } as any);
+
+      const http520Result = await verifier.verifyPayment('tx_520', challenge, store);
+      expect(http520Result.valid).toBe(false);
+      expect(http520Result.retriable).toBe(true);
+      expect(http520Result.statusCode).toBe(503);
+
+      // 7. Injected querySorobanContractReceipt network failure with cause.code = 'ECONNRESET'
+      const receiptConnReset = new TypeError('fetch failed');
+      (receiptConnReset as any).cause = { code: 'ECONNRESET' };
+      vi.spyOn((verifier as any).sorobanServer, 'getContractData').mockRejectedValueOnce(receiptConnReset);
+
+      await expect(verifier.querySorobanContractReceipt(
+        'CB5DW4J47Z3JWUJR5HQRPZIOTVPMT26N7H3HI5DMTRKMVAHJWZEGEUGO',
+        Buffer.from('f'.repeat(64), 'hex')
+      )).rejects.toThrow('Soroban RPC getContractData transient network failure');
     });
   });
 });
