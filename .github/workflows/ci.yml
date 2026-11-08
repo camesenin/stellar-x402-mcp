@@ -683,6 +683,7 @@ jobs:
               rec19 RECORD;
               rec20 RECORD;
               rec21 RECORD;
+              r RECORD;
               v_audit_count BIGINT;
               v_is_nullable TEXT;
               v_indnullsnotdistinct BOOLEAN;
