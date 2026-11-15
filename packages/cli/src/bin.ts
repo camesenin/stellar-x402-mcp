@@ -11,6 +11,7 @@ import {
   X402Request,
 } from '@stellar-x402/gateway';
 import { StellarPayer } from '@stellar-x402/client';
+import { runNetworkDoctor } from './commands/doctor.js';
 
 const program = new Command();
 
@@ -178,6 +179,41 @@ program
       console.log(pc.bold('Amount:           '), pc.yellow(`${receipt.amount} XLM`));
     } catch (err: unknown) {
       console.log(pc.red(`✗ Payment failed: ${err}`));
+    }
+  });
+
+// 5. Doctor Command
+program
+  .command('doctor')
+  .description('Ping Soroban RPC and Horizon endpoints to diagnose network health and sync status')
+  .option('-n, --network <network>', 'Network (testnet or public)', 'testnet')
+  .option('--rpc-url <url>', 'Custom Soroban RPC endpoint URL')
+  .option('--horizon-url <url>', 'Custom Stellar Horizon endpoint URL')
+  .action(async (options) => {
+    const report = await runNetworkDoctor({
+      network: options.network,
+      sorobanRpcUrl: options.rpcUrl,
+      horizonUrl: options.horizonUrl,
+    });
+
+    console.log(pc.cyan(`\n🩺 Stellar x402 Network Doctor (${report.network})`));
+    console.log(
+      pc.bold('Soroban RPC:  '),
+      report.sorobanRpc.reachable ? pc.green('healthy') : pc.red('unreachable'),
+      pc.gray(`(${report.sorobanRpc.latencyMs}ms, ledger: ${report.sorobanRpc.latestLedger ?? 'n/a'})`)
+    );
+    console.log(
+      pc.bold('Horizon API:  '),
+      report.horizon.reachable ? pc.green('online') : pc.red('unreachable'),
+      pc.gray(`(${report.horizon.latencyMs}ms, ledger: ${report.horizon.latestLedger ?? 'n/a'})`)
+    );
+    console.log(
+      pc.bold('Sync Status:  '),
+      report.synced ? pc.green('synced') : pc.yellow(`lag=${report.ledgerSyncLag ?? 'unknown'}`)
+    );
+
+    if (!report.healthy) {
+      process.exitCode = 1;
     }
   });
 
